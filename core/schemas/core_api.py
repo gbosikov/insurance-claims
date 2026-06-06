@@ -44,6 +44,13 @@ class ICD10Item(BaseModel):
     name:      str    # название диагноза
 
 
+class ProviderInfo(BaseModel):
+    """Провайдер (медицинское учреждение) из справочника кор-системы."""
+    pers_id: int      # числовой ID провайдера (PersID для ClaimParsing_UNI)
+    name:    str      # название учреждения
+    inn:     str      # ИНН провайдера
+
+
 class SubmitClaimResult(BaseModel):
     """Ответ ClaimParsing_UNI."""
     innum:       str   # номер направления в кор-системе

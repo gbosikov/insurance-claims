@@ -24,6 +24,7 @@ from core.exceptions import CoreAPIUnavailableError, PolicyNotFoundError
 from core.schemas.core_api import (
     ContractData,
     ICD10Item,
+    ProviderInfo,
     RiskInfo,
     RisksAndLimits,
     SubmitClaimResult,
@@ -279,7 +280,59 @@ class LiteGroupAdapter(CoreSystemAdapter):
 
         return items
 
-    # ── Метод 4: ClaimParsing_UNI ───────────────────────────────────
+    # ── Метод 4: Справочник провайдеров ────────────────────────────
+
+    REDIS_PROVIDERS_KEY = "lite_group:providers"
+    PROVIDERS_CACHE_TTL = 86400  # 24 часа
+
+    async def get_providers(self) -> list[ProviderInfo]:
+        """
+        Получить справочник медицинских учреждений (провайдеров).
+        Кэшируется в Redis на 24 часа.
+        METHODNAME: TODO_PROVIDERS_METHOD (уточнить у владельца)
+        Ожидаемый формат ответа: [{ PersID, Name, INN }]
+        """
+        redis = await self._get_redis()
+        if redis:
+            try:
+                cached = await redis.get(self.REDIS_PROVIDERS_KEY)
+                if cached:
+                    return [ProviderInfo(**item) for item in json.loads(cached)]
+            except Exception:
+                pass
+
+        result = await self._call(
+            method_name="TODO_PROVIDERS_METHOD",  # ← уточнить
+            xml_data={},
+        )
+        raw_list = result.get("responseData", [])
+        if not isinstance(raw_list, list):
+            raw_list = []
+
+        items = []
+        for r in raw_list:
+            try:
+                items.append(ProviderInfo(
+                    pers_id=int(r.get("PersID", 0)),
+                    name=r.get("Name", r.get("name", "")),
+                    inn=str(r.get("INN", r.get("inn", ""))),
+                ))
+            except Exception:
+                continue
+
+        if redis and items:
+            try:
+                await redis.setex(
+                    self.REDIS_PROVIDERS_KEY,
+                    self.PROVIDERS_CACHE_TTL,
+                    json.dumps([i.model_dump() for i in items]),
+                )
+            except Exception:
+                pass
+
+        return items
+
+    # ── Метод 5: ClaimParsing_UNI ───────────────────────────────────
 
     async def submit_claim(
         self,
@@ -383,6 +436,14 @@ class MockCoreAdapter(CoreSystemAdapter):
             ICD10Item(diagnosid=103, code="K29.7", name="Гастрит неуточнённый"),
             ICD10Item(diagnosid=104, code="M54.5", name="Боль в нижней части спины"),
             ICD10Item(diagnosid=105, code="J45.9", name="Астма неуточнённая"),
+        ]
+
+    async def get_providers(self) -> list[ProviderInfo]:
+        log.warning("mock_core_adapter_used", method="get_providers")
+        return [
+            ProviderInfo(pers_id=1, name="Клиника Аврора",        inn="123456789"),
+            ProviderInfo(pers_id=2, name="МЦ Мединтер",           inn="987654321"),
+            ProviderInfo(pers_id=3, name="Диагностический центр", inn="111222333"),
         ]
 
     async def submit_claim(

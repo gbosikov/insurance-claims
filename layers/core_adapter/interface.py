@@ -8,7 +8,7 @@
 
 from abc import ABC, abstractmethod
 
-from core.schemas.core_api import ContractData, ICD10Item, RisksAndLimits, SubmitClaimResult
+from core.schemas.core_api import ContractData, ICD10Item, ProviderInfo, RisksAndLimits, SubmitClaimResult
 
 
 class CoreSystemAdapter(ABC):
@@ -35,6 +35,15 @@ class CoreSystemAdapter(ABC):
         Получить справочник диагнозов ICD10.
         Результат кэшируется в Redis на 24 часа.
         Метод: TODO_ICD10_METHOD (уточнить у владельца кор-системы)
+        """
+
+    @abstractmethod
+    async def get_providers(self) -> list[ProviderInfo]:
+        """
+        Получить справочник провайдеров (медицинских учреждений).
+        Возвращает список с полями: PersID, название, ИНН.
+        Результат кэшируется в Redis на 24 часа.
+        Метод: TODO_PROVIDERS_METHOD (уточнить у владельца кор-системы)
         """
 
     @abstractmethod

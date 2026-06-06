@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     ocr_max_retries: int = 3
     ocr_min_confidence: float = 0.70
     ocr_language_hints: list[str] = ["ru", "ka", "en"]
+    # Полный путь к процессору Document AI:
+    # projects/{project_id}/locations/{location}/processors/{processor_id}
+    gcp_document_ai_processor: str = "projects/insurance-claims-dev/locations/us/processors/FORM_PARSER"
 
     # ── Quality Gate ───────────────────────────────────────────────
     quality_min_resolution_dpi: int = 150

@@ -98,6 +98,10 @@ insurance-claims/
 
 ```python
 # Используй async/await везде где есть I/O
+# Claude API вызывать только через AsyncAnthropic (не Anthropic) + await
+# Синхронные внешние клиенты (Google Vision, Document AI) — запускать через
+#   loop = asyncio.get_running_loop(); await loop.run_in_executor(None, func, *args)
+# Из синхронного контекста (Celery) запускать async через asyncio.run(), не get_event_loop()
 # Типизируй всё через Pydantic v2
 # Логируй через structlog (JSON-формат)
 # Обработка ошибок — кастомные исключения из core/exceptions.py
@@ -678,6 +682,9 @@ class Settings(BaseSettings):
     ocr_max_retries: int = 3
     ocr_min_confidence: float = 0.70
     ocr_language_hints: list[str] = ["ru", "ka", "en"]
+    # Полный путь к процессору Document AI:
+    # projects/{project_id}/locations/{location}/processors/{processor_id}
+    gcp_document_ai_processor: str = "projects/insurance-claims-dev/locations/us/processors/FORM_PARSER"
 
     # ── Quality Gate ───────────────────────────────────────────────
     quality_min_resolution_dpi: int = 150
@@ -1278,7 +1285,32 @@ async def get_icd10_list(redis: Redis, settings: Settings) -> list[dict]:
     return result
 
 
-# ── МЕТОД 4 (ФИНАЛЬНЫЙ): Создать убыток ClaimParsing_UNI ─────────────
+# ── МЕТОД 4: Получить справочник провайдеров ─────────────────────────
+async def get_providers(redis: Redis, settings: Settings) -> list[dict]:
+    """
+    METHODNAME: уточнить у владельца кор-системы
+    Возвращает: список { PersID, Name, INN }
+    PersID используется для ClaimParsing_UNI.
+    Кэшируется в Redis на 24 часа.
+    Маппинг на заявку: fuzzy-match названия учреждения из документов → PersID.
+    XML_DATA: {} (без параметров — полный справочник)
+    """
+    cached = await redis.get("lite_group:providers")
+    if cached:
+        import json
+        return json.loads(cached)
+
+    result = await call_method(
+        method_name="TODO_PROVIDERS_METHOD",   # ← уточнить название метода
+        xml_data={},
+        redis=redis,
+        settings=settings,
+    )
+    await redis.setex("lite_group:providers", 86400, json.dumps(result))
+    return result
+
+
+# ── МЕТОД 5 (ФИНАЛЬНЫЙ): Создать убыток ClaimParsing_UNI ─────────────
 async def submit_claim(
     policy_number: str,
     diagnosid: int,               # DiagnosID из справочника ICD10
@@ -1415,12 +1447,12 @@ class MockCoreAdapter:
 ### Открытые вопросы по кор-системе (уточнить у владельца)
 
 ```
-TODO_CONTRACT_METHOD  ← название метода для получения генерального договора
-TODO_RISKS_METHOD     ← название метода для получения рисков и лимитов
-TODO_ICD10_METHOD     ← название метода для получения справочника диагнозов
-fkind коды            ← справочник типов файлов (form_100, id_document, receipt)
-PersID                ← как определять код провайдера из документов или справочника
-ConfigKind            ← справочник видов направлений
+TODO_CONTRACT_METHOD   ← название метода для получения генерального договора
+TODO_RISKS_METHOD      ← название метода для получения рисков и лимитов
+TODO_ICD10_METHOD      ← название метода для получения справочника диагнозов
+TODO_PROVIDERS_METHOD  ← название метода для получения справочника провайдеров
+fkind коды             ← справочник типов файлов (form_100, id_document, receipt)
+ConfigKind             ← справочник видов направлений
 ```
 
 ---
@@ -1945,18 +1977,43 @@ pytest-httpx==0.30.0
 ✅ Шаг 13: Слой 9 (Celery worker) — оркестрация реализована
 ✅ Шаг 14: Слой 10 (FastAPI) — все роуты реализованы, Swagger на :8000/docs
 
-   Шаг 15: Обновить слои 1, 6, 7, 8, 9 под новую архитектуру:
-           - Слой 1 (intake): добавить policy_number как обязательный параметр
-           - Слой 6 (core_adapter): переписать под JWT + реальные методы кор-системы
-           - Слой 7 (decision): decision.summary = полный вердикт для Comment
-           - Слой 8 (routing): роутинг ПОСЛЕ submit, не блокирует отправку
+✅ Шаг 15: Слои обновлены под новую архитектуру:
+           - Слой 1 (intake): policy_number обязательный параметр
+           - Слой 6 (core_adapter): JWT + MockCoreAdapter + get_providers()
+           - Слой 7 (decision): summary = полный вердикт, find_pers_id() по справочнику
+           - Слой 8 (routing): выполняется ПОСЛЕ ClaimParsing_UNI
            - Слой 9 (worker): ClaimParsing_UNI вызывается всегда
+
+✅ Шаг 15а: Технический рефакторинг:
+           - asyncio.run() вместо get_event_loop().run_until_complete() в tasks.py
+           - AsyncAnthropic + await везде (extraction, decision, rag/indexer)
+           - OCR-клиенты Google стали синхронными, запускаются через run_in_executor
+           - gcp_document_ai_processor вынесен в settings (не хардкод)
+
+✅ Шаг 15б: Исправление багов (приоритет: критические → средние → минорные):
+           - #11 ИСПРАВЛЕН: index_contract_from_text() добавлена в rag/indexer.py
+             (searcher.py импортировал несуществующую функцию → ImportError на первой заявке)
+           - #6  ИСПРАВЛЕН: fraud_task = asyncio.create_task(check_fraud(...))
+             (было: корутина создавалась но не запускалась — антифрод работал последовательно)
+           - #7  ИСПРАВЛЕН: REQUIRED_DOC_TYPES проверяется в receive_claim()
+             (было: заявка с одним файлом проходила без валидации комплектности)
+
+   Шаг 15в: Оставшиеся баги (исправить перед Шагом 16):
+           - #16 🟡 N+1 запросов в RAG searcher (_semantic_search, _keyword_search)
+                    → заменить db.get() в цикле на один SELECT ... WHERE id IN (...)
+           - #17 🟡 get_embedding() блокирует event loop (синхронный CPU-вызов в async)
+                    → перенести в run_in_executor
+           - #4  🟡 Retry-цикл rest_adapter._call(): 401 не уменьшает счётчик попыток,
+                    last_error=None при исчерпании через 401
+           - #3  🟡 Contract hash-mismatch: только log.warning, переиндексация не запущена
+           - #10 🟢 CORS allow_origins=[] в production → портал заблокирован
+           - #9  🟢 Сталый TODO-комментарий в core/schemas/decision.py
 
    Шаг 16: Уточнить у владельца кор-системы:
            - TODO_CONTRACT_METHOD, TODO_RISKS_METHOD, TODO_ICD10_METHOD
+           - TODO_PROVIDERS_METHOD (список провайдеров: PersID, название, ИНН)
            - Коды fkind (типы файлов для ClaimParsing_UNI)
            - Справочник ConfigKind (виды направлений)
-           - Как определять PersID (код провайдера) из документов
            → Убрать заглушки TODO в LiteGroupAdapter
            → Протестировать ClaimParsing_UNI на тестовом полисе
 
@@ -1971,28 +2028,48 @@ pytest-httpx==0.30.0
 
 ## Известные ограничения (TODO)
 
-1. **Три метода кор-системы не уточнены** — названия не получены от владельца:
+### Ожидают информации от владельца кор-системы
+
+1. **Четыре метода кор-системы не уточнены** — названия не получены от владельца:
    ```
-   TODO_CONTRACT_METHOD  → layers/core_adapter/lite_group_adapter.py
-   TODO_RISKS_METHOD     → layers/core_adapter/lite_group_adapter.py
-   TODO_ICD10_METHOD     → layers/core_adapter/lite_group_adapter.py
+   TODO_CONTRACT_METHOD   → layers/core_adapter/rest_adapter.py
+   TODO_RISKS_METHOD      → layers/core_adapter/rest_adapter.py
+   TODO_ICD10_METHOD      → layers/core_adapter/rest_adapter.py
+   TODO_PROVIDERS_METHOD  → layers/core_adapter/rest_adapter.py
    ```
+   Логика разбора ответов уже написана, нужно только подставить реальные имена методов.
 
 2. **fkind коды — заглушки** (`layers/core_adapter/file_helpers.py`)  
-   `form_100=1, id_document=2, receipt=3` — уточнить реальные коды.
+   `form_100=1, id_document=2, receipt=3` — уточнить реальные коды у владельца.
 
-3. **PersID и ConfigKind не определены** (`layers/decision/service.py`)  
-   Как получать код провайдера и вид направления — уточнить у владельца.
+3. **ConfigKind не определён** (`layers/decision/service.py::build_risks_list`)  
+   Берётся из первого сервиса первого риска. Уточнить справочник у владельца.
 
-4. **Contract reindex timeout не реализован** (`layers/rag/searcher.py`)  
-   При изменении контракта заявка уходит в `manual_review`.
+### Технические TODO (запланированы в Шаге 15в)
 
-5. **Amount anomaly fraud detection — заглушка** (`layers/decision/service.py`)  
-   Требует накопленной статистики.
+4. **N+1 запросов в RAG searcher** (`layers/rag/searcher.py::_semantic_search`, `_keyword_search`)  
+   `db.get(ContractChunk, row.id)` в цикле → заменить на `SELECT ... WHERE id IN (...)`.
 
-6. **React Portal не реализован** (`services/portal/`)
+5. **get_embedding() блокирует event loop** (`layers/rag/searcher.py:216`)  
+   Синхронный CPU-вызов sentence-transformers в async-контексте → перенести в `run_in_executor`.
 
-7. **Integration tests отсутствуют** (`tests/integration/`)
+6. **Retry-цикл `_call()` при 401** (`layers/core_adapter/rest_adapter.py`)  
+   `continue` после token refresh не уменьшает счётчик попыток; `last_error=None` при исчерпании через 401.
+
+7. **Contract reindex при hash-mismatch не реализован** (`layers/rag/searcher.py:301`)  
+   При изменении контракта — только `log.warning`, переиндексация не запускается.
+
+8. **CORS `allow_origins=[]` в production** (`services/api/main.py:36`)  
+   React Portal заблокирован в production-окружении.
+
+### Функциональные TODO
+
+9. **Amount anomaly fraud detection — заглушка** (`layers/decision/service.py`)  
+   Требует накопленной статистики по суммам заявок.
+
+10. **React Portal не реализован** (`services/portal/`)
+
+11. **Integration tests отсутствуют** (`tests/integration/`)
 
 
 

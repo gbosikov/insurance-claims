@@ -27,6 +27,9 @@ tmp/
 .idea/
 *.swp
 
+# Claude Code local settings (personal, not for sharing)
+.claude/
+
 # Docker
 *.log
 

@@ -3,9 +3,20 @@ Pytest конфигурация и фикстуры.
 """
 
 import asyncio
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
+
+# ── Mock asyncpg до любого импорта моделей ────────────────────────
+# database.py создаёт SQLAlchemy engine на уровне модуля, которому нужен asyncpg.
+# Мокируем только asyncpg — это позволяет SQLAlchemy-моделям загрузиться нормально
+# (class Claim(Base) работает), но не инициирует реального TCP-соединения.
+_asyncpg_mock = MagicMock()
+sys.modules.setdefault("asyncpg", _asyncpg_mock)
+sys.modules.setdefault("asyncpg.connection", _asyncpg_mock)
+sys.modules.setdefault("asyncpg.pool", _asyncpg_mock)
 
 
 @pytest.fixture(scope="session")

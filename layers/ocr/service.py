@@ -56,11 +56,12 @@ class OCRResult:
     strategy_used: str = ""
 
 
-async def _ocr_with_vision_api(image_bytes: bytes) -> list[TextBlock]:
+def _ocr_with_vision_api(image_bytes: bytes) -> list[TextBlock]:
     """
-    Google Vision API — DOCUMENT_TEXT_DETECTION.
+    Google Vision API — DOCUMENT_TEXT_DETECTION (синхронный клиент).
     Подходит для ID-документов и общего текста.
     Использует ADC (Application Default Credentials) автоматически.
+    Запускается в thread executor чтобы не блокировать event loop.
     """
     from google.cloud import vision
 
@@ -93,18 +94,16 @@ async def _ocr_with_vision_api(image_bytes: bytes) -> list[TextBlock]:
     return blocks
 
 
-async def _ocr_with_document_ai(image_bytes: bytes, doc_type: DocType) -> list[TextBlock]:
+def _ocr_with_document_ai(image_bytes: bytes) -> list[TextBlock]:
     """
-    Google Document AI Form Parser — структурный парсинг форм и таблиц.
+    Google Document AI Form Parser — структурный парсинг форм и таблиц (синхронный клиент).
     Используется для form_100 и receipt.
+    Запускается в thread executor чтобы не блокировать event loop.
     """
     from google.cloud import documentai
 
     client = documentai.DocumentProcessorServiceClient()
-
-    # TODO: processor_name берётся из конфигурации тенанта
-    # Пример: projects/{project}/locations/us/processors/{processor_id}
-    processor_name = "projects/insurance-claims-dev/locations/us/processors/FORM_PARSER"
+    processor_name = settings.gcp_document_ai_processor
 
     raw_document = documentai.RawDocument(
         content=image_bytes,
@@ -121,7 +120,6 @@ async def _ocr_with_document_ai(image_bytes: bytes, doc_type: DocType) -> list[T
 
     blocks: list[TextBlock] = []
 
-    # Извлекаем структурированные поля формы
     for entity in document.entities:
         confidence = entity.confidence if entity.confidence else 0.0
         blocks.append(TextBlock(
@@ -129,27 +127,30 @@ async def _ocr_with_document_ai(image_bytes: bytes, doc_type: DocType) -> list[T
             confidence=confidence,
         ))
 
-    # Также берём полный текст как один блок
     if document.text:
         blocks.insert(0, TextBlock(
             text=document.text,
-            confidence=0.90,  # Document AI обычно высокое качество
+            confidence=0.90,
         ))
 
     return blocks
 
 
 async def _ocr_single_attempt(image_bytes: bytes, doc_type: DocType) -> list[TextBlock]:
-    """Один вызов OCR согласно стратегии для типа документа."""
+    """Один вызов OCR согласно стратегии для типа документа.
+    Синхронные Google API клиенты запускаются в thread pool executor.
+    """
+    import functools
+    loop = asyncio.get_running_loop()
     strategy = OCR_STRATEGIES.get(doc_type, "vision_text_detection")
 
     if strategy == "vision_text_detection":
-        return await asyncio.get_event_loop().run_in_executor(
-            None, lambda: asyncio.run(_ocr_with_vision_api(image_bytes))  # type: ignore
+        return await loop.run_in_executor(
+            None, functools.partial(_ocr_with_vision_api, image_bytes)
         )
     else:
-        return await asyncio.get_event_loop().run_in_executor(
-            None, lambda: asyncio.run(_ocr_with_document_ai(image_bytes, doc_type))  # type: ignore
+        return await loop.run_in_executor(
+            None, functools.partial(_ocr_with_document_ai, image_bytes)
         )
 
 

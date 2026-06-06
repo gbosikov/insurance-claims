@@ -242,13 +242,13 @@ async def extract_claim_data(
     3. Кросс-валидация
     4. Аудит-лог
     """
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     with AuditTimer() as timer:
         user_message = _build_user_message(ocr_results)
 
         try:
-            response = client.messages.create(
+            response = await client.messages.create(
                 model=settings.claude_model,
                 max_tokens=settings.claude_extraction_max_tokens,
                 temperature=settings.claude_extraction_temperature,

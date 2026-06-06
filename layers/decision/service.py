@@ -27,9 +27,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.audit import AuditTimer, write_audit_entry
 from core.config import get_settings
+from core.exceptions import PolicyLimitExhaustedError
 from core.schemas.claim import ExtractionResult
 from core.schemas.contract import ContractChunkSchema
-from core.schemas.core_api import ICD10Item, RisksAndLimits
+from core.schemas.core_api import ICD10Item, ProviderInfo, RisksAndLimits
 from core.schemas.decision import ClaimDecision, DiagnosisDecisionSchema, LineItemDecisionSchema
 
 log = structlog.get_logger()
@@ -245,6 +246,34 @@ def build_risks_list(
     return risks_list, config_kind
 
 
+# ── Поиск провайдера ──────────────────────────────────────────────
+
+def find_pers_id(institution: str | None, providers: list[ProviderInfo]) -> int:
+    """
+    Найти PersID провайдера по названию учреждения из документов.
+    Сначала точное совпадение (без учёта регистра), затем по ИНН если передан,
+    затем частичное совпадение по подстроке.
+    Возвращает 0 если провайдер не найден.
+    """
+    if not institution or not providers:
+        return 0
+
+    inst_lower = institution.lower().strip()
+
+    # Точное совпадение
+    for p in providers:
+        if p.name.lower().strip() == inst_lower:
+            return p.pers_id
+
+    # Частичное совпадение: название провайдера содержится в названии учреждения или наоборот
+    for p in providers:
+        p_lower = p.name.lower().strip()
+        if p_lower in inst_lower or inst_lower in p_lower:
+            return p.pers_id
+
+    return 0
+
+
 # ── Антифрод ──────────────────────────────────────────────────────
 
 async def check_fraud(
@@ -301,6 +330,7 @@ async def make_decision(
     extraction: ExtractionResult,
     risks_limits: RisksAndLimits,
     icd10_list: list[ICD10Item],
+    providers: list[ProviderInfo],
     contract_chunks: list[ContractChunkSchema],
     submission_date: date,
     db: AsyncSession,
@@ -312,28 +342,57 @@ async def make_decision(
     with AuditTimer() as timer:
 
         # ── Уровень 1: Детерминированные проверки ─────────────────
+
+        # Парсинг даты события — отдельно, чтобы ValueError не попал в бизнес-ветки
         try:
             event_date = date.fromisoformat(extraction.event.date)
-            check_remaining_limit(risks_limits)
+        except ValueError:
+            return ClaimDecision(
+                claim_id=claim_id,
+                diagnoses=[],
+                total_approved=0.0,
+                deductible_applied=0.0,
+                final_payout=0.0,
+                status="manual_review",
+                requires_manual_review=True,
+                manual_review_reason="invalid_event_date",
+                fraud_flags=[],
+                overall_confidence=0.0,
+                summary=(
+                    f"Не удалось разобрать дату события: «{extraction.event.date}». "
+                    "Требуется ручная проверка оператором."
+                ),
+                prompt_version=PROMPT_VERSION,
+                model_version=settings.claude_model,
+            )
 
-            if not check_claim_filed_in_time(submission_date, event_date):
-                summary = "Заявка подана позже допустимого срока (90 дней) с даты страхового события."
-                return ClaimDecision(
-                    claim_id=claim_id,
-                    diagnoses=[],
-                    total_approved=0.0,
-                    deductible_applied=0.0,
-                    final_payout=0.0,
-                    status="rejected",
-                    requires_manual_review=False,
-                    fraud_flags=[],
-                    overall_confidence=1.0,
-                    summary=summary,
-                    prompt_version=PROMPT_VERSION,
-                    model_version=settings.claude_model,
-                )
-        except Exception as e:
-            summary = str(e)
+        # Лимит полиса — исчерпан → ручная проверка (не автоотказ).
+        # Данные из кор-системы могут быть устаревшими; окончательное решение за оператором.
+        try:
+            check_remaining_limit(risks_limits)
+        except PolicyLimitExhaustedError as e:
+            return ClaimDecision(
+                claim_id=claim_id,
+                diagnoses=[],
+                total_approved=0.0,
+                deductible_applied=0.0,
+                final_payout=0.0,
+                status="manual_review",
+                requires_manual_review=True,
+                manual_review_reason="limit_exhausted",
+                fraud_flags=[],
+                overall_confidence=1.0,
+                summary=(
+                    f"Годовой лимит полиса исчерпан: остаток {e.remaining} {e.currency}. "
+                    "Автоматическое одобрение невозможно. Требуется проверка оператором."
+                ),
+                prompt_version=PROMPT_VERSION,
+                model_version=settings.claude_model,
+            )
+
+        # Срок подачи — однозначный детерминированный отказ (> 90 дней после события).
+        if not check_claim_filed_in_time(submission_date, event_date):
+            delta_days = (submission_date - event_date).days
             return ClaimDecision(
                 claim_id=claim_id,
                 diagnoses=[],
@@ -344,7 +403,10 @@ async def make_decision(
                 requires_manual_review=False,
                 fraud_flags=[],
                 overall_confidence=1.0,
-                summary=summary,
+                summary=(
+                    f"Заявка подана через {delta_days} дней после события "
+                    f"(допустимый срок: 90 дней). Отказ на основании условий договора."
+                ),
                 prompt_version=PROMPT_VERSION,
                 model_version=settings.claude_model,
             )
@@ -352,18 +414,18 @@ async def make_decision(
         # ── Антифрод (параллельно с Уровнем 2) ───────────────────
         import asyncio
         personal_id = extraction.insured.personal_id
-        fraud_task = check_fraud(
+        fraud_task = asyncio.create_task(check_fraud(
             db, tenant_id, personal_id,
             event_date, extraction.event.institution,
             extraction.event.total_claimed,
-        )
+        ))
 
         # ── Уровень 2: Claude API ─────────────────────────────────
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         user_prompt = build_decision_prompt(extraction, risks_limits, contract_chunks)
 
         try:
-            response = client.messages.create(
+            response = await client.messages.create(
                 model=settings.claude_model,
                 max_tokens=settings.claude_decision_max_tokens,
                 temperature=settings.claude_decision_temperature,
@@ -441,9 +503,8 @@ async def make_decision(
         # risks_list и config_kind из одобренных позиций
         risks_list, config_kind = build_risks_list(line_items, risks_limits, extraction.event.date)
 
-        # PersID: TODO — нужен справочник провайдеров из кор-системы
-        # Пока ставим 0; уточнить у владельца название метода lookup
-        pers_id = 0
+        # PersID: ищем по названию учреждения из документов
+        pers_id = find_pers_id(extraction.event.institution, providers)
 
         decision = ClaimDecision(
             claim_id=claim_id,

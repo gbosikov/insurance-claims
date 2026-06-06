@@ -51,7 +51,7 @@ settings = get_settings()
 
 def run_async(coro):
     """Запускает async-корутину в синхронном контексте Celery."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 @celery_app.task(
@@ -138,11 +138,26 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
             claim.status = ClaimStatus.IDENTITY_CHECK
             await db.flush()
 
+            async def _tracked(coro, method: str):
+                """Запускает корутину, логируя имя метода при любом исключении."""
+                try:
+                    return await coro
+                except Exception as exc:
+                    log.error(
+                        "core_api_method_failed",
+                        claim_id=claim_id,
+                        method=method,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    raise
+
             try:
-                contract_data, risks_limits, icd10_list = await asyncio.gather(
-                    core_adapter.get_contract(policy_number),
-                    core_adapter.get_risks_and_limits(policy_number),
-                    core_adapter.get_icd10_list(),
+                contract_data, risks_limits, icd10_list, providers = await asyncio.gather(
+                    _tracked(core_adapter.get_contract(policy_number),          "get_contract"),
+                    _tracked(core_adapter.get_risks_and_limits(policy_number),  "get_risks_and_limits"),
+                    _tracked(core_adapter.get_icd10_list(),                     "get_icd10_list"),
+                    _tracked(core_adapter.get_providers(),                      "get_providers"),
                 )
             except PolicyNotFoundError:
                 claim.status = ClaimStatus.REJECTED
@@ -183,6 +198,7 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                 extraction=extraction,
                 risks_limits=risks_limits,
                 icd10_list=icd10_list,
+                providers=providers,
                 contract_chunks=contract_chunks,
                 submission_date=submission_date,
                 db=db,

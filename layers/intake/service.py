@@ -114,6 +114,21 @@ async def receive_claim(
             doc_type = detect_doc_type(file.filename or "", file.content_type or "")
             validated_files.append((file, data, doc_type))
 
+        # Проверка комплектности документов
+        detected_types = {doc_type for _, _, doc_type in validated_files}
+        missing_types = REQUIRED_DOC_TYPES - detected_types
+        if missing_types:
+            from fastapi import HTTPException
+            missing_names = sorted(t.value for t in missing_types)
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "missing_required_documents",
+                    "missing": missing_names,
+                    "message": f"Отсутствуют обязательные документы: {', '.join(missing_names)}",
+                },
+            )
+
         # Шаг 2: Создание записи заявки
         claim = Claim(
             tenant_id=tenant_id,

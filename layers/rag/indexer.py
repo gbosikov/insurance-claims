@@ -73,9 +73,9 @@ async def chunk_contract_with_claude(text: str) -> list[dict]:
     Семантический chunking контракта через Claude API.
     Возвращает список секций: [{section_type, title, content, key_terms}, ...]
     """
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
-    response = client.messages.create(
+    response = await client.messages.create(
         model=settings.claude_model,
         max_tokens=settings.claude_chunking_max_tokens,
         temperature=settings.claude_extraction_temperature,  # 0.0 — детерминированность
@@ -208,6 +208,105 @@ async def index_contract(
 
     log.info(
         "contract_indexed",
+        policy_number=policy_number,
+        version_id=version_id,
+        chunks=len(raw_chunks),
+    )
+
+    return ContractVersionSchema.model_validate(contract_version)
+
+
+async def index_contract_from_text(
+    *,
+    tenant_id: UUID,
+    policy_number: str,
+    content: str,
+    content_hash: str | None,
+    version_label: str,
+    valid_from: date,
+    db: AsyncSession,
+    storage: StorageClient,
+) -> ContractVersionSchema:
+    """
+    Индексация контракта из текстового содержимого (без PDF).
+    Вызывается при авто-индексации в get_contract_chunks_with_freshness_check,
+    когда кор-система вернула текст договора, а в нашей БД его ещё нет.
+    """
+    # Если хэш не передан из кор-системы — вычисляем из текста
+    actual_hash = content_hash or compute_hash(content.encode("utf-8"))
+
+    # Проверяем: нет ли уже такой версии (по хэшу)
+    existing = await db.execute(
+        select(ContractVersion).where(
+            ContractVersion.tenant_id == tenant_id,
+            ContractVersion.policy_number == policy_number,
+            ContractVersion.content_hash == actual_hash,
+        )
+    )
+    existing_version = existing.scalar_one_or_none()
+    if existing_version:
+        log.info(
+            "contract_already_indexed",
+            policy_number=policy_number,
+            hash=actual_hash[:16],
+        )
+        return ContractVersionSchema.model_validate(existing_version)
+
+    version_id = version_label if version_label else f"v{valid_from.strftime('%Y%m%d')}"
+
+    # Сохраняем текст в storage (pdf_path обязателен в ContractVersion — используем .txt)
+    txt_path = f"tenants/{tenant_id}/contracts/{policy_number}/{version_id}.txt"
+    await storage.upload(content.encode("utf-8"), txt_path, content_type="text/plain")
+
+    # Закрываем предыдущие версии (valid_to)
+    prev_versions = await db.execute(
+        select(ContractVersion).where(
+            ContractVersion.tenant_id == tenant_id,
+            ContractVersion.policy_number == policy_number,
+            ContractVersion.valid_to.is_(None),
+        )
+    )
+    for prev in prev_versions.scalars():
+        prev.valid_to = valid_from
+
+    contract_version = ContractVersion(
+        tenant_id=tenant_id,
+        policy_number=policy_number,
+        version_id=version_id,
+        content_hash=actual_hash,
+        valid_from=valid_from,
+        valid_to=None,
+        pdf_path=txt_path,
+    )
+    db.add(contract_version)
+    await db.flush()
+
+    raw_chunks = await chunk_contract_with_claude(content)
+    log.info("contract_chunked", policy_number=policy_number, chunks=len(raw_chunks))
+
+    for chunk_data in raw_chunks:
+        chunk_content = chunk_data.get("content", "")
+        if not chunk_content.strip():
+            continue
+
+        embedding = get_embedding(chunk_content, is_query=False)
+
+        chunk = ContractChunk(
+            tenant_id=tenant_id,
+            policy_number=policy_number,
+            version_id=version_id,
+            section_type=chunk_data.get("section_type", "general"),
+            title=chunk_data.get("title"),
+            content=chunk_content,
+            key_terms=chunk_data.get("key_terms", []),
+            embedding=embedding,
+        )
+        db.add(chunk)
+
+    await db.commit()
+
+    log.info(
+        "contract_indexed_from_text",
         policy_number=policy_number,
         version_id=version_id,
         chunks=len(raw_chunks),
