@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Env
+.env
+.env.local
+
+# Storage
+storage/
+tmp/
+
+# Model cache
+.cache/
+*.cache
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docker
+*.log
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage

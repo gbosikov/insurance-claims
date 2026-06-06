@@ -1,0 +1,146 @@
+# Запуск ядра системы:  docker compose up -d
+# Запуск с порталом:    docker compose --profile portal up -d
+# Логи:                 docker compose logs -f api worker
+
+services:
+
+  # ── База данных ──────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-claims}
+      POSTGRES_USER:     ${POSTGRES_USER:-claims_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d   # применяются при первом старте
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-claims_user}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis (очередь + кэш) ────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── FastAPI ──────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      - PYTHONPATH=/app
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-claims_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-claims}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
+      - STORAGE_BUCKET=${STORAGE_BUCKET:-claims-documents-dev}
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
+      - CORE_API_BASE_URL=${CORE_API_BASE_URL:-http://mock-core}
+      - CORE_API_KEY=${CORE_API_KEY:-dev-key}
+      - SECRET_KEY=${SECRET_KEY}
+      - ENVIRONMENT=development
+    volumes:
+      - ${APPDATA}/gcloud:/root/.config/gcloud:ro
+      - .:/app
+      - local_storage:/app/storage     # локальное хранилище документов (dev)
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn services.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── Celery Worker ────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      - PYTHONPATH=/app
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-claims_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-claims}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
+      - STORAGE_BUCKET=${STORAGE_BUCKET:-claims-documents-dev}
+      - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
+      - CORE_API_BASE_URL=${CORE_API_BASE_URL:-http://mock-core}
+      - CORE_API_KEY=${CORE_API_KEY:-dev-key}
+      - SECRET_KEY=${SECRET_KEY}
+      - ENVIRONMENT=development
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
+      - TRANSFORMERS_CACHE=/app/.cache/huggingface
+    volumes:
+      - ${APPDATA}/gcloud:/root/.config/gcloud:ro
+      - .:/app
+      - model_cache:/app/.cache/huggingface
+      - local_storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A services.worker.celery_app worker --loglevel=info --concurrency=4
+
+  # ── Celery Beat (планировщик) ────────────────────────────────────
+  beat:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      - PYTHONPATH=/app
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-claims_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-claims}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+    volumes:
+      - .:/app
+    depends_on:
+      - redis
+    command: celery -A services.worker.celery_app beat --loglevel=info
+
+  # ── LibreOffice (конвертация .docx → PDF) ────────────────────────
+  libreoffice:
+    image: linuxserver/libreoffice:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+    volumes:
+      - ./tmp/conversions:/conversions
+    ports:
+      - "3001:3000"
+
+  # ── React Portal (запускается отдельно: --profile portal) ────────
+  portal:
+    profiles: ["portal"]
+    build:
+      context: services/portal
+      dockerfile: Dockerfile
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./services/portal:/app
+      - /app/node_modules
+    command: npm run dev -- --host
+
+volumes:
+  postgres_data:
+  redis_data:
+  model_cache:
+  local_storage:    # локальное хранилище документов (только для dev)
