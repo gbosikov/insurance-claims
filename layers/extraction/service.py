@@ -23,6 +23,7 @@ from core.config import get_settings
 from core.exceptions import CrossValidationError, ExtractionFailedError
 from core.models.claim import ClaimDocument, DocType
 from core.schemas.claim import DiagnoisItem, EventData, ExtractionResult, InsuredData, LineItem
+from layers.extraction.classifier import reclassify_documents
 from layers.ocr.service import OCRResult
 
 log = structlog.get_logger()
@@ -245,6 +246,13 @@ async def extract_claim_data(
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     with AuditTimer() as timer:
+        # Переклассифицируем типы документов по содержимому OCR-текста.
+        # Исправляет ошибки Layer 1 (filename_hint) до того как текст
+        # попадает в промпт Claude — Claude получит правильные лейблы.
+        ocr_results = await reclassify_documents(
+            ocr_results, db, claim_id, tenant_id
+        )
+
         user_message = _build_user_message(ocr_results)
 
         try:

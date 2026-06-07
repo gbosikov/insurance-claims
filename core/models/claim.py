@@ -79,6 +79,10 @@ class ClaimDocument(Base):
     claim_id           = Column(UUID(as_uuid=True), ForeignKey("claims.id", ondelete="CASCADE"), nullable=False)
     tenant_id          = Column(UUID(as_uuid=True), nullable=False)
     doc_type           = Column(Enum(DocType, name="doc_type"), nullable=False)
+    # filename_hint | ocr_rules | operator
+    doc_type_source    = Column(String(30), nullable=False, default="filename_hint")
+    # TRUE когда тип верифицирован (auto_approved или оператором) → годится для обучения
+    doc_type_confirmed = Column(Boolean, nullable=False, default=False)
     storage_path       = Column(Text, nullable=False)
     preprocessed_path  = Column(Text)
     ocr_text           = Column(Text)

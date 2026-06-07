@@ -60,6 +60,9 @@ insurance-claims/
 │   ├── preprocessing/           ← слой 2
 │   ├── ocr/                     ← слой 3
 │   ├── extraction/              ← слой 4
+│   │   ├── service.py           ← извлечение данных через Claude API
+│   │   ├── classifier.py        ← regex-классификатор типов документов по OCR-тексту
+│   │   └── training_exporter.py ← экспорт подтверждённых примеров для обучения ML
 │   ├── rag/                     ← слой 5 (indexer.py + searcher.py + embedder.py)
 │   ├── core_adapter/            ← слой 6
 │   ├── decision/                ← слой 7
@@ -67,6 +70,8 @@ insurance-claims/
 │
 ├── db/
 │   └── migrations/              ← SQL миграции (применяются при старте)
+│       ├── 001_initial.sql      ← начальная схема
+│       └── 002_doc_type_training.sql ← поля для обучающей выборки классификатора
 │
 └── tests/
     ├── unit/
@@ -896,9 +901,74 @@ async def ocr_all_documents(
 
 ## Слой 4 — Extraction Service
 
-**Файл:** `layers/extraction/service.py`
+**Файлы:** `layers/extraction/service.py`, `layers/extraction/classifier.py`, `layers/extraction/training_exporter.py`
 
-**Задача:** извлечь структурированные данные из OCR-текста через Claude API. Строго через tool use — никогда не парси свободный текст.
+**Задача:** переклассифицировать типы документов по содержимому → извлечь структурированные данные через Claude API. Строго через tool use — никогда не парси свободный текст.
+
+### Классификатор типов документов (classifier.py)
+
+Вызывается **первым шагом** `extract_claim_data()`, до передачи текста в Claude.
+
+**Проблема:** Layer 1 определяет тип документа по имени файла (`filename_hint`) — ненадёжно, т.к. клиент может назвать файл произвольно (`scan001.jpg`).
+
+**Решение:** после OCR анализируем содержимое текста regex-паттернами на RU + KA + EN:
+
+```python
+# layers/extraction/classifier.py
+
+MIN_MATCHES = 2  # минимум совпадений для переклассификации
+
+CONTENT_PATTERNS = {
+    DocType.FORM_100:    [...],  # мкб-10, диагноз, სამედიცინო, icd-10, diagnosis ...
+    DocType.ID_DOCUMENT: [...],  # личный номер, \b\d{11}\b, პირადი ნომერი, passport ...
+    DocType.RECEIPT:     [...],  # итого, к оплате, სულ, \d+GEL, invoice ...
+}
+
+def classify_by_ocr_text(text: str, current_type: DocType) -> ClassificationResult:
+    """Подсчитать совпадения для каждого типа. Победитель с >= MIN_MATCHES совпадений."""
+
+async def reclassify_documents(ocr_results, db, claim_id, tenant_id) -> list[OCRResult]:
+    """
+    Для каждого документа:
+    - classify_by_ocr_text()
+    - Если тип изменился → ClaimDocument.doc_type + doc_type_source='ocr_rules' в БД
+    - Обновляет OCRResult.doc_type → Claude получит правильный лейбл в промпте
+    """
+```
+
+**Важно:** `reclassify_documents()` вызывается до `_build_user_message()` — Claude видит уже исправленные метки документов.
+
+### Сбор обучающих данных (training_exporter.py)
+
+`ClaimDocument` содержит два новых поля:
+- `doc_type_source` (`filename_hint` | `ocr_rules` | `operator`) — как определили тип
+- `doc_type_confirmed` (`bool`) — верифицирован ли тип для обучения
+
+**Когда подтверждается:**
+- `AUTO_APPROVED` → routing/service.py автоматически ставит `confirmed=True` для всех документов заявки
+- Оператор подтверждает в ручной проверке → `confirmed=True`, `source='operator'` (через Portal, Шаг 17)
+
+**Экспорт:**
+```powershell
+# Статистика: сколько примеров накоплено
+python -m layers.extraction.training_exporter --stats
+
+# Экспорт в JSONL для обучения
+python -m layers.extraction.training_exporter --output dataset.jsonl
+
+# Только оператором подтверждённые (максимальное качество)
+python -m layers.extraction.training_exporter --output dataset.jsonl --min-source operator
+```
+
+**Цель:** ~200 примеров на класс → обучить `multilingual-e5-large + LogisticRegression` → заменить regex на ML-классификатор (Шаг 20).
+
+### Правило для classifier.py
+
+```python
+# classifier.py вызывается ВСЕГДА в extract_claim_data() как первый шаг
+# Даже если имя файла говорит правильный тип — source обновляется до 'ocr_rules'
+# Это гарантирует что все записи для обучения прошли контентный анализ
+```
 
 ```python
 EXTRACTION_TOOL = {
@@ -1998,6 +2068,15 @@ pytest-httpx==0.30.0
            - #7  ИСПРАВЛЕН: REQUIRED_DOC_TYPES проверяется в receive_claim()
              (было: заявка с одним файлом проходила без валидации комплектности)
 
+✅ Шаг 15г: Классификатор типов документов по OCR-тексту:
+           - layers/extraction/classifier.py — regex-классификатор (RU + KA + EN)
+           - layers/extraction/training_exporter.py — экспорт обучающей выборки
+           - db/migrations/002_doc_type_training.sql — поля doc_type_source, doc_type_confirmed
+           - core/models/claim.py — ClaimDocument получил doc_type_source + doc_type_confirmed
+           - layers/extraction/service.py — reclassify_documents() вызывается до Claude
+           - layers/routing/service.py — AUTO_APPROVED помечает документы как confirmed=True
+           Цель: накопить ~600 примеров → обучить ML-классификатор (Шаг 20)
+
    Шаг 15в: Оставшиеся баги (исправить перед Шагом 16):
            - #16 🟡 N+1 запросов в RAG searcher (_semantic_search, _keyword_search)
                     → заменить db.get() в цикле на один SELECT ... WHERE id IN (...)
@@ -2018,10 +2097,19 @@ pytest-httpx==0.30.0
            → Протестировать ClaimParsing_UNI на тестовом полисе
 
    Шаг 17: Слой 11 (Portal) — создать React приложение
+           При реализации формы загрузки — добавить подтверждение типа документа оператором
+           в UI ручной проверки → устанавливать doc_type_source='operator', doc_type_confirmed=True
 
    Шаг 18: Integration tests — покрыть полный flow end-to-end
 
    Шаг 19: Prometheus + Grafana мониторинг
+
+   Шаг 20: ML-классификатор типов документов (после накопления данных)
+           Условие старта: python -m layers.extraction.training_exporter --stats
+                           показывает ≥200 примеров на каждый из 3 классов
+           Реализация: multilingual-e5-large embeddings + LogisticRegression
+           Интеграция: заменить regex в classifier.py на ML-модель
+                       (интерфейс classify_by_ocr_text() остаётся прежним)
 ```
 
 ---
@@ -2067,9 +2155,18 @@ pytest-httpx==0.30.0
 9. **Amount anomaly fraud detection — заглушка** (`layers/decision/service.py`)  
    Требует накопленной статистики по суммам заявок.
 
-10. **React Portal не реализован** (`services/portal/`)
+10. **React Portal не реализован** (`services/portal/`)  
+    При реализации: добавить подтверждение типа документа оператором → `doc_type_source='operator'`.
 
 11. **Integration tests отсутствуют** (`tests/integration/`)
+
+12. **Оператор не может подтвердить тип документа** (ждёт Portal, Шаг 17)  
+    `doc_type_source='operator'` и `doc_type_confirmed=True` сейчас устанавливаются только  
+    при `AUTO_APPROVED`. Для MANUAL_REVIEW нужен UI в Portal.
+
+13. **ML-классификатор не обучен** (ждёт накопления данных, Шаг 20)  
+    Сейчас работает regex (`classifier.py`). После ~600 подтверждённых документов  
+    запустить `training_exporter --stats` и начать Шаг 20.
 
 
 

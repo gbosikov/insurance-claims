@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.audit import AuditTimer, write_audit_entry
 from core.config import get_settings
-from core.models.claim import Claim, ClaimStatus
+from core.models.claim import Claim, ClaimDocument, ClaimStatus
 from core.models.review import ManualReviewQueue
 from core.schemas.decision import ClaimDecision
 
@@ -139,6 +139,18 @@ async def route_claim(
             claim.overall_confidence = decision.overall_confidence
             claim.routing_reason = result.reason
             claim.processed_at = datetime.utcnow()
+
+            # Подтверждаем типы документов — высокая уверенность системы
+            # означает что документы распознаны корректно → годятся для обучения
+            docs_result = await db.execute(
+                select(ClaimDocument).where(
+                    ClaimDocument.claim_id == claim.id,
+                    ClaimDocument.tenant_id == claim.tenant_id,
+                )
+            )
+            for doc in docs_result.scalars().all():
+                doc.doc_type_confirmed = True
+            await db.flush()
 
             log.info(
                 "claim_auto_approved",
