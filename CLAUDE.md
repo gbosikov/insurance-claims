@@ -2164,8 +2164,8 @@ fi
 exec "$@"
 ```
 
-**Важно:** файл `db/data/ICD10.csv` добавлен в `.gitignore` (большой бинарный справочник).
-При первом деплое скопировать файл вручную или через CI/CD.
+**Важно:** файл `db/data/ICD10.csv` хранится в репозитории (3.6 МБ, 12 435 записей).
+Загружается автоматически при старте контейнера через `entrypoint.sh --skip-if-loaded`.
 
 ### requirements.txt
 
@@ -2291,7 +2291,7 @@ pytest-httpx==0.30.0
            - db/migrations/004_icd10_local.sql — таблица icd10_diagnoses (12 433 записи)
            - core/models/icd10.py — SQLAlchemy модель ICD10Diagnosis
            - db/loaders/load_icd10.py — загрузчик CSV/Excel с auto-detect кодировки и разделителя
-           - db/data/ICD10.csv — добавлен в .gitignore (не в git, деплоить вручную)
+           - db/data/ICD10.csv — в репозитории (3.6 МБ), загружается entrypoint.sh при старте
            - layers/decision/icd10_enricher.py — обогащение диагнозов иерархией через рекурсивный CTE
              (PID → parent → block → chapter), функции enrich_all() и find_diagnosid()
            - services/api/entrypoint.sh — ENTRYPOINT Docker: загружает МКБ-10 при старте с --skip-if-loaded
