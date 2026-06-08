@@ -83,7 +83,8 @@ class ClaimDocument(Base):
     doc_type_source    = Column(String(30), nullable=False, default="filename_hint")
     # TRUE когда тип верифицирован (auto_approved или оператором) → годится для обучения
     doc_type_confirmed = Column(Boolean, nullable=False, default=False)
-    storage_path       = Column(Text, nullable=False)
+    source_url         = Column(Text)      # pre-signed URL внешней системы; заполняется при intake
+    storage_path       = Column(Text)      # путь в нашем storage; NULL до скачивания в worker
     preprocessed_path  = Column(Text)
     ocr_text           = Column(Text)
     ocr_confidence     = Column(Numeric(4, 3))

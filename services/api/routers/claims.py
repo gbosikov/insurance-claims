@@ -6,16 +6,14 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_db
-from core.exceptions import FileTooLargeError, UnsupportedFileTypeError
 from core.models.audit import AuditLog
 from core.models.claim import Claim
-from core.schemas.claim import ClaimResponse, ClaimStatusResponse
-from core.storage import get_storage_client
+from core.schemas.claim import ClaimCreateRequest, ClaimResponse, ClaimStatusResponse
 from layers.intake.service import receive_claim
 from services.worker.celery_app import celery_app
 
@@ -26,35 +24,24 @@ DEFAULT_TENANT_ID = UUID("00000000-0000-0000-0000-000000000001")
 
 @router.post("", response_model=ClaimResponse, status_code=201)
 async def create_claim(
-    policy_number: str = Form(..., description="Номер медицинской карточки (обязательно)"),
-    files: list[UploadFile] = File(..., description="Документы заявки (form_100, id_document)"),
-    client_reference: str | None = Form(None, description="Внешний ID клиента"),
+    request: ClaimCreateRequest,
     db: AsyncSession = Depends(get_db),
 ):
     """
     Принять новую страховую заявку.
 
-    Обязательные параметры:
-    - policy_number — номер медицинской карточки
-    - files — документы: Форма 100 и документ удостоверяющий личность
+    Обязательные поля:
+    - policy_number  — номер медицинской карточки
+    - documents      — список ссылок на файлы (url + filename)
 
-    Форматы файлов: JPEG, PNG, PDF. Максимальный размер: 20 МБ.
+    Файлы скачиваются асинхронно в фоновом worker-е после постановки задачи в очередь.
     """
-    storage = get_storage_client()
-    try:
-        return await receive_claim(
-            tenant_id=DEFAULT_TENANT_ID,
-            policy_number=policy_number,
-            files=files,
-            client_reference=client_reference,
-            db=db,
-            storage=storage,
-            celery_app=celery_app,
-        )
-    except UnsupportedFileTypeError as e:
-        raise HTTPException(status_code=415, detail=f"Unsupported file type: {e.mime_type}")
-    except FileTooLargeError as e:
-        raise HTTPException(status_code=413, detail=f"File too large: {e.size_mb:.1f} MB > {e.max_mb} MB")
+    return await receive_claim(
+        tenant_id=DEFAULT_TENANT_ID,
+        request=request,
+        db=db,
+        celery_app=celery_app,
+    )
 
 
 @router.get("/{claim_id}", response_model=ClaimStatusResponse)

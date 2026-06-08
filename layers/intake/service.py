@@ -1,185 +1,125 @@
 """
 Слой 1 — Intake Service.
 
-Задача: принять документы, проверить форматы, сохранить оригиналы,
-создать запись заявки в БД, поставить задачу в очередь Celery.
+Задача: принять ссылки на документы, создать запись заявки в БД,
+поставить задачу в очередь Celery.
+Файлы скачиваются в worker (шаг 0) — не здесь.
 """
 
 from __future__ import annotations
 
-import hashlib
-import mimetypes
-import time
+from urllib.parse import urlparse
 from uuid import UUID
 
 import structlog
-from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.audit import AuditTimer, write_audit_entry
 from core.config import get_settings
-from core.exceptions import FileTooLargeError, UnsupportedFileTypeError
 from core.models.claim import Claim, ClaimDocument, ClaimStatus, DocType
-from core.schemas.claim import ClaimResponse
-from core.storage import StorageClient
+from core.schemas.claim import ClaimCreateRequest, ClaimResponse
 
 log = structlog.get_logger()
 settings = get_settings()
 
-# ── Константы ─────────────────────────────────────────────────────
 
-ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "application/pdf"}
-MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
-
-# Ключевые слова в имени файла → тип документа
-DOC_TYPE_HINTS: dict[str, list[str]] = {
-    "form_100":    ["form100", "form-100", "форма", "направление", "act", "акт"],
-    "id_document": ["passport", "id", "паспорт", "удостоверение", "license"],
-    "receipt":     ["receipt", "check", "чек", "квитанция", "invoice"],
-}
-
-# Обязательные типы документов для заявки
-REQUIRED_DOC_TYPES = {DocType.FORM_100, DocType.ID_DOCUMENT, DocType.RECEIPT}
-
-
-def detect_doc_type(filename: str, mime_type: str) -> DocType:
-    """Определить тип документа по имени файла."""
-    lower = filename.lower()
-    for doc_type_str, hints in DOC_TYPE_HINTS.items():
-        if any(hint in lower for hint in hints):
-            return DocType(doc_type_str)
-    # Fallback: если не определили — form_100 (наиболее частый)
-    return DocType.FORM_100
-
-
-async def validate_file(file: UploadFile) -> bytes:
-    """
-    Проверить файл на допустимость.
-    Возвращает содержимое файла или бросает исключение.
-    """
-    # Определяем MIME-тип
-    mime_type = file.content_type or ""
-    if not mime_type:
-        # Пытаемся определить по имени файла
-        guessed, _ = mimetypes.guess_type(file.filename or "")
-        mime_type = guessed or ""
-
-    if mime_type not in ALLOWED_MIME_TYPES:
-        raise UnsupportedFileTypeError(mime_type)
-
-    data = await file.read()
-
-    if len(data) > MAX_FILE_SIZE_BYTES:
-        size_mb = len(data) / (1024 * 1024)
-        raise FileTooLargeError(size_mb, MAX_FILE_SIZE_BYTES / (1024 * 1024))
-
-    return data
+def _validate_url(url: str) -> None:
+    """Проверить что строка является валидным HTTP/HTTPS URL."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"Недопустимый URL: {url!r}")
 
 
 async def receive_claim(
     *,
     tenant_id: UUID,
-    policy_number: str,
-    files: list[UploadFile],
-    client_reference: str | None,
+    request: ClaimCreateRequest,
     db: AsyncSession,
-    storage: StorageClient,
-    celery_app: object,  # Celery app — передаём как Any чтобы избежать circular import
+    celery_app: object,
 ) -> ClaimResponse:
     """
     Точка входа для новой заявки.
 
     1. Валидация policy_number
-    2. Валидация каждого файла (формат, размер)
-    3. Определение типа документа
-    4. Сохранение оригиналов в storage
-    5. Создание записи Claim в БД (policy_number сохраняется сразу)
-    6. Создание записей ClaimDocument
-    7. Постановка задачи process_claim в Celery
-    8. Запись в audit_log: step=intake
-    9. Возврат claim_id клиенту
+    2. Валидация URL каждого документа (формат http/https)
+    3. Создание записи Claim в БД
+    4. Создание записей ClaimDocument (source_url, storage_path=None)
+    5. Запись в audit_log: step=intake
+    6. Постановка задачи process_claim в Celery
+    7. Возврат claim_id клиенту
     """
-    if not policy_number or not policy_number.strip():
+    if not request.policy_number or not request.policy_number.strip():
         from fastapi import HTTPException
         raise HTTPException(status_code=422, detail="policy_number is required")
 
-    policy_number = policy_number.strip()
-    log.info("claim_received", tenant_id=str(tenant_id), policy_number=policy_number, files_count=len(files))
+    if not request.documents:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="documents list is empty")
+
+    policy_number = request.policy_number.strip()
+
+    # Валидация URL до записи в БД
+    for doc_ref in request.documents:
+        try:
+            _validate_url(doc_ref.url)
+        except ValueError as e:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=422, detail=str(e))
+
+    log.info(
+        "claim_received",
+        tenant_id=str(tenant_id),
+        policy_number=policy_number,
+        documents_count=len(request.documents),
+    )
 
     with AuditTimer() as timer:
-        # Шаг 1: Валидация и чтение файлов
-        validated_files: list[tuple[UploadFile, bytes, DocType]] = []
-        for file in files:
-            data = await validate_file(file)
-            doc_type = detect_doc_type(file.filename or "", file.content_type or "")
-            validated_files.append((file, data, doc_type))
-
-        # Проверка комплектности документов
-        detected_types = {doc_type for _, _, doc_type in validated_files}
-        missing_types = REQUIRED_DOC_TYPES - detected_types
-        if missing_types:
-            from fastapi import HTTPException
-            missing_names = sorted(t.value for t in missing_types)
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "missing_required_documents",
-                    "missing": missing_names,
-                    "message": f"Отсутствуют обязательные документы: {', '.join(missing_names)}",
-                },
-            )
-
-        # Шаг 2: Создание записи заявки
+        # Шаг 1: Создание записи заявки
         claim = Claim(
             tenant_id=tenant_id,
-            policy_number=policy_number,      # сохраняем сразу — не из extraction
+            policy_number=policy_number,
             status=ClaimStatus.RECEIVED,
-            client_reference=client_reference,
+            client_reference=request.client_reference,
         )
         db.add(claim)
         await db.flush()  # получаем claim.id
 
-        # Шаг 3 & 4: Сохранение файлов + создание ClaimDocument
+        # Шаг 2: Создание ClaimDocument для каждой ссылки
         doc_records: list[dict] = []
-        for file, data, doc_type in validated_files:
-            # Генерируем путь и сохраняем в storage
-            storage_path = storage.generate_path(
-                tenant_id=str(tenant_id),
-                claim_id=str(claim.id),
-                filename=file.filename or f"{doc_type.value}.bin",
-            )
-            await storage.upload(data, storage_path, content_type=file.content_type or "application/octet-stream")
-
+        for doc_ref in request.documents:
             doc = ClaimDocument(
                 claim_id=claim.id,
                 tenant_id=tenant_id,
-                doc_type=doc_type,
-                storage_path=storage_path,
+                doc_type=DocType.FORM_100,   # временная метка; слой 4 переопределит по OCR
+                source_url=doc_ref.url,
+                storage_path=None,           # заполнит worker после скачивания
             )
             db.add(doc)
             doc_records.append({
-                "doc_type": doc_type.value,
-                "filename": file.filename,
-                "size_bytes": len(data),
-                "storage_path": storage_path,
+                "filename": doc_ref.filename,
+                "source_url": doc_ref.url,
             })
 
         await db.flush()
 
-    # Шаг 5: Аудит-лог
+    # Шаг 3: Аудит-лог
     await write_audit_entry(
         db,
         claim_id=claim.id,
         tenant_id=tenant_id,
         step="intake",
-        input_data={"policy_number": policy_number, "files_count": len(files), "client_reference": client_reference},
+        input_data={
+            "policy_number": policy_number,
+            "documents_count": len(request.documents),
+            "client_reference": request.client_reference,
+        },
         output_data={"documents": doc_records, "claim_id": str(claim.id)},
         duration_ms=timer.duration_ms,
     )
 
     await db.commit()
 
-    # Шаг 6: Ставим задачу в очередь (после commit — чтобы worker видел данные в БД)
+    # Шаг 4: Ставим задачу в очередь (после commit — worker видит данные в БД)
     celery_app.send_task(
         "process_claim",
         kwargs={"claim_id": str(claim.id), "tenant_id": str(tenant_id)},

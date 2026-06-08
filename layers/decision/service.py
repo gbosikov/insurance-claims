@@ -32,11 +32,12 @@ from core.schemas.claim import ExtractionResult
 from core.schemas.contract import ContractChunkSchema
 from core.schemas.core_api import ICD10Item, ProviderInfo, RisksAndLimits
 from core.schemas.decision import ClaimDecision, DiagnosisDecisionSchema, LineItemDecisionSchema
+from layers.decision.icd10_enricher import EnrichedDiagnosis, enrich_all
 
 log = structlog.get_logger()
 settings = get_settings()
 
-PROMPT_VERSION = "decision/v2.0.0"
+PROMPT_VERSION = "decision/v3.0.0"  # categorical reasoning + ICD10 hierarchy
 
 # ── Decision Tool ─────────────────────────────────────────────────
 
@@ -96,16 +97,27 @@ DECISION_TOOL: dict[str, Any] = {
     }
 }
 
-DECISION_SYSTEM_PROMPT = """Ты — эксперт по страховым выплатам ДМС. Принимай точные, обоснованные решения.
+DECISION_SYSTEM_PROMPT = """Ты — эксперт-андеррайтер по ДМС. У тебя есть медицинские знания и знание страхового права.
 
-ВАЖНЫЕ ПРАВИЛА:
-1. Если в тексте договора нет ЯВНОГО указания что случай покрывается — верни requires_manual_review=true
-2. НЕ принимай решение об ОТКАЗЕ без явного пункта договора об исключении
-3. При любом сомнении — ручная проверка, не отказ
-4. Цитируй КОНКРЕТНЫЙ пункт договора для каждого решения (contract_reference)
-5. Рассчитывай итоговую сумму с учётом процента покрытия и остатка лимита из risks_data
-6. summary должен содержать: решение + обоснование + уверенность + флаги (читает оператор)
-7. Отвечай СТРОГО в формате JSON-инструмента — никакого свободного текста"""
+ВАЖНО: Страховые договоры описывают КАТЕГОРИИ случаев, а не конкретные коды МКБ-10.
+Твоя задача — определить, попадает ли конкретный диагноз под описанную категорию.
+
+ПРАВИЛА ИНТЕРПРЕТАЦИИ:
+1. Если договор покрывает "острые респираторные заболевания", а диагноз J06.9 —
+   это ПОКРЫТЫЙ СЛУЧАЙ. Рассуждай: J06.9 ∈ [острые] ∩ [инфекции] ∩ [органы дыхания] ✓
+2. Исключения имеют приоритет над покрытием — проверяй раздел [exclusions] для каждого диагноза
+3. При граничном случае → requires_manual_review=true, НЕ отказ
+4. ЗАПРЕЩЕНО: отказывать только потому что конкретный код МКБ-10 не упомянут в договоре
+
+ПРОЦЕСС ДЛЯ КАЖДОГО ДИАГНОЗА:
+a) Используй "Медицинская иерархия" из промпта — это цепочка категорий для диагноза
+b) Найди в разделах договора категорию, к которой относится диагноз
+c) Проверь раздел [exclusions] — исключён ли этот случай явно?
+d) Вынеси решение с прямой цитатой из договора (contract_reference)
+
+ФИНАНСЫ: рассчитывай сумму с учётом coverage_pct и остатка remaining из risks_data
+SUMMARY: решение + обоснование + уверенность + флаги (текст читает оператор кор-системы)
+ФОРМАТ: отвечай СТРОГО в формате JSON-инструмента — никакого свободного текста"""
 
 
 # ── Уровень 1: Детерминированные проверки ─────────────────────────
@@ -131,28 +143,44 @@ def check_claim_filed_in_time(submission_date: date, event_date: date, max_days:
 
 def build_decision_prompt(
     extraction: ExtractionResult,
+    enriched: dict[str, "EnrichedDiagnosis"],
     risks_limits: RisksAndLimits,
     chunks: list[ContractChunkSchema],
 ) -> str:
-    """Собирает промпт: данные заявки + риски/лимиты + чанки договора."""
+    """Собирает промпт: данные заявки + иерархия МКБ-10 + риски/лимиты + чанки договора."""
 
     claim_data = {
         "insured": {
-            "full_name":    extraction.insured.full_name,
-            "birth_date":   extraction.insured.birth_date,
-            "personal_id":  extraction.insured.personal_id,
+            "full_name":     extraction.insured.full_name,
+            "birth_date":    extraction.insured.birth_date,
+            "personal_id":   extraction.insured.personal_id,
             "policy_number": extraction.insured.policy_number,
         },
         "event": {
-            "date":        extraction.event.date,
-            "institution": extraction.event.institution,
-            "diagnoses":   [{"icd10_code": d.icd10_code, "description": d.description} for d in extraction.event.diagnoses],
-            "line_items":  [{"description": li.description, "amount": li.amount} for li in extraction.event.line_items],
+            "date":          extraction.event.date,
+            "institution":   extraction.event.institution,
+            "diagnoses":     [
+                {"icd10_code": d.icd10_code, "doctor_description": d.description}
+                for d in extraction.event.diagnoses
+            ],
+            "line_items":    [{"description": li.description, "amount": li.amount} for li in extraction.event.line_items],
             "total_claimed": extraction.event.total_claimed,
         },
         "extraction_confidence": extraction.extraction_confidence,
         "flags": extraction.flags,
     }
+
+    # Медицинская иерархия: каждый диагноз → цепочка категорий на русском
+    hierarchy_lines = []
+    for d in extraction.event.diagnoses:
+        e = enriched.get(d.icd10_code)
+        if e and e.name_r:
+            hierarchy_lines.append(
+                f"  {d.icd10_code}: {e.category_chain_ru}"
+            )
+        else:
+            hierarchy_lines.append(f"  {d.icd10_code}: (не найден в справочнике МКБ-10)")
+    hierarchy_text = "\n".join(hierarchy_lines) if hierarchy_lines else "  (диагнозы не определены)"
 
     risks_data = {
         "annual_limit": risks_limits.annual_limit,
@@ -160,27 +188,34 @@ def build_decision_prompt(
         "currency":     risks_limits.currency,
         "risks": [
             {
-                "risk_id":       r.risk_id,
-                "name":          r.name,
-                "coverage_pct":  r.coverage_pct,
-                "remaining":     r.remaining_limit,
+                "risk_id":      r.risk_id,
+                "name":         r.name,
+                "coverage_pct": r.coverage_pct,
+                "remaining":    r.remaining_limit,
             }
             for r in risks_limits.risks
         ],
     }
 
+    # Исключения — первыми, чтобы Claude проверил их до решения о покрытии
+    SECTION_ORDER = {"exclusions": 0, "coverage_cases": 1, "limits": 2, "claim_conditions": 3}
+    sorted_chunks = sorted(chunks, key=lambda c: SECTION_ORDER.get(c.section_type or "", 9))
     chunks_text = "\n\n".join(
         f"[{chunk.section_type or 'general'}] {chunk.title or ''}\n{chunk.content}"
-        for chunk in chunks
+        for chunk in sorted_chunks
     )
 
     return f"""## Данные заявки
 {json.dumps(claim_data, ensure_ascii=False, indent=2)}
 
+## Медицинская иерархия диагнозов (МКБ-10)
+Используй эти категории чтобы найти соответствующий раздел в договоре:
+{hierarchy_text}
+
 ## Риски и лимиты (актуальные данные из кор-системы)
 {json.dumps(risks_data, ensure_ascii=False, indent=2)}
 
-## Релевантные пункты договора
+## Релевантные пункты договора (исключения — первыми)
 {chunks_text if chunks_text else "Релевантные пункты не найдены — верни requires_manual_review=true"}"""
 
 
@@ -411,7 +446,7 @@ async def make_decision(
                 model_version=settings.claude_model,
             )
 
-        # ── Антифрод (параллельно с Уровнем 2) ───────────────────
+        # ── Антифрод (параллельно с обогащением и Уровнем 2) ────────
         import asyncio
         personal_id = extraction.insured.personal_id
         fraud_task = asyncio.create_task(check_fraud(
@@ -420,9 +455,13 @@ async def make_decision(
             extraction.event.total_claimed,
         ))
 
+        # ── Обогащение диагнозов иерархией МКБ-10 ────────────────
+        diagnosis_codes = [d.icd10_code for d in extraction.event.diagnoses]
+        enriched: dict[str, EnrichedDiagnosis] = await enrich_all(diagnosis_codes, db)
+
         # ── Уровень 2: Claude API ─────────────────────────────────
         client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-        user_prompt = build_decision_prompt(extraction, risks_limits, contract_chunks)
+        user_prompt = build_decision_prompt(extraction, enriched, risks_limits, contract_chunks)
 
         try:
             response = await client.messages.create(

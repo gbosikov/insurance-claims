@@ -49,9 +49,15 @@ class ExtractionResult(BaseModel):
 
 # ── API-схемы заявки ──────────────────────────────────────────────
 
-class ClaimCreate(BaseModel):
-    policy_number:    str                  # номер медицинской карточки — обязательный
-    client_reference: str | None = None   # внешний ID клиента (опционально)
+class DocumentRef(BaseModel):
+    url:      str   # pre-signed URL файла во внешней системе
+    filename: str   # оригинальное имя файла (сохраняется как есть)
+
+
+class ClaimCreateRequest(BaseModel):
+    policy_number:    str                        # номер медицинской карточки — обязательный
+    client_reference: str | None = None          # внешний ID клиента (опционально)
+    documents:        list[DocumentRef]          # ссылки на файлы во внешней системе
 
 
 class ClaimResponse(BaseModel):

@@ -18,6 +18,11 @@ build/
 storage/
 tmp/
 
+# Справочные данные (большие файлы, не в репозитории)
+db/data/*.csv
+db/data/*.xlsx
+db/data/*.xls
+
 # Model cache
 .cache/
 *.cache

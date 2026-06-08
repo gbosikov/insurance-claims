@@ -193,6 +193,79 @@ def test_find_pers_id_empty_providers():
     assert find_pers_id("Клиника Аврора", []) == 0
 
 
+# ── build_decision_prompt ─────────────────────────────────────────
+
+
+def test_build_decision_prompt_includes_hierarchy():
+    """Промпт должен содержать категориальную цепочку МКБ-10 из enriched."""
+    from layers.decision.icd10_enricher import AncestorNode, EnrichedDiagnosis
+    from layers.decision.service import build_decision_prompt
+    from core.schemas.core_api import RiskInfo, RisksAndLimits
+
+    enriched = {
+        "J06.9": EnrichedDiagnosis(
+            code="J06.9",
+            name_r="Острая инфекция верхних дыхательных путей",
+            name_g=None,
+            name_e=None,
+            ancestors=[
+                AncestorNode(id=2, extcod="J06", name_r="Острые инфекции верхних дыхательных путей", name_g=None, name_e=None),
+                AncestorNode(id=3, extcod=None, name_r="Болезни органов дыхания", name_g=None, name_e=None),
+            ],
+        )
+    }
+
+    risks = RisksAndLimits(
+        policy_number="DMC-001",
+        risks=[RiskInfo(risk_id=1, name="Амбулаторное", coverage_pct=80.0, total_limit=1000.0, remaining_limit=1000.0, currency="GEL")],
+        annual_limit=1000.0, remaining=1000.0, currency="GEL",
+    )
+
+    prompt = build_decision_prompt(make_extraction(), enriched, risks, [])
+
+    assert "Медицинская иерархия" in prompt
+    assert "J06.9" in prompt
+    assert "Болезни органов дыхания" in prompt
+    assert "Острая инфекция верхних дыхательных путей" in prompt
+
+
+def test_build_decision_prompt_missing_code_shows_fallback():
+    """Если код не найден в enriched — показывается fallback-метка."""
+    from layers.decision.service import build_decision_prompt
+    from core.schemas.core_api import RiskInfo, RisksAndLimits
+
+    risks = RisksAndLimits(
+        policy_number="DMC-001",
+        risks=[RiskInfo(risk_id=1, name="Амбулаторное", coverage_pct=80.0, total_limit=1000.0, remaining_limit=1000.0, currency="GEL")],
+        annual_limit=1000.0, remaining=1000.0, currency="GEL",
+    )
+
+    prompt = build_decision_prompt(make_extraction(), {}, risks, [])
+
+    assert "не найден в справочнике МКБ-10" in prompt
+
+
+def test_build_decision_prompt_exclusions_before_coverage():
+    """Чанки exclusions должны идти раньше coverage_cases в тексте промпта."""
+    from layers.decision.service import build_decision_prompt
+    from core.schemas.contract import ContractChunkSchema
+    from core.schemas.core_api import RiskInfo, RisksAndLimits
+    from uuid import uuid4
+
+    coverage = ContractChunkSchema(id=uuid4(), policy_number="DMC-001", version_id="v1", section_type="coverage_cases", title="Покрытие", content="Покрываются ОРВИ")
+    exclusion = ContractChunkSchema(id=uuid4(), policy_number="DMC-001", version_id="v1", section_type="exclusions", title="Исключения", content="Исключаются хронические")
+
+    risks = RisksAndLimits(
+        policy_number="DMC-001",
+        risks=[RiskInfo(risk_id=1, name="Амбулаторное", coverage_pct=80.0, total_limit=1000.0, remaining_limit=1000.0, currency="GEL")],
+        annual_limit=1000.0, remaining=1000.0, currency="GEL",
+    )
+
+    prompt = build_decision_prompt(make_extraction(), {}, risks, [coverage, exclusion])
+
+    assert prompt.index("Исключаются хронические") < prompt.index("Покрываются ОРВИ")
+
+
 @pytest.mark.asyncio
 async def test_fraud_task_is_asyncio_task():
     """fraud_task должен быть asyncio.Task, а не корутиной — для параллельного исполнения с Claude."""
@@ -242,7 +315,8 @@ async def test_fraud_task_is_asyncio_task():
         icd10 = [ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ")]
 
         with patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client), \
-             patch("layers.decision.service.write_audit_entry", AsyncMock()):
+             patch("layers.decision.service.write_audit_entry", AsyncMock()), \
+             patch("layers.decision.service.enrich_all", AsyncMock(return_value={})):
             from layers.decision.service import make_decision
             await make_decision(
                 claim_id=CLAIM_ID, tenant_id=TENANT_ID,

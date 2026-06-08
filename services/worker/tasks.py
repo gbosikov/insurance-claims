@@ -3,6 +3,7 @@ Celery Tasks — оркестрация pipeline обработки заявки
 
 Главная задача: process_claim
 Порядок шагов:
+  0. Download (скачать файлы по source_url → наш storage)
   1. Preprocessing (quality gate)
   2. OCR (параллельно для всех документов)
   3. Extraction (Claude API)
@@ -29,8 +30,10 @@ from core.exceptions import (
     ContractNotIndexedError,
     CoreAPIUnavailableError,
     DocumentQualityError,
+    FileTooLargeError,
     OCRFailedError,
     PolicyNotFoundError,
+    UnsupportedFileTypeError,
 )
 from core.models.claim import Claim, ClaimDocument, ClaimStatus
 from core.storage import get_storage_client
@@ -38,7 +41,7 @@ from layers.core_adapter.factory import get_core_adapter
 from layers.core_adapter.file_helpers import documents_to_file_fields
 from layers.decision.service import make_decision
 from layers.extraction.service import extract_claim_data
-from layers.intake.service import REQUIRED_DOC_TYPES
+from layers.intake.downloader import download_all_documents
 from layers.ocr.service import ocr_all_documents
 from layers.preprocessing.service import preprocess_all_documents
 from layers.rag.searcher import build_rag_query, get_contract_chunks_with_freshness_check
@@ -100,6 +103,38 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                 claim.routing_reason = "Отсутствует номер медкарточки"
                 await db.commit()
                 return {"status": "manual_review", "reason": "missing_policy_number"}
+
+            # ── Слой 0: Download (скачать файлы по source_url) ────
+            from sqlalchemy import text as sa_text
+            allowed_hosts_result = await db.execute(
+                sa_text(
+                    "SELECT value FROM platform.tenant_configs "
+                    "WHERE tenant_id = :tid AND key = 'allowed_download_hosts'"
+                ),
+                {"tid": str(tenant_uuid)},
+            )
+            row = allowed_hosts_result.fetchone()
+            allowed_hosts: list[str] = []
+            if row:
+                import json as _json
+                allowed_hosts = _json.loads(row[0])
+
+            try:
+                await download_all_documents(
+                    documents=documents,
+                    allowed_hosts=allowed_hosts,
+                    storage=storage,
+                    db=db,
+                    tenant_id=tenant_uuid,
+                    claim_id=claim_uuid,
+                )
+            except (DocumentQualityError, UnsupportedFileTypeError, FileTooLargeError) as e:
+                reason = getattr(e, "reason", type(e).__name__)
+                detail = getattr(e, "detail", str(e))
+                claim.status = ClaimStatus.DOCS_REQUESTED
+                claim.routing_reason = detail
+                await db.commit()
+                return {"status": "docs_requested", "reason": reason}
 
             # ── Слой 2: Preprocessing ──────────────────────────────
             claim.status = ClaimStatus.PREPROCESSING
