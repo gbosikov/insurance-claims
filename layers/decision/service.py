@@ -186,11 +186,17 @@ def build_decision_prompt(
     enriched: dict[str, "EnrichedDiagnosis"],
     risks_limits: RisksAndLimits,
     chunks: list[ContractChunkSchema],
+    positive_list_match: dict[str, tuple[bool, str | None]] | None = None,
 ) -> str:
     """Собирает промпт: данные заявки + иерархия МКБ-10 + риски/лимиты + чанки договора.
 
-    ВАЖНО: выделяет CARVEOUT-исключения отдельно с их условиями.
+    ВАЖНО: выделяет CARVEOUT-исключения и POSITIVE LIST отдельно.
+
+    Args:
+        positive_list_match: результат check_positive_list() вида {description: (is_in_list, procedure_name)}
     """
+    if positive_list_match is None:
+        positive_list_match = {}
 
     claim_data = {
         "insured": {
@@ -288,10 +294,24 @@ def build_decision_prompt(
 ## Риски и лимиты (актуальные данные из кор-системы)
 {json.dumps(risks_data, ensure_ascii=False, indent=2)}"""]
 
+    # POSITIVE LIST: явно покрытые процедуры (100%)
+    positive_list_text = ""
+    positive_procedures = [
+        f"  ✓ {desc}" for desc, (is_in_list, proc_name) in positive_list_match.items()
+        if is_in_list
+    ]
+    if positive_procedures:
+        positive_list_text = "\n".join(positive_procedures)
+
     if carveout_text:
         sections.append(f"""## CARVEOUT-исключения (исключения с УСЛОВИЯМИ)
 ⚠️  ВАЖНО: Проверь условие перед отказом!
 {carveout_text}""")
+
+    if positive_list_text:
+        sections.append(f"""## POSITIVE LIST — явно покрытые процедуры (100%)
+✅ ЭТИ ПРОЦЕДУРЫ ВСЕГДА ПОКРЫТЫ (раздел 1.7.3-1.7.4), не требуют диагностики:
+{positive_list_text}""")
 
     if other_text:
         sections.append(f"""## Остальные пункты договора
@@ -739,9 +759,27 @@ async def make_decision(
                     reason=reason,
                 )
 
+        # ── POSITIVE LIST Preprocessing (явно покрытые процедуры) ────
+        # Проверяем какие услуги в POSITIVE LIST (всегда 100% покрыты)
+        positive_list_match = await check_positive_list(
+            extraction.event.line_items,
+            tenant_id=tenant_id,
+            policy_number=claim.policy_number,
+            version_id="latest",  # TODO: получить из contract_chunks
+            db=db,
+        )
+        log.info(
+            "positive_list_check_done",
+            claim_id=str(claim_id),
+            matched_count=sum(1 for v in positive_list_match.values() if v[0]),
+        )
+
         # ── Уровень 2: Claude API ─────────────────────────────────
         client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-        user_prompt = build_decision_prompt(extraction, enriched, risks_limits, contract_chunks)
+        user_prompt = build_decision_prompt(
+            extraction, enriched, risks_limits, contract_chunks,
+            positive_list_match=positive_list_match,
+        )
 
         try:
             response = await client.messages.create(
@@ -803,6 +841,24 @@ async def make_decision(
                 diag.approved_amount = 0.0
                 diag.rejection_reason = carveout_rejections[diag.icd10_code]
                 # Не обновляем contract_reference — CARVEOUT-причина в rejection_reason
+
+        # ── Применить POSITIVE LIST результаты ─────────────────────────────
+        # Если услуга в POSITIVE LIST → 100% покрыта, переопределяем решение Claude
+        for line_item in line_items:
+            desc = line_item.description or ""
+            if desc in positive_list_match:
+                is_in_list, procedure_name = positive_list_match[desc]
+                if is_in_list:
+                    # POSITIVE LIST процедура → ВСЕГДА покрыта 100%
+                    line_item.is_covered = True
+                    line_item.approved_amount = line_item.claimed_amount
+                    line_item.linked_icd10 = None  # POSITIVE LIST не привязана к диагнозу
+                    log.info(
+                        "positive_list_coverage_applied",
+                        claim_id=str(claim_id),
+                        procedure=procedure_name,
+                        claimed_amount=line_item.claimed_amount,
+                    )
 
         all_covered = all(d.is_covered for d in diagnoses) if diagnoses else False
         any_covered = any(d.is_covered for d in diagnoses) if diagnoses else False
@@ -879,12 +935,15 @@ async def make_decision(
             "total_claimed":   extraction.event.total_claimed,
             "rag_chunks_count": len(contract_chunks),
             "risks_count":     len(risks_limits.risks),
+            "service_urgency": extraction.event.service_urgency,
         },
         output_data={
             "status":          decision.status,
             "final_payout":    decision.final_payout,
             "requires_manual_review": decision.requires_manual_review,
             "fraud_flags":     decision.fraud_flags,
+            "carveout_rejections_count": len(carveout_rejections),
+            "positive_list_matched_count": sum(1 for v in positive_list_match.values() if v[0]),
             "diagnosid":       decision.diagnosid,
             "pers_id":         decision.pers_id,
             "config_kind":     decision.config_kind,
