@@ -461,3 +461,157 @@ async def create_carveout_chunks(
         policy_number=policy_number,
         count=len(carveouts)
     )
+
+
+# ── POSITIVE LIST — явно покрытые процедуры (Pass 1) ──────────────────────────
+
+POSITIVE_LIST_PARSING_PROMPT = """
+Извлеки POSITIVE LIST — явно покрытые медицинские процедуры/услуги из контракта.
+
+Это раздел 1.7.3-1.7.4 контракта ДМС, содержащий явный перечень процедур,
+которые ВСЕГДА покрыты страховкой (независимо от диагноза, сроков, и т.д.).
+
+Примеры:
+- პოლიპექტომია (полипэктомия)
+- ადენოიდექტომია (аденоидэктомия)
+- სტენტირება (стентирование)
+- ლაზერული კორექცია (лазерная коррекция)
+
+Для каждой процедуры в явном списке верни JSON объект:
+{
+    "procedure_name_ka": "სქელი ნაწლავის მუქოპლასტიკა",  // На грузинском (обязателен)
+    "procedure_name_ru": "Кольцеватная пластика толстой кишки",  // На русском (если есть)
+    "procedure_name_en": "Colostomy reversal",  // На английском (если есть)
+    "procedure_code": "45.92",  // ICD-9-CM код процедуры (если есть)
+    "coverage_percent": 100.0,  // % покрытия (по умолчанию 100)
+    "sublimit": null,  // Суб-лимит если есть (например 5000 GEL)
+    "section_reference": "1.7.3"  // Пункт в контракте где упомянута
+}
+
+Правила:
+- Процедуры в явном списке → процедура ВСЕГДА ПОКРЫТА (нет исключений)
+- Если несколько названий на одном языке → первое основное
+- ICD-9-CM коды используются для медицинских процедур
+- Выдели чёткую границу между POSITIVE LIST и обычным текстом
+- Если раздел очень большой (>100 процедур) → укажи это в error
+
+Верни ТОЛЬКО JSON-массив без пояснений:
+[...]
+"""
+
+
+async def parse_positive_list_with_claude(text: str) -> list[dict]:
+    """Парсим POSITIVE LIST процедур из контракта через Claude API."""
+    from anthropic import AsyncAnthropic
+    from core.config import get_settings
+
+    settings = get_settings()
+    client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+
+    try:
+        response = await client.messages.create(
+            model=settings.claude_model,
+            max_tokens=4096,
+            temperature=0.0,
+            system=POSITIVE_LIST_PARSING_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Распарси POSITIVE LIST из этого контракта:\n\n{text}"
+                }
+            ]
+        )
+
+        raw_text = response.content[0].text
+        procedures = json.loads(raw_text)
+
+        if not isinstance(procedures, list):
+            procedures = []
+
+        return procedures
+
+    except json.JSONDecodeError:
+        log.warning("positive_list_parsing_failed", reason="invalid_json")
+        return []
+    except Exception as e:
+        log.error("positive_list_parsing_error", error=str(e))
+        return []
+
+
+async def create_positive_list_records(
+    procedures: list[dict],
+    *,
+    tenant_id: UUID,
+    policy_number: str,
+    version_id: str,
+    db: AsyncSession,
+) -> int:
+    """Создаём записи PositiveListProcedure в БД из распарсенного POSITIVE LIST."""
+    from core.models.contract import PositiveListProcedure
+    from sqlalchemy.dialects.postgresql import insert
+
+    if not procedures:
+        log.info("no_procedures_to_save")
+        return 0
+
+    saved_count = 0
+
+    for proc in procedures:
+        try:
+            # Валидация обязательных полей
+            procedure_name_ka = proc.get("procedure_name_ka", "").strip()
+            if not procedure_name_ka:
+                log.warning("positive_list_skip_no_ka_name", proc=proc)
+                continue
+
+            procedure = PositiveListProcedure(
+                tenant_id=tenant_id,
+                policy_number=policy_number,
+                version_id=version_id,
+                procedure_code=proc.get("procedure_code"),
+                procedure_name_ka=procedure_name_ka,
+                procedure_name_ru=proc.get("procedure_name_ru"),
+                procedure_name_en=proc.get("procedure_name_en"),
+                coverage_percent=proc.get("coverage_percent", 100.0),
+                sublimit=proc.get("sublimit"),
+                section_reference=proc.get("section_reference"),
+            )
+
+            # Upsert: если уже есть процедура с тем же кодом → update
+            stmt = insert(PositiveListProcedure).values(
+                tenant_id=tenant_id,
+                policy_number=policy_number,
+                version_id=version_id,
+                procedure_code=proc.get("procedure_code"),
+                procedure_name_ka=procedure_name_ka,
+                procedure_name_ru=proc.get("procedure_name_ru"),
+                procedure_name_en=proc.get("procedure_name_en"),
+                coverage_percent=proc.get("coverage_percent", 100.0),
+                sublimit=proc.get("sublimit"),
+                section_reference=proc.get("section_reference"),
+            ).on_conflict_do_update(
+                index_elements=[
+                    "tenant_id", "policy_number", "version_id", "procedure_code"
+                ],
+                set_={
+                    "procedure_name_ka": procedure_name_ka,
+                    "procedure_name_ru": proc.get("procedure_name_ru"),
+                    "procedure_name_en": proc.get("procedure_name_en"),
+                    "coverage_percent": proc.get("coverage_percent", 100.0),
+                    "sublimit": proc.get("sublimit"),
+                    "section_reference": proc.get("section_reference"),
+                }
+            )
+
+            await db.execute(stmt)
+            saved_count += 1
+
+        except Exception as e:
+            log.warning("positive_list_procedure_error", error=str(e), proc=proc)
+
+    log.info(
+        "positive_list_procedures_saved",
+        policy_number=policy_number,
+        count=saved_count
+    )
+    return saved_count

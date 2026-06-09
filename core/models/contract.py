@@ -1,7 +1,8 @@
 """ORM-модели для контрактов и RAG-чанков."""
 
 import uuid
-from sqlalchemy import Column, Date, DateTime, Index, String, Text, func
+from decimal import Decimal
+from sqlalchemy import Column, Date, DateTime, Index, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import relationship
 
@@ -66,3 +67,38 @@ class ContractChunk(Base):
                     "ContractVersion.version_id==ContractChunk.version_id, "
                     "ContractVersion.tenant_id==ContractChunk.tenant_id)",
     )
+
+
+class PositiveListProcedure(Base):
+    """POSITIVE LIST — явно покрытые медицинские процедуры/услуги."""
+
+    __tablename__ = "positive_list_procedures"
+
+    id                = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id         = Column(UUID(as_uuid=True), nullable=False)
+    policy_number     = Column(String(50), nullable=False)
+    version_id        = Column(String(20), nullable=False)
+    procedure_code    = Column(String(50))                    # SNOMED, ICD-9-CM или внутренний код
+    procedure_name_ka = Column(Text, nullable=False)          # На грузинском
+    procedure_name_ru = Column(Text)                          # На русском
+    procedure_name_en = Column(Text)                          # На английском
+    coverage_percent  = Column(Numeric(5, 2), default=100.0)  # % покрытия
+    sublimit          = Column(Numeric(10, 2))                # Суб-лимит для процедуры
+    section_reference = Column(String(20))                    # Например "1.7.3"
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PositiveListParsingLog(Base):
+    """Лог парсинга POSITIVE LIST процедур из контракта."""
+
+    __tablename__ = "positive_list_parsing_log"
+
+    id                  = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id           = Column(UUID(as_uuid=True), nullable=False)
+    policy_number       = Column(String(50), nullable=False)
+    version_id          = Column(String(20), nullable=False)
+    claude_prompt_used  = Column(String(50))              # версия промпта
+    raw_response        = Column(Text)                    # сырой ответ от Claude
+    procedures_found    = Column(Numeric(10, 0))          # сколько процедур распарсили
+    errors              = Column(ARRAY(Text))             # какие-то ошибки/предупреждения
+    parsed_at           = Column(DateTime(timezone=True), server_default=func.now())

@@ -302,6 +302,91 @@ def build_decision_prompt(
     return "\n\n".join(sections)
 
 
+# ── POSITIVE LIST — явно покрытые процедуры ──────────────────────────────
+
+async def check_positive_list(
+    line_items: list[LineItem],
+    tenant_id: UUID,
+    policy_number: str,
+    version_id: str,
+    db: AsyncSession,
+) -> dict[str, tuple[bool, str | None]]:
+    """
+    Проверить есть ли процедуры/услуги в POSITIVE LIST.
+
+    Возвращает словарь:
+      {
+        "line_item_description": (is_in_positive_list, procedure_name)
+      }
+
+    Если процедура в POSITIVE LIST → ВСЕГДА ПОКРЫТА (100%).
+    Этот результат переопределяет любые CARVEOUT-исключения.
+    """
+    from core.models.contract import PositiveListProcedure
+    from sqlalchemy import or_, select
+
+    if not line_items:
+        return {}
+
+    results = {}
+
+    # Загружаем все процедуры для этого контракта
+    stmt = select(PositiveListProcedure).where(
+        PositiveListProcedure.tenant_id == tenant_id,
+        PositiveListProcedure.policy_number == policy_number,
+        PositiveListProcedure.version_id == version_id,
+    )
+    db_result = await db.execute(stmt)
+    procedures_in_list = db_result.scalars().all()
+
+    if not procedures_in_list:
+        # POSITIVE LIST пуст — все результаты (False, None)
+        for item in line_items:
+            results[item.description] = (False, None)
+        return results
+
+    # Для каждой услуги в заявке проверяем совпадение с POSITIVE LIST
+    from difflib import SequenceMatcher
+
+    for item in line_items:
+        desc_lower = (item.description or "").lower().strip()
+        best_match = None
+        best_ratio = 0.0
+
+        for proc in procedures_in_list:
+            # Проверяем совпадение по всем названиям
+            names_to_check = [
+                proc.procedure_name_ka or "",
+                proc.procedure_name_ru or "",
+                proc.procedure_name_en or "",
+            ]
+
+            for name in names_to_check:
+                if not name:
+                    continue
+
+                name_lower = name.lower().strip()
+                ratio = SequenceMatcher(None, desc_lower, name_lower).ratio()
+
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_match = proc
+
+        # Если совпадение ≥ 0.70 → в POSITIVE LIST
+        if best_ratio >= 0.70 and best_match:
+            procedure_name = (
+                best_match.procedure_name_ru or
+                best_match.procedure_name_ka or
+                best_match.procedure_name_en or
+                "Unknown"
+            )
+            results[item.description] = (True, procedure_name)
+        else:
+            results[item.description] = (False, None)
+
+    return results
+
+
 # ── CARVEOUT Exclusion Logic ─────────────────────────────────────────
 
 def apply_carveout_exclusion_logic(
