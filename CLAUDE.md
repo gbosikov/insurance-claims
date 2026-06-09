@@ -2508,14 +2508,12 @@ pytest-httpx==0.30.0
            Принцип: контракт описывает категории → enricher строит цепочку J06.9 → глава J →
            Claude рассуждает "входит ли диагноз в покрываемую категорию" вместо exact-match
 
-   Шаг 15в: Оставшиеся баги (исправить перед Шагом 16):
-           - #16 🟡 N+1 запросов в RAG searcher (_semantic_search, _keyword_search)
-                    → заменить db.get() в цикле на один SELECT ... WHERE id IN (...)
-           - #17 🟡 get_embedding() блокирует event loop (синхронный CPU-вызов в async)
-                    → перенести в run_in_executor
-           - #4  🟡 Retry-цикл rest_adapter._call(): 401 не уменьшает счётчик попыток,
-                    last_error=None при исчерпании через 401
-           - #3  🟡 Contract hash-mismatch: только log.warning, переиндексация не запущена
+✅ Шаг 15в: Исправлены баги:
+           - #16 ✅ N+1 в RAG searcher → batch SELECT ... WHERE id IN (...)
+           - #17 ✅ get_embedding() → run_in_executor (не блокирует event loop)
+           - #4  ✅ Retry 401: inline повтор с новым токеном, range(max_retries) без +1
+           - #3  ✅ Contract hash-mismatch → asyncio.wait_for(reindex, timeout=45)
+           - #28 ✅ Stochastic QA sampling: 5% AUTO_APPROVED → manual_review
            - #10 🟢 CORS allow_origins=[] в production → портал заблокирован
            - #9  🟢 Сталый TODO-комментарий в core/schemas/decision.py
 
@@ -2589,11 +2587,11 @@ pytest-httpx==0.30.0
            Применять в make_decision(): effective_confidence = raw * calibration_factor
            Файл: services/worker/tasks_analytics.py (новый)
 
-   Шаг 28: Stochastic QA Sampling
+✅ Шаг 28: Stochastic QA Sampling — реализован
            5% AUTO_APPROVED → manual_review с reason="stochastic_qa_sample"
            Ставка: settings.decision_stochastic_qa_rate (0.05)
            Данные QA-выборки → входят в калибровку (Шаг 27)
-           Файл: layers/decision/service.py (3 строки в конце make_decision)
+           Файл: layers/decision/service.py
 ```
 
 ---

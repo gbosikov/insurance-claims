@@ -131,13 +131,14 @@ class LiteGroupAdapter(CoreSystemAdapter):
     async def _call(self, method_name: str, xml_data: dict) -> dict:
         """
         POST /LiteApi/LiteServiceJSON
-        Retry: 3 попытки, backoff [1, 3, 10] сек.
-        При 401 → refresh_token + одна дополнительная попытка.
+        Retry: max_retries попыток, backoff [1, 3, 10] сек.
+        При 401 → refresh_token + один inline повтор (не считается как attempt).
+        Два 401 подряд (после refresh) → CoreAPIUnavailableError.
         """
         token = await self._get_token()
         last_error: Exception | None = None
 
-        for attempt in range(self._max_retries + 1):  # +1 для повтора после 401
+        for attempt in range(self._max_retries):
             try:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
                     resp = await client.post(
@@ -147,9 +148,18 @@ class LiteGroupAdapter(CoreSystemAdapter):
                     )
 
                     if resp.status_code == 401:
-                        log.info("core_token_expired_refreshing")
+                        log.info("core_token_expired_refreshing", attempt=attempt)
                         token = await self._refresh_token()
-                        continue  # повторить с новым токеном
+                        # Один inline повтор с новым токеном — не считается как attempt (#4)
+                        resp = await client.post(
+                            self._service_url,
+                            json={"METHODNAME": method_name, "XML_DATA": xml_data},
+                            headers={"Authorization": token, "Content-Type": "application/json"},
+                        )
+                        if resp.status_code == 401:
+                            raise CoreAPIUnavailableError(
+                                message=f"Method={method_name}: 401 after token refresh"
+                            )
 
                     if resp.status_code == 404:
                         raise PolicyNotFoundError(f"Method={method_name}, policy not found")
@@ -157,7 +167,7 @@ class LiteGroupAdapter(CoreSystemAdapter):
                     resp.raise_for_status()
                     return resp.json()
 
-            except PolicyNotFoundError:
+            except (PolicyNotFoundError, CoreAPIUnavailableError):
                 raise
 
             except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
@@ -169,7 +179,7 @@ class LiteGroupAdapter(CoreSystemAdapter):
                     error=str(e),
                 )
                 if attempt < self._max_retries - 1:
-                    await asyncio.sleep(RETRY_BACKOFF[min(attempt, 2)])
+                    await asyncio.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
 
         raise CoreAPIUnavailableError(
             message=f"Method={method_name} failed after {self._max_retries} attempts: {last_error}"

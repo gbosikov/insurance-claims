@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 from datetime import date
 from uuid import UUID
 
@@ -111,13 +113,20 @@ async def _semantic_search(
     })
     rows = result.fetchall()
 
-    chunks: list[tuple[ContractChunk, float]] = []
-    for row in rows:
-        chunk = await db.get(ContractChunk, row.id)
-        if chunk:
-            chunks.append((chunk, 1.0 - row.distance))  # similarity = 1 - distance
+    if not rows:
+        return []
 
-    return chunks
+    # Batch load — один SELECT вместо N запросов в цикле (#16)
+    ids = [row.id for row in rows]
+    distance_by_id = {row.id: row.distance for row in rows}
+    batch = await db.execute(select(ContractChunk).where(ContractChunk.id.in_(ids)))
+    chunks_by_id = {c.id: c for c in batch.scalars().all()}
+
+    return [
+        (chunks_by_id[row.id], 1.0 - distance_by_id[row.id])
+        for row in rows
+        if row.id in chunks_by_id
+    ]
 
 
 async def _keyword_search(
@@ -162,13 +171,20 @@ async def _keyword_search(
     })
     rows = result.fetchall()
 
-    chunks: list[tuple[ContractChunk, float]] = []
-    for row in rows:
-        chunk = await db.get(ContractChunk, row.id)
-        if chunk:
-            chunks.append((chunk, float(row.rank)))
+    if not rows:
+        return []
 
-    return chunks
+    # Batch load — один SELECT вместо N запросов в цикле (#16)
+    ids = [row.id for row in rows]
+    rank_by_id = {row.id: float(row.rank) for row in rows}
+    batch = await db.execute(select(ContractChunk).where(ContractChunk.id.in_(ids)))
+    chunks_by_id = {c.id: c for c in batch.scalars().all()}
+
+    return [
+        (chunks_by_id[row.id], rank_by_id[row.id])
+        for row in rows
+        if row.id in chunks_by_id
+    ]
 
 
 async def get_active_version(
@@ -212,11 +228,12 @@ async def search_chunks(
     if top_k is None:
         top_k = settings.rag_top_k
 
-    # Эмбеддинг запроса
-    query_embedding = get_embedding(query, is_query=True)
+    # Эмбеддинг запроса — в executor, чтобы не блокировать event loop (#17)
+    query_embedding = await asyncio.get_running_loop().run_in_executor(
+        None, functools.partial(get_embedding, query, True)
+    )
 
     # Параллельный поиск
-    import asyncio
     semantic_task = _semantic_search(
         db, tenant_id, policy_number, version_id,
         query_embedding, top_k * 2
@@ -289,7 +306,7 @@ async def get_contract_chunks_with_freshness_check(
         if version is None:
             raise ContractNotIndexedError(policy_number)
 
-    # Проверка актуальности по content_hash
+    # Проверка актуальности по content_hash — переиндексировать при изменении (#3)
     if contract_data is not None and contract_data.content_hash:
         if version.content_hash and version.content_hash != contract_data.content_hash:
             log.info(
@@ -298,8 +315,36 @@ async def get_contract_chunks_with_freshness_check(
                 old_hash=version.content_hash[:16],
                 new_hash=contract_data.content_hash[:16],
             )
-            # TODO: переиндексировать с timeout=45 сек → manual_review при таймауте
-            log.warning("contract_reindex_needed_but_not_implemented", policy_number=policy_number)
+            _REINDEX_TIMEOUT_SEC = 45
+            try:
+                from layers.rag.indexer import index_contract_from_text
+                from core.storage import get_storage_client
+                await asyncio.wait_for(
+                    index_contract_from_text(
+                        tenant_id=tenant_id,
+                        policy_number=policy_number,
+                        content=contract_data.content,
+                        content_hash=contract_data.content_hash,
+                        version_label=contract_data.version or "v1",
+                        valid_from=event_date,
+                        db=db,
+                        storage=get_storage_client(),
+                    ),
+                    timeout=_REINDEX_TIMEOUT_SEC,
+                )
+                version = await get_active_version(db, tenant_id, policy_number, event_date)
+                log.info("contract_reindexed", policy_number=policy_number)
+            except asyncio.TimeoutError:
+                raise ContractReindexTimeoutError(policy_number, timeout_sec=_REINDEX_TIMEOUT_SEC)
+            except ContractReindexTimeoutError:
+                raise
+            except Exception as exc:
+                # Не блокируем обработку — продолжаем со старой версией
+                log.warning(
+                    "contract_reindex_failed_using_old_version",
+                    policy_number=policy_number,
+                    error=str(exc),
+                )
 
     return await search_chunks(
         db=db,
