@@ -67,6 +67,16 @@ class Settings(BaseSettings):
     environment: str = "development"
     secret_key: str = "change_me"
 
+    # ── Webhook Security ────────────────────────────────────────────
+    # Секретный ключ для подписи webhook от CoreAPI
+    # Используется для HMAC-SHA256 верификации
+    # Должен быть сгенерирован случайно и согласован с CoreAPI
+    # В production: generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+    webhook_secret_key: str = ""  # пусто = отключить проверку (только для dev)
+    webhook_signature_header: str = "x-webhook-signature"  # заголовок с подписью
+    webhook_signature_algorithm: str = "sha256"  # алгоритм подписи
+    webhook_signature_version: str = "v1"  # версия формата подписи
+
     # ── Эмбеддинги (локальная модель) ─────────────────────────────
     embedding_model: str = "intfloat/multilingual-e5-large"
     transformers_cache: str = "/app/.cache/huggingface"

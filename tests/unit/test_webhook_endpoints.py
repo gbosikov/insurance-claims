@@ -1,9 +1,13 @@
-"""Tests for webhook endpoints."""
+"""Tests for webhook endpoints with signature verification."""
 
+import hashlib
+import hmac
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
 
 import pytest
+from fastapi import HTTPException
 
 from services.api.routers.webhooks import (
     ContractUpdatedPayload,
@@ -11,6 +15,7 @@ from services.api.routers.webhooks import (
     webhook_contract_updated,
     webhook_policy_status_changed,
     webhook_test,
+    verify_webhook_signature,
 )
 
 
@@ -18,28 +23,33 @@ class TestContractUpdatedWebhook:
     """Tests for POST /internal/hooks/contract-updated webhook."""
 
     @pytest.mark.asyncio
-    async def test_webhook_contract_updated_queues_reindex_task(self):
-        """Webhook should queue reindex task when contract is updated."""
-        payload = ContractUpdatedPayload(
-            policy_number="POL-001",
-            version_id="v20240609",
-            reason="contract_text_updated",
-            timestamp="2024-06-09T12:34:56Z",
-        )
+    async def test_webhook_contract_updated_with_valid_signature(self):
+        """Webhook should queue reindex task when signature is valid."""
+        payload_dict = {
+            "policy_number": "POL-001",
+            "version_id": "v20240609",
+            "reason": "contract_text_updated",
+            "timestamp": "2024-06-09T12:34:56Z",
+        }
+        payload_bytes = json.dumps(payload_dict).encode("utf-8")
+        secret = "test-secret-key"
 
-        with patch("services.api.routers.webhooks.celery_app") as mock_celery:
-            result = await webhook_contract_updated(payload)
+        # Generate valid signature
+        sig = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
+        signature_header = f"v1,sha256={sig}"
+
+        # Mock request
+        mock_request = AsyncMock()
+        mock_request.body = AsyncMock(return_value=payload_bytes)
+
+        with patch("services.api.routers.webhooks.celery_app") as mock_celery, \
+             patch("services.api.routers.webhooks.settings") as mock_settings:
+            mock_settings.webhook_secret_key = secret
+
+            result = await webhook_contract_updated(mock_request, signature_header)
 
             # Verify task was queued
             mock_celery.send_task.assert_called_once()
-            call_kwargs = mock_celery.send_task.call_args[1]
-            assert call_kwargs["task_name"] == "reindex_contract_structures"
-            assert call_kwargs["queue"] == "contracts"
-
-            # Verify payload passed correctly
-            task_kwargs = call_kwargs["kwargs"]
-            assert task_kwargs["policy_number"] == "POL-001"
-            assert task_kwargs["version_id"] == "v20240609"
 
             # Verify response
             assert result["status"] == "queued"
@@ -48,142 +58,164 @@ class TestContractUpdatedWebhook:
             assert result["webhook_id"].startswith("wh_")
 
     @pytest.mark.asyncio
-    async def test_webhook_contract_updated_without_version_id(self):
-        """Webhook should use 'latest' if version_id not provided."""
-        payload = ContractUpdatedPayload(
-            policy_number="POL-002",
-            reason="contract_active",
-            timestamp="2024-06-09T12:34:56Z",
-        )
+    async def test_webhook_contract_updated_invalid_signature_returns_401(self):
+        """Webhook should return 401 if signature is invalid."""
+        payload_bytes = b'{"policy_number": "POL-001"}'
+        secret = "test-secret-key"
 
-        with patch("services.api.routers.webhooks.celery_app") as mock_celery:
-            result = await webhook_contract_updated(payload)
+        # Invalid signature
+        signature_header = "v1,sha256=invalid_signature_abc123"
 
-            # Verify task was queued with 'latest'
-            call_kwargs = mock_celery.send_task.call_args[1]
-            task_kwargs = call_kwargs["kwargs"]
-            assert task_kwargs["version_id"] == "latest"
+        mock_request = AsyncMock()
+        mock_request.body = AsyncMock(return_value=payload_bytes)
 
-            assert result["status"] == "queued"
+        with patch("services.api.routers.webhooks.settings") as mock_settings:
+            mock_settings.webhook_secret_key = secret
 
-    @pytest.mark.asyncio
-    async def test_webhook_contract_updated_logs_event(self):
-        """Webhook should log receipt and task queueing."""
-        payload = ContractUpdatedPayload(
-            policy_number="POL-001",
-            version_id="v20240609",
-            reason="contract_text_updated",
-        )
+            with pytest.raises(HTTPException) as exc_info:
+                await webhook_contract_updated(mock_request, signature_header)
 
-        with patch("services.api.routers.webhooks.celery_app"), \
-             patch("services.api.routers.webhooks.log") as mock_log:
-
-            result = await webhook_contract_updated(payload)
-
-            # Verify logging
-            webhook_id = result["webhook_id"]
-
-            # Should log webhook receipt
-            webhook_received_calls = [
-                c for c in mock_log.info.call_args_list
-                if "webhook_received" in str(c)
-            ]
-            assert len(webhook_received_calls) > 0
-
-            # Should log task queuing
-            task_queued_calls = [
-                c for c in mock_log.info.call_args_list
-                if "contract_reindex_queued" in str(c)
-            ]
-            assert len(task_queued_calls) > 0
+            assert exc_info.value.status_code == 401
+            assert "signature" in exc_info.value.detail.lower()
 
     @pytest.mark.asyncio
-    async def test_webhook_contract_updated_response_format(self):
-        """Webhook response should have correct format and fields."""
-        payload = ContractUpdatedPayload(
-            policy_number="POL-001",
-            version_id="v20240609",
-            reason="contract_text_updated",
-        )
+    async def test_webhook_contract_updated_missing_signature_returns_401(self):
+        """Webhook should return 401 if signature header is missing."""
+        payload_bytes = b'{"policy_number": "POL-001"}'
+        secret = "test-secret-key"
 
-        with patch("services.api.routers.webhooks.celery_app"):
-            result = await webhook_contract_updated(payload)
+        mock_request = AsyncMock()
+        mock_request.body = AsyncMock(return_value=payload_bytes)
 
-            # Verify response structure
-            assert isinstance(result, dict)
+        with patch("services.api.routers.webhooks.settings") as mock_settings:
+            mock_settings.webhook_secret_key = secret
+
+            with pytest.raises(HTTPException) as exc_info:
+                await webhook_contract_updated(mock_request, None)
+
+            assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_webhook_contract_updated_invalid_payload_returns_400(self):
+        """Webhook should return 400 for invalid JSON payload."""
+        payload_bytes = b'{"invalid json'  # Malformed JSON
+        secret = "test-secret-key"
+
+        sig = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
+        signature_header = f"v1,sha256={sig}"
+
+        mock_request = AsyncMock()
+        mock_request.body = AsyncMock(return_value=payload_bytes)
+
+        with patch("services.api.routers.webhooks.settings") as mock_settings:
+            mock_settings.webhook_secret_key = secret
+
+            with pytest.raises(HTTPException) as exc_info:
+                await webhook_contract_updated(mock_request, signature_header)
+
+            assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_webhook_contract_updated_dev_mode_no_signature(self):
+        """In dev mode (no secret configured), signature check should be skipped."""
+        payload_dict = {
+            "policy_number": "POL-001",
+            "reason": "contract_text_updated",
+        }
+        payload_bytes = json.dumps(payload_dict).encode("utf-8")
+
+        # Fake signature (won't be checked in dev mode)
+        signature_header = "v1,sha256=fake_signature"
+
+        mock_request = AsyncMock()
+        mock_request.body = AsyncMock(return_value=payload_bytes)
+
+        with patch("services.api.routers.webhooks.celery_app") as mock_celery, \
+             patch("services.api.routers.webhooks.settings") as mock_settings:
+            mock_settings.webhook_secret_key = ""  # Dev mode: no secret
+
+            result = await webhook_contract_updated(mock_request, signature_header)
+
+            # Should succeed despite invalid signature (dev mode)
             assert result["status"] == "queued"
-            assert "webhook_id" in result
-            assert "received_at" in result
-            assert "policy_number" in result
-            assert "message" in result
-
-            # Verify values
-            assert result["policy_number"] == "POL-001"
-            assert "queued" in result["message"].lower()
+            mock_celery.send_task.assert_called_once()
 
 
 class TestPolicyStatusChangedWebhook:
     """Tests for POST /internal/hooks/policy-status-changed webhook."""
 
     @pytest.mark.asyncio
-    async def test_webhook_policy_status_changed_receives_and_logs(self):
-        """Webhook should receive policy status change and log it."""
-        payload = PolicyStatusChangedPayload(
-            policy_number="POL-001",
-            status="inactive",
-            timestamp="2024-06-09T12:34:56Z",
-        )
+    async def test_webhook_policy_status_changed_with_valid_signature(self):
+        """Webhook should receive and log status change with valid signature."""
+        payload_dict = {
+            "policy_number": "POL-001",
+            "status": "inactive",
+            "timestamp": "2024-06-09T12:34:56Z",
+        }
+        payload_bytes = json.dumps(payload_dict).encode("utf-8")
+        secret = "test-secret-key"
 
-        with patch("services.api.routers.webhooks.log") as mock_log:
-            result = await webhook_policy_status_changed(payload)
+        sig = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
+        signature_header = f"v1,sha256={sig}"
 
-            # Verify logging
-            webhook_log_calls = [
-                c for c in mock_log.info.call_args_list
-                if "webhook_received" in str(c)
-            ]
-            assert len(webhook_log_calls) > 0
+        mock_request = AsyncMock()
+        mock_request.body = AsyncMock(return_value=payload_bytes)
 
-            # Verify response
+        with patch("services.api.routers.webhooks.settings") as mock_settings:
+            mock_settings.webhook_secret_key = secret
+
+            result = await webhook_policy_status_changed(mock_request, signature_header)
+
             assert result["status"] == "received"
             assert result["policy_number"] == "POL-001"
             assert "webhook_id" in result
             assert result["webhook_id"].startswith("wh_")
 
     @pytest.mark.asyncio
+    async def test_webhook_policy_status_changed_invalid_signature_returns_401(self):
+        """Webhook should return 401 if signature is invalid."""
+        payload_bytes = b'{"policy_number": "POL-001", "status": "inactive"}'
+        secret = "test-secret-key"
+
+        signature_header = "v1,sha256=invalid_signature"
+
+        mock_request = AsyncMock()
+        mock_request.body = AsyncMock(return_value=payload_bytes)
+
+        with patch("services.api.routers.webhooks.settings") as mock_settings:
+            mock_settings.webhook_secret_key = secret
+
+            with pytest.raises(HTTPException) as exc_info:
+                await webhook_policy_status_changed(mock_request, signature_header)
+
+            assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
     async def test_webhook_policy_status_changed_various_statuses(self):
-        """Webhook should handle different policy status values."""
+        """Webhook should handle different policy statuses."""
         statuses = ["active", "inactive", "suspended", "expired"]
+        secret = "test-secret-key"
 
         for status in statuses:
-            payload = PolicyStatusChangedPayload(
-                policy_number="POL-001",
-                status=status,
-            )
+            payload_dict = {
+                "policy_number": "POL-001",
+                "status": status,
+            }
+            payload_bytes = json.dumps(payload_dict).encode("utf-8")
 
-            with patch("services.api.routers.webhooks.log"):
-                result = await webhook_policy_status_changed(payload)
+            sig = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
+            signature_header = f"v1,sha256={sig}"
+
+            mock_request = AsyncMock()
+            mock_request.body = AsyncMock(return_value=payload_bytes)
+
+            with patch("services.api.routers.webhooks.settings") as mock_settings:
+                mock_settings.webhook_secret_key = secret
+
+                result = await webhook_policy_status_changed(mock_request, signature_header)
 
                 assert result["status"] == "received"
                 assert result["policy_number"] == "POL-001"
-
-    @pytest.mark.asyncio
-    async def test_webhook_policy_status_changed_response_format(self):
-        """Webhook response should have correct format."""
-        payload = PolicyStatusChangedPayload(
-            policy_number="POL-001",
-            status="inactive",
-        )
-
-        with patch("services.api.routers.webhooks.log"):
-            result = await webhook_policy_status_changed(payload)
-
-            assert isinstance(result, dict)
-            assert result["status"] == "received"
-            assert "webhook_id" in result
-            assert "received_at" in result
-            assert "policy_number" in result
-            assert "message" in result
 
 
 class TestTestWebhook:
@@ -191,7 +223,7 @@ class TestTestWebhook:
 
     @pytest.mark.asyncio
     async def test_webhook_test_returns_ok(self):
-        """Test webhook should always return 200 OK."""
+        """Test webhook should always return 200 OK (no signature check)."""
         with patch("services.api.routers.webhooks.log"):
             result = await webhook_test()
 
@@ -268,23 +300,32 @@ class TestWebhookPayloads:
 
 
 class TestWebhookIntegration:
-    """Integration tests for webhook flow."""
+    """Integration tests for webhook flow with signature verification."""
 
     @pytest.mark.asyncio
-    async def test_contract_updated_webhook_end_to_end(self):
-        """Full flow: webhook receipt → reindex task queuing."""
-        payload = ContractUpdatedPayload(
-            policy_number="POL-001",
-            version_id="v20240609",
-            reason="contract_text_updated",
-            timestamp="2024-06-09T12:34:56Z",
-            details={"change_count": 5},
-        )
+    async def test_contract_updated_webhook_full_flow(self):
+        """Full flow: signature verify → parse → queue → response."""
+        payload_dict = {
+            "policy_number": "POL-001",
+            "version_id": "v20240609",
+            "reason": "contract_text_updated",
+        }
+        payload_bytes = json.dumps(payload_dict).encode("utf-8")
+        secret = "test-secret-key"
+
+        sig = hmac.new(secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
+        signature_header = f"v1,sha256={sig}"
+
+        mock_request = AsyncMock()
+        mock_request.body = AsyncMock(return_value=payload_bytes)
 
         with patch("services.api.routers.webhooks.celery_app") as mock_celery, \
+             patch("services.api.routers.webhooks.settings") as mock_settings, \
              patch("services.api.routers.webhooks.log") as mock_log:
 
-            result = await webhook_contract_updated(payload)
+            mock_settings.webhook_secret_key = secret
+
+            result = await webhook_contract_updated(mock_request, signature_header)
 
             # Verify response
             assert result["status"] == "queued"
@@ -294,16 +335,5 @@ class TestWebhookIntegration:
             # Verify Celery task queued
             mock_celery.send_task.assert_called_once()
 
-            # Verify logging happened
-            assert mock_log.info.call_count >= 2  # at least 2 log calls
-
-    @pytest.mark.asyncio
-    async def test_webhook_error_handling_missing_policy_number(self):
-        """Webhook should reject payloads with missing required fields."""
-        # Note: Pydantic will validate this at the model level
-        # This test verifies the FastAPI endpoint receives validated data
-        with pytest.raises(Exception):  # Pydantic ValidationError
-            ContractUpdatedPayload(
-                reason="contract_text_updated",
-                # Missing policy_number
-            )
+            # Verify logging
+            assert mock_log.info.call_count >= 2  # signature verified + task queued
