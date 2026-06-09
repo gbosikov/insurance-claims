@@ -103,22 +103,61 @@ DECISION_SYSTEM_PROMPT = """Ты — эксперт-андеррайтер по 
 ВАЖНО: Страховые договоры описывают КАТЕГОРИИ случаев, а не конкретные коды МКБ-10.
 Твоя задача — определить, попадает ли конкретный диагноз под описанную категорию.
 
+═══════════════════════════════════════════════════════════════════════════════════
+
 ПРАВИЛА ИНТЕРПРЕТАЦИИ:
-1. Если договор покрывает "острые респираторные заболевания", а диагноз J06.9 —
+
+1. БАЗОВОЕ ПРАВИЛО КАТЕГОРИЙ:
+   Если договор покрывает "острые респираторные заболевания", а диагноз J06.9 —
    это ПОКРЫТЫЙ СЛУЧАЙ. Рассуждай: J06.9 ∈ [острые] ∩ [инфекции] ∩ [органы дыхания] ✓
-2. Исключения имеют приоритет над покрытием — проверяй раздел [exclusions] для каждого диагноза
-3. При граничном случае → requires_manual_review=true, НЕ отказ
-4. ЗАПРЕЩЕНО: отказывать только потому что конкретный код МКБ-10 не упомянут в договоре
+
+2. ИСКЛЮЧЕНИЯ БЕЗ CARVEOUT (обычные):
+   - Исключения имеют приоритет над покрытием
+   - Проверяй раздел [exclusions] для каждого диагноза
+   - Если диагноз в списке исключённых → ОТКАЗ
+
+3. ИСКЛЮЧЕНИЯ С CARVEOUT (条件付き исключения):
+   Некоторые исключения имеют УСЛОВИЯ ("გარდა"/EXCEPT/КРОМЕ).
+
+   ПРИМЕР: "N18 (хроническая почечная) ИСКЛЮЧЕНА КРОМЕ ургентного вмешательства"
+   - Если service_urgency=urgent → ПОКРЫТО (CARVEOUT применяется)
+   - Если service_urgency=planned → ИСКЛЮЧЕНО
+   - Если service_urgency=diagnostic → ИСКЛЮЧЕНО
+
+   CARVEOUT-УСЛОВИЯ ищи в разделе [exclusions_with_carveout]:
+   - type="service_urgency" → проверь поле service_urgency из заявки
+   - type="diagnosis_exception" → исключение из исключения (гепатит A)
+
+4. ГРАНИЧНЫЕ СЛУЧАИ И НЕОПРЕДЕЛЁННОСТЬ:
+   - Если непонятно → requires_manual_review=true, НЕ отказ
+   - Если service_urgency=null И есть CARVEOUT → manual_review (не можем применить условие)
+   - При неуверенности → manual_review, не быстрое решение
+
+5. ЗАПРЕЩЕНО:
+   - Отказывать только потому что конкретный код МКБ-10 не упомянут в договоре
+   - Игнорировать CARVEOUT-условия ("помню об исключении, но забыл о условии")
+   - Применять CARVEOUT без проверки условия
+
+═══════════════════════════════════════════════════════════════════════════════════
 
 ПРОЦЕСС ДЛЯ КАЖДОГО ДИАГНОЗА:
-a) Используй "Медицинская иерархия" из промпта — это цепочка категорий для диагноза
-b) Найди в разделах договора категорию, к которой относится диагноз
-c) Проверь раздел [exclusions] — исключён ли этот случай явно?
-d) Вынеси решение с прямой цитатой из договора (contract_reference)
 
-ФИНАНСЫ: рассчитывай сумму с учётом coverage_pct и остатка remaining из risks_data
-SUMMARY: решение + обоснование + уверенность + флаги (текст читает оператор кор-системы)
-ФОРМАТ: отвечай СТРОГО в формате JSON-инструмента — никакого свободного текста"""
+a) Используй "Медицинская иерархия" — цепочка категорий для диагноза
+b) Найди в разделах договора категорию, под которую подпадает диагноз
+c) Проверь обычные исключения [exclusions] — явно исключён?
+   → ДА: ОТКАЗ (если нет CARVEOUT-условия)
+d) Проверь CARVEOUT-исключения [exclusions_with_carveout]
+   → Если диагноз в excluded_icd10, проверь carveout_conditions:
+      ✓ service_urgency совпадает? → ПОКРЫТО
+      ✗ service_urgency не совпадает? → ИСКЛЮЧЕНО (CARVEOUT не применяется)
+      ? service_urgency неизвестен? → MANUAL_REVIEW
+e) Вынеси решение с прямой цитатой из договора (contract_reference)
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+ФИНАНСЫ: рассчитывай сумму с учётом coverage_pct и остатка remaining
+SUMMARY: решение + обоснование + уверенность + флаги (текст для оператора)
+ФОРМАТ: СТРОГО JSON-инструмент — никакого свободного текста"""
 
 
 # ── Уровень 1: Детерминированные проверки ─────────────────────────
@@ -148,7 +187,10 @@ def build_decision_prompt(
     risks_limits: RisksAndLimits,
     chunks: list[ContractChunkSchema],
 ) -> str:
-    """Собирает промпт: данные заявки + иерархия МКБ-10 + риски/лимиты + чанки договора."""
+    """Собирает промпт: данные заявки + иерархия МКБ-10 + риски/лимиты + чанки договора.
+
+    ВАЖНО: выделяет CARVEOUT-исключения отдельно с их условиями.
+    """
 
     claim_data = {
         "insured": {
@@ -160,6 +202,7 @@ def build_decision_prompt(
         "event": {
             "date":          extraction.event.date,
             "institution":   extraction.event.institution,
+            "service_urgency": extraction.event.service_urgency,  # ← ДОБАВЛЕНО для CARVEOUT-проверки
             "diagnoses":     [
                 {"icd10_code": d.icd10_code, "doctor_description": d.description}
                 for d in extraction.event.diagnoses
@@ -198,15 +241,44 @@ def build_decision_prompt(
         ],
     }
 
-    # Исключения — первыми, чтобы Claude проверил их до решения о покрытии
+    # Разделяем чанки: CARVEOUT-исключения отдельно, остальные обычным порядком
+    carveout_chunks = [c for c in chunks if c.section_type == "exclusion_with_carveout"]
+    other_chunks = [c for c in chunks if c.section_type != "exclusion_with_carveout"]
+
+    # Сортируем остальные: обычные исключения первыми
     SECTION_ORDER = {"exclusions": 0, "coverage_cases": 1, "limits": 2, "claim_conditions": 3}
-    sorted_chunks = sorted(chunks, key=lambda c: SECTION_ORDER.get(c.section_type or "", 9))
-    chunks_text = "\n\n".join(
+    other_chunks = sorted(other_chunks, key=lambda c: SECTION_ORDER.get(c.section_type or "", 9))
+
+    # Формируем текст для CARVEOUT-исключений с их структурой
+    carveout_text = ""
+    if carveout_chunks:
+        carveout_lines = []
+        for chunk in carveout_chunks:
+            carveout_lines.append(f"[exclusions_with_carveout] {chunk.title or ''}")
+            carveout_lines.append(f"Содержание: {chunk.content}")
+
+            # Если есть chunk_structure, покажи его Claude
+            if chunk.chunk_structure:
+                struct = chunk.chunk_structure
+                conditions_str = ", ".join(
+                    f"{c.get('type')}={c.get('value')}"
+                    for c in struct.get('carveout_conditions', [])
+                )
+                exceptions_str = ", ".join(struct.get('general_exceptions', []))
+                carveout_lines.append(
+                    f"Структура: исключены={struct.get('excluded_icd10', [])}, "
+                    f"условия=[{conditions_str}], исключения_из_исключений=[{exceptions_str}]"
+                )
+            carveout_lines.append("")
+        carveout_text = "\n".join(carveout_lines)
+
+    # Формируем текст для обычных чанков
+    other_text = "\n\n".join(
         f"[{chunk.section_type or 'general'}] {chunk.title or ''}\n{chunk.content}"
-        for chunk in sorted_chunks
+        for chunk in other_chunks
     )
 
-    return f"""## Данные заявки
+    sections = [f"""## Данные заявки
 {json.dumps(claim_data, ensure_ascii=False, indent=2)}
 
 ## Медицинская иерархия диагнозов (МКБ-10)
@@ -214,13 +286,107 @@ def build_decision_prompt(
 {hierarchy_text}
 
 ## Риски и лимиты (актуальные данные из кор-системы)
-{json.dumps(risks_data, ensure_ascii=False, indent=2)}
+{json.dumps(risks_data, ensure_ascii=False, indent=2)}"""]
 
-## Релевантные пункты договора (исключения — первыми)
-{chunks_text if chunks_text else "Релевантные пункты не найдены — верни requires_manual_review=true"}"""
+    if carveout_text:
+        sections.append(f"""## CARVEOUT-исключения (исключения с УСЛОВИЯМИ)
+⚠️  ВАЖНО: Проверь условие перед отказом!
+{carveout_text}""")
+
+    if other_text:
+        sections.append(f"""## Остальные пункты договора
+{other_text}""")
+    else:
+        sections.append("## Остальные пункты договора\n(не найдены)")
+
+    return "\n\n".join(sections)
 
 
-# ── Маппинг на справочники кор-системы ───────────────────────────
+# ── CARVEOUT Exclusion Logic ─────────────────────────────────────────
+
+def apply_carveout_exclusion_logic(
+    icd10_code: str,
+    service_urgency: str | None,
+    carveout_chunks: list[ContractChunkSchema],
+) -> tuple[bool, str | None]:
+    """
+    Применить CARVEOUT-исключения без Claude (детерминированно).
+
+    Возвращает:
+      (should_reject, rejection_reason)
+
+    Логика:
+      - Если диагноз в excluded_icd10 и service_urgency не совпадает условиям
+        → (True, reason) — быстрый отказ
+      - Если диагноз в general_exceptions → (False, None) — НЕ отказывать
+      - Если диагноз не в исключённых или условие совпадает → (False, None) — пусть Claude решает
+    """
+    for chunk in carveout_chunks:
+        if not chunk.chunk_structure:
+            continue
+
+        struct = chunk.chunk_structure
+        excluded_icd10s = struct.get("excluded_icd10", [])
+        general_exceptions = struct.get("general_exceptions", [])
+
+        # Проверяем: входит ли диагноз в excluded_icd10?
+        is_excluded = any(
+            icd10_code.upper().startswith(code.upper())
+            for code in excluded_icd10s
+        )
+
+        if not is_excluded:
+            continue
+
+        # Диагноз в списке исключённых. Проверяем: есть ли в general_exceptions?
+        # (гепатит А не исключён, даже если в "гепатиты")
+        is_general_exception = any(
+            icd10_code.upper().startswith(code.upper())
+            for code in general_exceptions
+        )
+
+        if is_general_exception:
+            # Это исключение из исключения → НЕ отказываем
+            return False, None
+
+        # Диагноз исключён. Проверяем carveout_conditions.
+        carveout_conditions = struct.get("carveout_conditions", [])
+
+        if not carveout_conditions:
+            # Нет условий → просто исключено
+            return True, f"Исключение по договору (пункт {chunk.title or 'N/A'}): {chunk.content[:100]}..."
+
+        # Есть условия. Проверяем: совпадает ли service_urgency?
+        for condition in carveout_conditions:
+            if condition.get("type") != "service_urgency":
+                continue
+
+            required_urgency = condition.get("value")  # "urgent" | "diagnostic" | "planned"
+
+            if service_urgency is None:
+                # service_urgency неизвестна, а исключение зависит от неё → manual_review позже
+                # Не отказываем здесь, дождёмся should_require_manual_review_for_unknown_urgency
+                return False, None
+
+            if service_urgency == required_urgency:
+                # Условие КАРВЕОУТА совпадает → диагноз НЕ исключён!
+                return False, None
+
+        # Условия есть, но service_urgency не совпадает → отказываем
+        condition_text = "; ".join(
+            f"{c.get('type')}={c.get('value')}" for c in carveout_conditions
+        )
+        return True, (
+            f"Исключение по CARVEOUT-условиям договора: диагноз исключён, "
+            f"но условия [{condition_text}] не совпадают с заявкой "
+            f"(service_urgency={service_urgency})"
+        )
+
+    # Нет CARVEOUT-чанков, или диагноз не в исключённых → пусть Claude решает
+    return False, None
+
+
+# ── Маппинг на справочники кор-системы ───────────────────────────────
 
 def find_diagnosid(icd10_code: str, icd10_list: list[ICD10Item]) -> int | None:
     """Найти DiagnosID по коду ICD10 (точное совпадение, без учёта регистра)."""
@@ -468,6 +634,26 @@ async def make_decision(
         diagnosis_codes = [d.icd10_code for d in extraction.event.diagnoses]
         enriched: dict[str, EnrichedDiagnosis] = await enrich_all(diagnosis_codes, db)
 
+        # ── CARVEOUT Preprocessing (детерминированное исключение) ────
+        # Для каждого диагноза проверяем CARVEOUT-условия без Claude
+        carveout_chunks = [c for c in contract_chunks if c.section_type == "exclusion_with_carveout"]
+        carveout_rejections: dict[str, str] = {}  # {icd10_code: rejection_reason}
+
+        for diag in extraction.event.diagnoses:
+            should_reject, reason = apply_carveout_exclusion_logic(
+                diag.icd10_code,
+                extraction.event.service_urgency,
+                carveout_chunks,
+            )
+            if should_reject:
+                carveout_rejections[diag.icd10_code] = reason
+                log.info(
+                    "carveout_quick_rejection",
+                    claim_id=str(claim_id),
+                    icd10_code=diag.icd10_code,
+                    reason=reason,
+                )
+
         # ── Уровень 2: Claude API ─────────────────────────────────
         client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         user_prompt = build_decision_prompt(extraction, enriched, risks_limits, contract_chunks)
@@ -523,6 +709,15 @@ async def make_decision(
 
         diagnoses = [DiagnosisDecisionSchema(**d) for d in raw.get("diagnoses", [])]
         line_items = [LineItemDecisionSchema(**li) for li in raw.get("line_items", [])]
+
+        # ── Применить CARVEOUT-отказы (переопределить решение Claude) ────────
+        # Если диагноз попал в быстрый CARVEOUT-отказ, переопределяем решение
+        for diag in diagnoses:
+            if diag.icd10_code in carveout_rejections:
+                diag.is_covered = False
+                diag.approved_amount = 0.0
+                diag.rejection_reason = carveout_rejections[diag.icd10_code]
+                # Не обновляем contract_reference — CARVEOUT-причина в rejection_reason
 
         all_covered = all(d.is_covered for d in diagnoses) if diagnoses else False
         any_covered = any(d.is_covered for d in diagnoses) if diagnoses else False
