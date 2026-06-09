@@ -30,7 +30,43 @@ from layers.rag.embedder import get_embedding
 log = structlog.get_logger()
 settings = get_settings()
 
-CHUNKING_PROMPT_VERSION = "chunking/v1.0.0"
+CHUNKING_PROMPT_VERSION = "chunking/v2.0.0"
+
+# ── Pass 1: Структурирование CARVEOUT-исключений ─────────────────────
+
+CARVEOUT_STRUCTURING_PROMPT = """Найди в страховом контракте разделы с CARVEOUT-исключениями.
+CARVEOUT = исключение КОТОРОЕ ИМЕЕТ ИСКЛЮЧЕНИЕ ("გარდა"/КРОМЕ/EXCEPT).
+
+Пример:
+  "თირკმლის ქრონიკულ უკმარისობა ნებისმიერი თანხით histsaveladdeba
+   გარდა ურგენტული ჩარევის დროს"
+  = CARVEOUT: N18 ИСКЛЮЧЕНА, КРОМЕ ургентного вмешательства
+
+Для каждого найденного CARVEOUT верни JSON:
+{
+  "num": "4.1",  // номер пункта
+  "excluded": {
+    "ka": "თირკმლის ქრონიკულ უკმარისობა",  // грузинский текст
+    "ru": "Хроническая почечная недостаточность",  // русский перевод
+    "icd10": ["N18", "N19", ...]  // коды МКБ-10
+  },
+  "carveout_conditions": [
+    {
+      "type": "service_urgency",  // или "diagnosis_exception" или "condition_type"
+      "value": "urgent",  // "urgent" | "diagnostic" | "planned"
+      "ka_marker": "ურგენტული ჩარევა"  // маркер в тексте на грузинском
+    },
+    ...
+  ],
+  "general_exceptions": ["B15"],  // диагнозы которые НЕ исключены (гепатит А)
+  "original_text": "Полный текст пункта с CARVEOUT"
+}
+
+Верни ТОЛЬКО JSON-массив найденных CARVEOUT-ов, без пояснений."""
+
+CARVEOUT_STRUCTURING_VERSION = "carveout/v1.0.0"
+
+# ── Pass 2: Базовое семантическое chunking ──────────────────────────
 
 CHUNKING_SYSTEM_PROMPT = """Раздели страховой договор на смысловые секции.
 Договор может быть на русском, грузинском или английском языке.
@@ -281,6 +317,14 @@ async def index_contract_from_text(
     db.add(contract_version)
     await db.flush()
 
+    # ── PASS 1: Парсим CARVEOUT-исключения ────────────────────────────
+    carveouts = await parse_carveout_exclusions_with_claude(content)
+    log.info("carveouts_detected", policy_number=policy_number, count=len(carveouts))
+
+    # ── PASS 2a: Создаём чанки для CARVEOUT-исключений ────────────────
+    await create_carveout_chunks(carveouts, tenant_id, policy_number, version_id, db)
+
+    # ── PASS 2b: Семантический chunking ────────────────────────────────
     raw_chunks = await chunk_contract_with_claude(content)
     log.info("contract_chunked", policy_number=policy_number, chunks=len(raw_chunks))
 
@@ -313,3 +357,107 @@ async def index_contract_from_text(
     )
 
     return ContractVersionSchema.model_validate(contract_version)
+
+
+# ── Pass 1: Парсинг CARVEOUT-исключений ────────────────────────────────
+
+async def parse_carveout_exclusions_with_claude(text: str) -> list[dict]:
+    """
+    Pass 1 — Структурирование CARVEOUT-исключений через Claude API.
+
+    Возвращает список CARVEOUT-ов с парсированной структурой:
+    [{
+        "num": "4.1",
+        "excluded": {"ka": "...", "ru": "...", "icd10": [...]},
+        "carveout_conditions": [{"type": "service_urgency", "value": "urgent", ...}],
+        "general_exceptions": ["B15"],
+        "original_text": "..."
+    }, ...]
+
+    Может вернуть пустой список если CARVEOUT-ов не найдено.
+    """
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+
+    response = await client.messages.create(
+        model=settings.claude_model,
+        max_tokens=settings.claude_chunking_max_tokens,
+        temperature=settings.claude_extraction_temperature,
+        system=CARVEOUT_STRUCTURING_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"Найди CARVEOUT-исключения в этом контракте:\n\n{text}"
+        }],
+    )
+
+    raw_text = response.content[0].text.strip()
+
+    # Убираем markdown-обёртку если Claude добавил
+    if raw_text.startswith("```"):
+        lines = raw_text.split("\n")
+        raw_text = "\n".join(lines[1:-1])
+
+    try:
+        carveouts = json.loads(raw_text)
+        if not isinstance(carveouts, list):
+            return []
+        return carveouts
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning(
+            "carveout_parsing_error",
+            error=str(e),
+            raw_text_preview=raw_text[:200]
+        )
+        return []
+
+
+async def create_carveout_chunks(
+    carveouts: list[dict],
+    tenant_id: UUID,
+    policy_number: str,
+    version_id: str,
+    db: AsyncSession,
+) -> None:
+    """
+    Pass 2 — Создание ContractChunk-ов из CARVEOUT-ов с chunk_structure.
+
+    Для каждого CARVEOUT создаёт отдельный чанк типа "exclusion_with_carveout"
+    с структурированной информацией в поле chunk_structure.
+    """
+    for carveout in carveouts:
+        # Валидация обязательных полей
+        if not carveout.get("original_text"):
+            continue
+
+        excluded = carveout.get("excluded", {})
+        conditions = carveout.get("carveout_conditions", [])
+        exceptions = carveout.get("general_exceptions", [])
+
+        # Собираем chunk_structure
+        chunk_structure = {
+            "type": "exclusion_with_carveout",
+            "excluded_icd10": excluded.get("icd10", []),
+            "carveout_conditions": conditions,
+            "general_exceptions": exceptions,
+        }
+
+        # Эмбеддинг для оригинального текста
+        embedding = get_embedding(carveout["original_text"], is_query=False)
+
+        chunk = ContractChunk(
+            tenant_id=tenant_id,
+            policy_number=policy_number,
+            version_id=version_id,
+            section_type="exclusion_with_carveout",
+            title=f"Исключение пункт {carveout.get('num', '?')}: {excluded.get('ru', 'Неизвестно')}",
+            content=carveout["original_text"],
+            key_terms=excluded.get("icd10", []) + [excluded.get("ru", "")],
+            embedding=embedding,
+            chunk_structure=chunk_structure,
+        )
+        db.add(chunk)
+
+    log.info(
+        "carveout_chunks_created",
+        policy_number=policy_number,
+        count=len(carveouts)
+    )

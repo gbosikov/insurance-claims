@@ -2,7 +2,7 @@
 
 import uuid
 from sqlalchemy import Column, Date, DateTime, Index, String, Text, func
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import relationship
 
 from core.database import Base
@@ -40,17 +40,23 @@ class ContractVersion(Base):
 class ContractChunk(Base):
     __tablename__ = "contract_chunks"
 
-    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id     = Column(UUID(as_uuid=True), nullable=False)
-    policy_number = Column(String(50), nullable=False)
-    version_id    = Column(String(20), nullable=False)
-    section_type  = Column(String(50))  # coverage_cases | exclusions | claim_conditions | limits | definitions | appeal_process | general
-    title         = Column(Text)
-    content       = Column(Text, nullable=False)
-    key_terms     = Column(ARRAY(Text))
+    id               = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id        = Column(UUID(as_uuid=True), nullable=False)
+    policy_number    = Column(String(50), nullable=False)
+    version_id       = Column(String(20), nullable=False)
+    section_type     = Column(String(50))  # coverage_cases | exclusions | claim_conditions | limits | definitions | appeal_process | general | exclusion_with_carveout
+    title            = Column(Text)
+    content          = Column(Text, nullable=False)
+    key_terms        = Column(ARRAY(Text))
     # multilingual-e5-large выдаёт 1024 измерения
-    embedding     = Column(Vector(1024) if VECTOR_AVAILABLE else Text)
-    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+    embedding        = Column(Vector(1024) if VECTOR_AVAILABLE else Text)
+    # Структурированная информация для CARVEOUT-исключений:
+    # {"type": "exclusion_with_carveout",
+    #  "excluded_icd10": ["N18", "I10"],
+    #  "carveout_conditions": [{"type": "service_urgency", "value": "urgent"}],
+    #  "general_exceptions": ["B15"]}
+    chunk_structure  = Column(JSONB)
+    created_at       = Column(DateTime(timezone=True), server_default=func.now())
 
     version = relationship(
         "ContractVersion",
