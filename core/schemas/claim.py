@@ -30,11 +30,16 @@ class LineItem(BaseModel):
 
 
 class EventData(BaseModel):
-    date:          str          # ISO 8601: YYYY-MM-DD
-    institution:   str | None = None
-    diagnoses:     list[DiagnoisItem] = Field(default_factory=list)
-    line_items:    list[LineItem] = Field(default_factory=list)
-    total_claimed: float
+    date:             str          # ISO 8601: YYYY-MM-DD
+    institution:      str | None = None
+    diagnoses:        list[DiagnoisItem] = Field(default_factory=list)
+    line_items:       list[LineItem] = Field(default_factory=list)
+    total_claimed:    float
+    service_urgency:  str | None = None  # "urgent" | "diagnostic" | "planned" | None
+    # urgent = სასწრაფო/გადაუდებელი (ЧС, неотложное)
+    # diagnostic = პირველადი დიაგნოსტიკა (первичная диагностика, скрининг)
+    # planned = გეგმიური (плановое лечение, профилактика)
+    # None = не указано врачом → требуется heuristic-определение
 
 
 # ── Результат извлечения (выход Слоя 4) ───────────────────────────

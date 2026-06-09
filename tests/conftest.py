@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from uuid import UUID
 
-# ── Mock asyncpg до любого импорта моделей ────────────────────────
+# ── Mock asyncpg перед импортом моделей ────────────────────────
 # database.py создаёт SQLAlchemy engine на уровне модуля, которому нужен asyncpg.
 # Мокируем только asyncpg — это позволяет SQLAlchemy-моделям загрузиться нормально
 # (class Claim(Base) работает), но не инициирует реального TCP-соединения.
