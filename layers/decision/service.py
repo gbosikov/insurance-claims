@@ -636,6 +636,33 @@ async def check_fraud(
     return fraud_flags
 
 
+# ── Utility: Extract version_id from contract chunks ────────────────
+
+def extract_contract_version_id(chunks: list[ContractChunkSchema]) -> str:
+    """
+    Извлечь version_id из contract_chunks.
+
+    Все чанки одного контракта имеют одинаковый version_id.
+    Если чанки пусты или version_id не найден → fallback на "latest".
+
+    Args:
+        chunks: список ContractChunkSchema с полем version_id
+
+    Returns:
+        version_id (строка), например "v20240609" или "latest" (fallback)
+    """
+    if not chunks:
+        log.warning("extract_version_id_no_chunks")
+        return "latest"
+
+    for chunk in chunks:
+        if hasattr(chunk, "version_id") and chunk.version_id:
+            return chunk.version_id
+
+    log.warning("extract_version_id_not_found")
+    return "latest"
+
+
 # ── Основная функция ──────────────────────────────────────────────
 
 async def make_decision(
@@ -761,16 +788,18 @@ async def make_decision(
 
         # ── POSITIVE LIST Preprocessing (явно покрытые процедуры) ────
         # Проверяем какие услуги в POSITIVE LIST (всегда 100% покрыты)
+        contract_version_id = extract_contract_version_id(contract_chunks)
         positive_list_match = await check_positive_list(
             extraction.event.line_items,
             tenant_id=tenant_id,
             policy_number=claim.policy_number,
-            version_id="latest",  # TODO: получить из contract_chunks
+            version_id=contract_version_id,
             db=db,
         )
         log.info(
             "positive_list_check_done",
             claim_id=str(claim_id),
+            contract_version_id=contract_version_id,
             matched_count=sum(1 for v in positive_list_match.values() if v[0]),
         )
 
