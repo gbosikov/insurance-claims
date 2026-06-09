@@ -48,6 +48,9 @@ insurance-claims/
 ├── services/
 │   ├── api/                     ← FastAPI gateway (главный entrypoint)
 │   ├── worker/                  ← Celery worker (фоновые задачи)
+│   │   ├── tasks.py             ← оркестрация pipeline (process_claim)
+│   │   ├── tasks_analytics.py   ← петля обучения (calibrate_confidence, update_amount_benchmarks)
+│   │   └── celery_app.py        ← инициализация Celery
 │   └── portal/                  ← React клиентский портал
 │
 ├── core/                        ← общий код для всех сервисов
@@ -80,7 +83,10 @@ insurance-claims/
 │   │   ├── 002_doc_type_training.sql ← поля для обучающей выборки классификатора
 │   │   ├── 003_source_url.sql   ← source_url в claim_documents, storage_path nullable
 │   │   ├── 004_icd10_local.sql  ← таблица icd10_diagnoses (локальный справочник МКБ-10)
-│   │   └── 005_providers.sql    ← таблица providers (справочник клиник)
+│   │   ├── 005_providers.sql    ← таблица providers (справочник клиник)
+│   │   ├── 006_carveout_structure.sql    ← CARVEOUT структуры контракта
+│   │   ├── 007_positive_list_procedures.sql ← POSITIVE LIST процедуры
+│   │   └── 008_review_correction_types.sql  ← correction_type + claude_error_reason (Шаг 30)
 │   ├── loaders/
 │   │   ├── load_icd10.py        ← загрузчик справочника МКБ-10 из CSV/Excel
 │   │   └── load_providers.py    ← загрузчик справочника провайдеров из CSV/Excel
@@ -754,6 +760,18 @@ class Settings(BaseSettings):
 
     # Бенчмаркинг суммы (Шаг 24) — включать после 3+ месяцев накопленных данных
     fraud_amount_benchmark_enabled: bool = False
+
+    # ── Петля обучения (Шаги 29–35) ───────────────────────────────
+    # Feedback loop: калибровка confidence из решений операторов
+    learning_feedback_loop_enabled: bool = True
+    learning_calibration_window_days: int = 30     # окно для расчёта точности
+    learning_min_samples_for_calibration: int = 30 # минимум примеров для обновления коэффициента
+
+    # ML-классификатор документов: включается после накопления данных (Шаг 34)
+    learning_ml_classifier_enabled: bool = False   # включить после 600 примеров
+
+    # Fine-tuning extraction-модели: минимум примеров для запуска (Шаг 35)
+    learning_finetuning_min_examples: int = 2000
 
     # ВАЖНО: extra="ignore" обязателен — .env содержит POSTGRES_DB, REDIS_PASSWORD
     # и другие переменные для docker-compose, которых нет в Settings
@@ -1821,6 +1839,131 @@ if (
 
 ---
 
+## Петля обучения (Learning Loop)
+
+**Принцип:** система собирает данные о своих ошибках и автоматически улучшает решения.
+
+```
+Claim → Claude решение → operator override/confirm
+                                ↓
+                    manual_review_outcomes
+                    (correction_type, claude_error_reason)
+                                ↓
+                    tasks_analytics.py (ежедневно)
+                    Actual accuracy / Claimed confidence
+                                ↓
+                    confidence_calibration_factor
+                                ↓
+                    следующие решения точнее ←────────────┐
+                                                           │
+                    audit_log накапливается                │
+                    (confirmed examples)                   │
+                                ↓                          │
+                    ML-классификатор (600+ примеров)       │
+                    Fine-tuning extraction (2000+ примеров)┘
+```
+
+### Почему петля сейчас разомкнута
+
+Все данные уже собираются:
+- `audit_log` — каждый вызов Claude с confidence
+- `manual_review_outcomes` — что изменил оператор
+- `decision_stochastic_qa_rate = 0.05` — 5% AUTO_APPROVED → случайная проверка
+
+Но нет ни одного job-а который **читает** эти данные и **применяет** выводы.
+Результат: пороги `CONFIDENCE_AUTO_APPROVE=0.85` не имеют доказанного смысла.
+
+### Что система должна знать о своих ошибках
+
+**Таблица `manual_review_outcomes`** — расширить двумя полями (миграция 008):
+
+```sql
+-- db/migrations/008_review_correction_types.sql
+ALTER TABLE manual_review_outcomes
+    ADD COLUMN correction_type VARCHAR(30),
+    -- Что именно исправил оператор:
+    -- amount     — изменил сумму выплаты (Claude одобрил слишком много/мало)
+    -- diagnosis  — изменил покрытие диагноза (Claude ошибся в интерпретации)
+    -- coverage   — изменил решение целиком (Claude одобрил → отказ или наоборот)
+    -- none       — подтвердил решение Claude без изменений (QA-верификация прошла)
+    ADD COLUMN claude_error_reason VARCHAR(50);
+    -- Почему Claude ошибся (заполняет оператор в Portal):
+    -- ocr_quality        — плохое качество OCR-текста
+    -- contract_gap       — договор не охватывает этот случай явно
+    -- extraction_error   — Claude неверно извлёк данные из документов
+    -- fraud_missed       — Claude не заметил признаки мошенничества
+    -- correct            — Claude был прав, оператор подтвердил
+```
+
+### Алгоритм калибровки (Шаг 29)
+
+```python
+# services/worker/tasks_analytics.py
+
+@celery_app.task(name="calibrate_confidence")
+def calibrate_confidence_task(tenant_id: str) -> dict:
+    """
+    Ежедневный job (Celery Beat).
+    
+    1. Выбрать все заявки за последние learning_calibration_window_days дней:
+       WHERE step='decision' AND output_data->>'route' = 'auto_approved'
+    
+    2. Соединить с manual_review_outcomes:
+       Найти QA-выборки (reason='stochastic_qa_sample') где оператор проверил
+    
+    3. Вычислить реальную точность:
+       actual_accuracy = count(correction_type='none') / count(всех QA-проверок)
+    
+    4. Вычислить среднее claimed_confidence для этих заявок
+    
+    5. Если |actual_accuracy - mean_confidence| > 0.05 (значимое расхождение):
+       new_factor = actual_accuracy / mean_confidence
+       UPDATE platform.tenant_configs
+       SET value = new_factor
+       WHERE key = 'confidence_calibration_factor'
+    
+    6. Логировать: было/стало, sample_size, window_days
+    
+    Минимум learning_min_samples_for_calibration=30 проверенных заявок
+    перед первым обновлением — иначе оставить factor=1.0.
+    """
+
+@celery_app.task(name="update_amount_benchmarks")
+def update_amount_benchmarks_task(tenant_id: str) -> dict:
+    """
+    Еженедельный job.
+    Пересчитывает P25/P75/P95 из одобренных заявок за последние 90 дней.
+    Активируется только если fraud_amount_benchmark_enabled=True.
+    """
+```
+
+### Условия активации компонентов обучения
+
+| Компонент | Условие запуска | Данные-источник |
+|---|---|---|
+| Feedback Loop (Шаг 29) | Сразу после Шага 28 | `manual_review_outcomes` + `audit_log` |
+| Аналитика ошибок (Шаг 30) | После реализации Portal (Шаг 17) | `manual_review_outcomes.correction_type` |
+| Amount Benchmarks (Шаг 33) | ≥30 заявок на icd10_prefix | `audit_log` одобренных заявок |
+| ML-классификатор (Шаг 34) | ≥200 примеров на каждый из 3 классов | `ClaimDocument.doc_type_confirmed=True` |
+| Fine-tuning (Шаг 35) | ≥2000 подтверждённых extraction примеров | `audit_log` step=extraction + confirmed |
+
+**Проверка готовности к каждому шагу:**
+```powershell
+# ML-классификатор (Шаг 34):
+python -m layers.extraction.training_exporter --stats
+
+# Fine-tuning (Шаг 35):
+python -m layers.extraction.training_exporter --stats --format jsonl
+
+# Calibration quality:
+SELECT count(*), correction_type
+FROM manual_review_outcomes
+WHERE reviewed_at > NOW() - INTERVAL '30 days'
+GROUP BY correction_type;
+```
+
+---
+
 ## Слой 8 — Routing Service
 
 **Файл:** `layers/routing/service.py`
@@ -2430,6 +2573,75 @@ pytest-httpx==0.30.0
            Ставка: settings.decision_stochastic_qa_rate (0.05)
            Данные QA-выборки → входят в калибровку (Шаг 27)
            Файл: layers/decision/service.py
+
+   ── Петля обучения (Шаги 29–35) — замкнуть цикл данные → решение → улучшение ──
+
+   Шаг 29: Feedback Loop — замкнуть петлю [ПРИОРИТЕТ 1, делать сразу после 28]
+           Файл: services/worker/tasks_analytics.py (новый)
+           Ежедневный Celery Beat job calibrate_confidence:
+             1. Читает audit_log (step=decision) → claimed confidence
+             2. Соединяет с manual_review_outcomes (QA-выборки за N дней)
+             3. Вычисляет actual_accuracy = confirmed_correct / total_qa_checks
+             4. Если |actual - claimed| > 0.05 → обновляет confidence_calibration_factor
+                в platform.tenant_configs
+             5. В make_decision(): effective_confidence = raw * calibration_factor
+           Минимум 30 QA-проверенных заявок перед первым обновлением
+           Зависимость: Шаг 28 — QA-выборки уже накапливаются
+           Проверка: SELECT count(*) FROM manual_review_outcomes WHERE
+                     reviewed_at > NOW() - INTERVAL '30 days' — должно быть ≥30
+
+   Шаг 30: Детальная аналитика расхождений [ПРИОРИТЕТ 1]
+           db/migrations/008_review_correction_types.sql:
+             ALTER TABLE manual_review_outcomes
+               ADD COLUMN correction_type VARCHAR(30),
+               -- amount | diagnosis | coverage | none
+               ADD COLUMN claude_error_reason VARCHAR(50);
+               -- ocr_quality | contract_gap | extraction_error | fraud_missed | correct
+           Portal (Шаг 17 должен быть реализован): оператор выбирает тип ошибки
+           Файлы: db/migrations/008_review_correction_types.sql
+                  services/portal/ — UI для выбора correction_type
+           Цель: через 2–3 месяца данные покажут где Claude систематически ошибается
+           Вывод используется для: точечного улучшения промптов, RAG, quality gate
+
+   Шаг 31: Chain-of-Thought + Extended Thinking [ПРИОРИТЕТ 2]
+           (см. детали в Шаге 26)
+           Реализовать ПОСЛЕ Шага 29 — нужны baseline метрики до включения CoT
+           чтобы измерить реальный эффект (снижение ручных проверок, рост confidence)
+           Ожидаемый эффект: −15–20% manual_review для пограничных случаев
+
+   Шаг 32: Медицинская согласованность (Medical Coherence Check) [ПРИОРИТЕТ 2]
+           (см. детали в Шаге 21)
+           Реализовать ПОСЛЕ Шага 29 — аналогично нужны baseline метрики
+
+   Шаг 33: Бенчмаркинг суммы по диагнозу [после 3 месяцев данных]
+           (см. детали в Шаге 24)
+           Условие старта: ≥30 одобренных заявок на каждый icd10_prefix
+           Файл: services/worker/tasks_analytics.py — добавить update_amount_benchmarks
+           Celery Beat: еженедельно
+           Активация: fraud_amount_benchmark_enabled = True в .env
+
+   Шаг 34: ML-классификатор типов документов [после 600 примеров]
+           (см. детали в Шаге 20)
+           Условие старта: python -m layers.extraction.training_exporter --stats
+                           ≥200 примеров на каждый из 3 классов (form_100, id, receipt)
+           Реализация: multilingual-e5-large embeddings + LogisticRegression
+           Активация: learning_ml_classifier_enabled = True в .env
+           Интерфейс classify_by_ocr_text() остаётся прежним — только реализация меняется
+
+   Шаг 35: Fine-tuning для Extraction [после 2000 подтверждённых примеров]
+           Условие старта: ≥2000 записей в audit_log (step=extraction)
+                           где claim.status = AUTO_APPROVED или doc_type_confirmed = True
+           Цель: заменить Claude Sonnet в слое Extraction на специализированную модель
+                 Стоимость: ~10x дешевле ($0.0003 vs $0.003 на заявку при том же качестве)
+           Процесс:
+             1. Экспорт: python -m layers.extraction.training_exporter --format jsonl
+             2. Fine-tuning через Anthropic API fine-tuning endpoint
+             3. A/B тест: 10% трафика → fine-tuned модель, остальные → Sonnet
+                Метрика: extraction_confidence, количество flags, downstream decision quality
+             4. Переключение если точность ≥ baseline при cost < baseline * 0.5
+           Файлы: новый scripts/finetune_extraction.py
+                  core/config.py: claude_extraction_model_override (пусто = основной claude_model)
+           ВАЖНО: решение по переключению принимает человек, не автоматически
 ```
 
 ---
@@ -2502,6 +2714,38 @@ pytest-httpx==0.30.0
 14. **Confidence не откалиброван** (Шаг 27)  
     `manual_review_outcomes` заполняется, но нет job-а который сравнивает  
     AI-confidence с реальной точностью и обновляет `confidence_calibration_factor`.
+
+### Петля обучения (Шаги 29–35) — не реализована
+
+15. **Feedback Loop разомкнут** (Шаг 29) — КРИТИЧНО  
+    Данные копятся (`audit_log`, `manual_review_outcomes`, QA-выборки), но ни один  
+    job не читает их и не обновляет пороги. Пороги `0.85` / `0.80` — числа без  
+    доказанного смысла. Нужен `tasks_analytics.py` с ежедневным  
+    `calibrate_confidence` job-ом.
+
+16. **Аналитика расхождений не детализирована** (Шаг 30)  
+    `manual_review_outcomes` не содержит `correction_type` и `claude_error_reason`.  
+    Оператор не фиксирует почему Claude ошибся. Без этого нельзя целенаправленно  
+    улучшать промпты, RAG или quality gate.  
+    Нужна миграция `008_review_correction_types.sql` + UI в Portal.
+
+17. **Amount Benchmarks не активированы** (Шаг 33)  
+    Ждут 3+ месяцев данных. Проверить условие:  
+    ```sql
+    SELECT icd10_prefix, count(*) FROM audit_log al
+    JOIN claims c ON c.id = al.claim_id
+    WHERE c.status = 'AUTO_APPROVED' AND al.step = 'decision'
+    GROUP BY icd10_prefix HAVING count(*) >= 30;
+    ```  
+    Когда хотя бы 5 prefix-ов удовлетворяют условию — запускать Шаг 33.
+
+18. **ML-классификатор не обучен** (Шаг 34)  
+    Ждёт 600 подтверждённых примеров. Проверить:  
+    `python -m layers.extraction.training_exporter --stats`
+
+19. **Fine-tuning не начат** (Шаг 35)  
+    Ждёт 2000 подтверждённых extraction примеров. Принципиально важно:  
+    решение о переключении принимает человек после A/B теста, не автоматически.
 
 ---
 
