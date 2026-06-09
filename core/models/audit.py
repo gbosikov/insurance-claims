@@ -1,7 +1,7 @@
 """ORM-модель аудит-лога (append-only)."""
 
 import uuid
-from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text, func
+from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import relationship
 
@@ -12,7 +12,8 @@ class AuditLog(Base):
     __tablename__ = "audit_log"
 
     id              = Column(BigInteger, primary_key=True, autoincrement=True)
-    claim_id        = Column(UUID(as_uuid=True), nullable=False, index=True)
+    # ForeignKey нужен SQLAlchemy для relationship; DB-уровень FK не создаётся (миграция 001)
+    claim_id        = Column(UUID(as_uuid=True), ForeignKey("claims.id"), nullable=False, index=True)
     tenant_id       = Column(UUID(as_uuid=True), nullable=False, index=True)
     step            = Column(String(50), nullable=False)  # intake | preprocessing | ocr | extraction | rag_search | decision | routing
     timestamp       = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -26,9 +27,7 @@ class AuditLog(Base):
     override_reason = Column(Text)
     duration_ms     = Column(Integer)
 
-    claim = relationship("Claim", back_populates="audit_entries",
-                         foreign_keys=[claim_id],
-                         primaryjoin="AuditLog.claim_id==Claim.id")
+    claim = relationship("Claim", back_populates="audit_entries")
 
     # ВАЖНО: UPDATE и DELETE запрещены на уровне SQL (CREATE RULE в миграции).
     # Эта модель используется ТОЛЬКО для INSERT и SELECT.

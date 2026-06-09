@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from uuid import UUID
 
 import structlog
@@ -85,7 +85,7 @@ async def route_claim(
             claim.final_payout = 0.0
             claim.overall_confidence = decision.overall_confidence
             claim.routing_reason = result.reason
-            claim.processed_at = datetime.utcnow()
+            claim.processed_at = datetime.now(timezone.utc)
 
         # ── 3. РУЧНАЯ ПРОВЕРКА ────────────────────────────────────
         elif (
@@ -138,7 +138,7 @@ async def route_claim(
             claim.final_payout = decision.final_payout
             claim.overall_confidence = decision.overall_confidence
             claim.routing_reason = result.reason
-            claim.processed_at = datetime.utcnow()
+            claim.processed_at = datetime.now(timezone.utc)
 
             # Подтверждаем типы документов — высокая уверенность системы
             # означает что документы распознаны корректно → годятся для обучения

@@ -1,7 +1,7 @@
 """ORM-модель апелляций."""
 
 import uuid
-from sqlalchemy import Column, DateTime, Numeric, String, Text, func
+from sqlalchemy import Column, DateTime, ForeignKey, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import relationship
 
@@ -12,7 +12,7 @@ class Appeal(Base):
     __tablename__ = "appeals"
 
     id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    claim_id        = Column(UUID(as_uuid=True), nullable=False)
+    claim_id        = Column(UUID(as_uuid=True), ForeignKey("claims.id"), nullable=False)
     tenant_id       = Column(UUID(as_uuid=True), nullable=False)
     status          = Column(String(30), nullable=False, default="RECEIVED")  # RECEIVED | IN_REVIEW | RESOLVED
     client_reason   = Column(Text, nullable=False)
@@ -25,6 +25,4 @@ class Appeal(Base):
     revised_payout  = Column(Numeric(10, 2))
     resolved_at     = Column(DateTime(timezone=True))
 
-    claim = relationship("Claim", back_populates="appeals",
-                         foreign_keys=[claim_id],
-                         primaryjoin="Appeal.claim_id==Claim.id")
+    claim = relationship("Claim", back_populates="appeals")

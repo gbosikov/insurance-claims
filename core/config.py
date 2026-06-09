@@ -86,8 +86,20 @@ class Settings(BaseSettings):
     quality_max_skew_angle_deg: float = 45.0
 
     # ── RAG ────────────────────────────────────────────────────────
-    rag_top_k: int = 5
+    rag_top_k: int = 12   # отдельные запросы по диагнозам + исключения
     rag_rrf_k: int = 60   # константа Reciprocal Rank Fusion
+
+    # ── Enterprise: качество решений (Шаги 21–28) ─────────────────
+    decision_coherence_check_enabled: bool = True
+    decision_chain_of_thought_enabled: bool = True
+    decision_extended_thinking_enabled: bool = True
+    decision_extended_thinking_threshold: float = 300.0   # GEL
+    decision_extended_thinking_budget_tokens: int = 2000
+    decision_second_pass_confidence_threshold: float = 0.65
+    decision_stochastic_qa_rate: float = 0.05   # 5% AUTO_APPROVED → случайная проверка
+    decision_default_waiting_period_days: int = 30
+    decision_confidence_calibration_factor: float = 1.0
+    fraud_amount_benchmark_enabled: bool = False   # включить после 3+ месяцев данных
 
     model_config = SettingsConfigDict(
         env_file=".env",

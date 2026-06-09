@@ -1,7 +1,7 @@
 """ORM-модели для ручной проверки."""
 
 import uuid
-from sqlalchemy import Column, DateTime, String, Text, func
+from sqlalchemy import Column, DateTime, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
@@ -12,7 +12,7 @@ class ManualReviewQueue(Base):
     __tablename__ = "manual_review_queue"
 
     id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    claim_id      = Column(UUID(as_uuid=True), nullable=False)
+    claim_id      = Column(UUID(as_uuid=True), ForeignKey("claims.id"), nullable=False)
     tenant_id     = Column(UUID(as_uuid=True), nullable=False)
     priority      = Column(String(20), default="normal")  # urgent | high | normal
     reason        = Column(String(100), nullable=False)
@@ -21,9 +21,7 @@ class ManualReviewQueue(Base):
     resolved_at   = Column(DateTime(timezone=True))
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
-    claim = relationship("Claim", back_populates="manual_review",
-                         foreign_keys=[claim_id],
-                         primaryjoin="ManualReviewQueue.claim_id==Claim.id")
+    claim = relationship("Claim", back_populates="manual_review")
 
 
 class ManualReviewOutcome(Base):
