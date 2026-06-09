@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 
 from core.config import get_settings
 from core.database import check_db_connection
-from services.api.routers import analytics, appeals, claims, contracts
+from services.api.routers import analytics, appeals, claims, contracts, webhooks
 
 log = structlog.get_logger()
 settings = get_settings()
@@ -44,6 +44,7 @@ app.include_router(claims.router,    prefix="/v1/claims",    tags=["claims"])
 app.include_router(contracts.router, prefix="/v1/contracts", tags=["contracts"])
 app.include_router(appeals.router,   prefix="/v1/appeals",   tags=["appeals"])
 app.include_router(analytics.router, prefix="/v1/analytics", tags=["analytics"])
+app.include_router(webhooks.router,  prefix="/internal/hooks", tags=["webhooks"])
 
 
 # ── Healthcheck ───────────────────────────────────────────────────

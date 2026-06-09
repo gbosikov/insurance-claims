@@ -399,20 +399,62 @@ def reindex_contract_structures_task(
     tenant_id: str,
     policy_number: str,
     version_id: str,
-    pdf_storage_path: str,
+    pdf_storage_path: str | None = None,
 ) -> dict:
-    """Переиндексировать CARVEOUT и POSITIVE LIST для существующей версии контракта."""
+    """
+    Переиндексировать CARVEOUT и POSITIVE LIST для существующей версии контракта.
+
+    Args:
+        tenant_id: Tenant ID
+        policy_number: Policy number
+        version_id: Contract version ("latest" or specific version like "v20240609")
+        pdf_storage_path: Optional path to contract file in storage
+                          If None, will look up from ContractVersion in database
+    """
 
     async def _run():
         from layers.rag.indexer import reindex_contract_structures
         from core.storage import get_storage_client
+        from sqlalchemy import select
+        from core.models.contract import ContractVersion
 
         async with AsyncSessionLocal() as db:
             storage = get_storage_client()
 
-            # Если PDF path есть (текст из PDF), скачать и извлечь текст
+            # Если pdf_storage_path не передан, получить из БД
+            if not pdf_storage_path:
+                query = select(ContractVersion).where(
+                    ContractVersion.tenant_id == UUID(tenant_id),
+                    ContractVersion.policy_number == policy_number,
+                )
+
+                if version_id != "latest":
+                    query = query.where(ContractVersion.version_id == version_id)
+
+                result = await db.execute(
+                    query.order_by(ContractVersion.created_at.desc()).limit(1)
+                )
+                contract_version = result.scalar_one_or_none()
+
+                if not contract_version:
+                    raise ValueError(
+                        f"ContractVersion not found for {policy_number} "
+                        f"(version_id={version_id})"
+                    )
+
+                pdf_storage_path = contract_version.pdf_path
+                version_id = contract_version.version_id
+
+                logger.info(
+                    "reindex_contract_version_resolved",
+                    policy_number=policy_number,
+                    version_id=version_id,
+                    pdf_path=pdf_storage_path,
+                )
+
+            # Скачать и извлечь текст из контракта
             contract_text = None
-            if pdf_storage_path and pdf_storage_path.lower().endswith(".pdf"):
+            if pdf_storage_path.lower().endswith(".pdf"):
                 try:
                     pdf_bytes = await storage.download(pdf_storage_path)
                     from layers.rag.indexer import extract_text_from_pdf
@@ -422,16 +464,27 @@ def reindex_contract_structures_task(
                         "reindex_pdf_extract_error",
                         policy_number=policy_number,
                         version_id=version_id,
+                        pdf_path=pdf_storage_path,
                         error=str(e),
                     )
                     raise
-            elif pdf_storage_path and pdf_storage_path.lower().endswith(".txt"):
-                # Если текстовый файл (из index_contract_from_text)
+            elif pdf_storage_path.lower().endswith(".txt"):
+                # Текстовый файл (из index_contract_from_text)
                 contract_text = (await storage.download(pdf_storage_path)).decode("utf-8")
 
             if not contract_text:
-                raise ValueError(f"Could not extract contract text from {pdf_storage_path}")
+                raise ValueError(
+                    f"Could not extract contract text from {pdf_storage_path}"
+                )
 
+            logger.info(
+                "reindex_contract_text_extracted",
+                policy_number=policy_number,
+                version_id=version_id,
+                text_length=len(contract_text),
+            )
+
+            # Выполнить переиндексирование
             result = await reindex_contract_structures(
                 tenant_id=UUID(tenant_id),
                 policy_number=policy_number,
@@ -440,6 +493,15 @@ def reindex_contract_structures_task(
                 db=db,
                 storage=storage,
             )
+
+            logger.info(
+                "reindex_contract_complete",
+                policy_number=policy_number,
+                version_id=version_id,
+                carveout_chunks=result["carveout_chunks_new"],
+                positive_list=result["positive_list_new"],
+            )
+
             return {
                 "policy_number": policy_number,
                 "version_id": version_id,
