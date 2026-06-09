@@ -213,10 +213,31 @@ async def index_contract(
     db.add(contract_version)
     await db.flush()
 
-    # Извлекаем текст и создаём чанки
+    # Извлекаем текст из PDF
     text = extract_text_from_pdf(pdf_bytes)
     log.info("contract_text_extracted", policy_number=policy_number, chars=len(text))
 
+    # ── PASS 1a: Парсим CARVEOUT-исключения ────────────────────────────
+    carveouts = await parse_carveout_exclusions_with_claude(text)
+    log.info("carveouts_detected", policy_number=policy_number, count=len(carveouts))
+
+    # ── PASS 1a.1: Создаём чанки для CARVEOUT-исключений ────────────────
+    await create_carveout_chunks(carveouts, tenant_id, policy_number, version_id, db)
+
+    # ── PASS 1b: Парсим POSITIVE LIST процедур ────────────────────────
+    procedures = await parse_positive_list_with_claude(text)
+    log.info("positive_list_detected", policy_number=policy_number, count=len(procedures))
+
+    # ── PASS 1b.1: Сохраняем POSITIVE LIST процедуры ───────────────────
+    saved_procedures = await create_positive_list_records(
+        procedures,
+        tenant_id=tenant_id,
+        policy_number=policy_number,
+        version_id=version_id,
+        db=db,
+    )
+
+    # ── PASS 2: Семантический chunking ────────────────────────────────
     raw_chunks = await chunk_contract_with_claude(text)
     log.info("contract_chunked", policy_number=policy_number, chunks=len(raw_chunks))
 
@@ -246,6 +267,8 @@ async def index_contract(
         "contract_indexed",
         policy_number=policy_number,
         version_id=version_id,
+        carveout_chunks=len(carveouts),
+        positive_list_procedures=saved_procedures,
         chunks=len(raw_chunks),
     )
 
@@ -317,14 +340,27 @@ async def index_contract_from_text(
     db.add(contract_version)
     await db.flush()
 
-    # ── PASS 1: Парсим CARVEOUT-исключения ────────────────────────────
+    # ── PASS 1a: Парсим CARVEOUT-исключения ────────────────────────────
     carveouts = await parse_carveout_exclusions_with_claude(content)
     log.info("carveouts_detected", policy_number=policy_number, count=len(carveouts))
 
-    # ── PASS 2a: Создаём чанки для CARVEOUT-исключений ────────────────
+    # ── PASS 1a.1: Создаём чанки для CARVEOUT-исключений ────────────────
     await create_carveout_chunks(carveouts, tenant_id, policy_number, version_id, db)
 
-    # ── PASS 2b: Семантический chunking ────────────────────────────────
+    # ── PASS 1b: Парсим POSITIVE LIST процедур ────────────────────────
+    procedures = await parse_positive_list_with_claude(content)
+    log.info("positive_list_detected", policy_number=policy_number, count=len(procedures))
+
+    # ── PASS 1b.1: Сохраняем POSITIVE LIST процедуры ───────────────────
+    saved_procedures = await create_positive_list_records(
+        procedures,
+        tenant_id=tenant_id,
+        policy_number=policy_number,
+        version_id=version_id,
+        db=db,
+    )
+
+    # ── PASS 2: Семантический chunking ────────────────────────────────
     raw_chunks = await chunk_contract_with_claude(content)
     log.info("contract_chunked", policy_number=policy_number, chunks=len(raw_chunks))
 
@@ -354,6 +390,8 @@ async def index_contract_from_text(
         policy_number=policy_number,
         version_id=version_id,
         chunks=len(raw_chunks),
+        carveout_chunks=len(carveouts),
+        positive_list_procedures=saved_procedures,
     )
 
     return ContractVersionSchema.model_validate(contract_version)
