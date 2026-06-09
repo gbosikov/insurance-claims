@@ -93,3 +93,73 @@ async def get_contract_status(
             for v in versions
         ],
     }
+
+
+@router.post("/{policy_number}/reindex", status_code=202)
+async def reindex_contract(
+    policy_number: str,
+    version_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Переиндексировать CARVEOUT и POSITIVE LIST для контракта.
+
+    Повторно парсирует CARVEOUT-условия и POSITIVE LIST процедуры из текущей версии контракта.
+    Удаляет старые структурированные данные и создаёт новые.
+
+    Используется при обновлении контракта в кор-системе или для ручного переиндексирования.
+
+    Args:
+        policy_number: Номер полиса
+        version_id: ID версии (если None → используется последняя версия)
+
+    Returns:
+        {
+            "status": "queued",
+            "policy_number": "...",
+            "version_id": "v20240609",
+            "message": "..."
+        }
+    """
+    from sqlalchemy import desc, select
+    from core.models.contract import ContractVersion
+    from services.worker.celery_app import celery_app
+
+    # Найти версию контракта
+    query = select(ContractVersion).where(
+        ContractVersion.tenant_id == DEFAULT_TENANT_ID,
+        ContractVersion.policy_number == policy_number,
+    )
+
+    if version_id:
+        query = query.where(ContractVersion.version_id == version_id)
+
+    query = query.order_by(desc(ContractVersion.created_at)).limit(1)
+
+    result = await db.execute(query)
+    contract_version = result.scalar_one_or_none()
+
+    if not contract_version:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Contract version not found (policy_number={policy_number}, version_id={version_id or 'latest'})",
+        )
+
+    # Ставим задачу переиндексирования в очередь
+    celery_app.send_task(
+        "reindex_contract_structures",
+        kwargs={
+            "tenant_id": str(DEFAULT_TENANT_ID),
+            "policy_number": policy_number,
+            "version_id": contract_version.version_id,
+            "pdf_storage_path": contract_version.pdf_path,
+        },
+        queue="contracts",
+    )
+
+    return {
+        "status": "queued",
+        "policy_number": policy_number,
+        "version_id": contract_version.version_id,
+        "message": "Contract structures reindexing has been queued. Check status in a few minutes.",
+    }

@@ -18,11 +18,11 @@ from uuid import UUID
 
 import anthropic
 import structlog
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import get_settings
-from core.models.contract import ContractChunk, ContractVersion
+from core.models.contract import ContractChunk, ContractVersion, PositiveListProcedure
 from core.schemas.contract import ContractVersionSchema
 from core.storage import StorageClient
 from layers.rag.embedder import get_embedding
@@ -499,6 +499,128 @@ async def create_carveout_chunks(
         policy_number=policy_number,
         count=len(carveouts)
     )
+
+
+# ── Reindexing: Update CARVEOUT and POSITIVE LIST for existing contract ────
+
+async def reindex_contract_structures(
+    *,
+    tenant_id: UUID,
+    policy_number: str,
+    version_id: str,
+    contract_text: str,
+    db: AsyncSession,
+    storage: StorageClient | None = None,
+) -> dict[str, int]:
+    """
+    Переиндексировать CARVEOUT и POSITIVE LIST для существующей версии контракта.
+
+    Вызывается при обновлении контракта в кор-системе или для ручного переиндексирования.
+    Удаляет старые структурированные записи и создаёт новые.
+
+    Args:
+        tenant_id: ID тенанта
+        policy_number: Номер полиса
+        version_id: Версия контракта (например, "v20240609")
+        contract_text: Полный текст контракта
+        db: Сессия БД
+        storage: Storage клиент (для логирования)
+
+    Returns:
+        {
+            "carveout_chunks_old": старое количество,
+            "carveout_chunks_new": новое количество,
+            "positive_list_old": старое количество,
+            "positive_list_new": новое количество,
+        }
+
+    Process:
+        1. Удалить старые CARVEOUT chunks для этой версии
+        2. Удалить старые POSITIVE LIST процедуры для этой версии
+        3. Парсить CARVEOUT заново
+        4. Парсить POSITIVE LIST заново
+        5. Создать новые записи
+        6. Commit
+    """
+    from sqlalchemy import delete
+
+    # Подсчитать старые записи
+    old_carveout = await db.execute(
+        select(func.count(ContractChunk.id)).where(
+            ContractChunk.tenant_id == tenant_id,
+            ContractChunk.policy_number == policy_number,
+            ContractChunk.version_id == version_id,
+            ContractChunk.section_type == "exclusion_with_carveout",
+        )
+    )
+    old_carveout_count = old_carveout.scalar() or 0
+
+    old_positive = await db.execute(
+        select(func.count(PositiveListProcedure.id)).where(
+            PositiveListProcedure.tenant_id == tenant_id,
+            PositiveListProcedure.policy_number == policy_number,
+            PositiveListProcedure.version_id == version_id,
+        )
+    )
+    old_positive_count = old_positive.scalar() or 0
+
+    # ── Удалить старые CARVEOUT chunks ────────────────────────────────
+    await db.execute(
+        delete(ContractChunk).where(
+            ContractChunk.tenant_id == tenant_id,
+            ContractChunk.policy_number == policy_number,
+            ContractChunk.version_id == version_id,
+            ContractChunk.section_type == "exclusion_with_carveout",
+        )
+    )
+
+    # ── Удалить старые POSITIVE LIST процедуры ────────────────────────
+    await db.execute(
+        delete(PositiveListProcedure).where(
+            PositiveListProcedure.tenant_id == tenant_id,
+            PositiveListProcedure.policy_number == policy_number,
+            PositiveListProcedure.version_id == version_id,
+        )
+    )
+
+    # ── Парсить CARVEOUT заново ──────────────────────────────────────
+    carveouts = await parse_carveout_exclusions_with_claude(contract_text)
+    log.info("reindex_carveouts_detected", policy_number=policy_number, count=len(carveouts))
+
+    # ── Создать новые CARVEOUT chunks ────────────────────────────────
+    await create_carveout_chunks(carveouts, tenant_id, policy_number, version_id, db)
+
+    # ── Парсить POSITIVE LIST заново ────────────────────────────────
+    procedures = await parse_positive_list_with_claude(contract_text)
+    log.info("reindex_positive_list_detected", policy_number=policy_number, count=len(procedures))
+
+    # ── Создать новые POSITIVE LIST процедуры ────────────────────────
+    new_positive_count = await create_positive_list_records(
+        procedures,
+        tenant_id=tenant_id,
+        policy_number=policy_number,
+        version_id=version_id,
+        db=db,
+    )
+
+    await db.commit()
+
+    result = {
+        "carveout_chunks_old": old_carveout_count,
+        "carveout_chunks_new": len(carveouts),
+        "positive_list_old": old_positive_count,
+        "positive_list_new": new_positive_count,
+    }
+
+    log.info(
+        "contract_structures_reindexed",
+        policy_number=policy_number,
+        version_id=version_id,
+        carveout_delta=len(carveouts) - old_carveout_count,
+        positive_list_delta=new_positive_count - old_positive_count,
+    )
+
+    return result
 
 
 # ── POSITIVE LIST — явно покрытые процедуры (Pass 1) ──────────────────────────

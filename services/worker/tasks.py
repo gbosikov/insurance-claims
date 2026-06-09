@@ -392,3 +392,58 @@ def index_contract_task(
             return {"version_id": version.version_id, "policy_number": policy_number}
 
     return run_async(_run())
+
+
+@celery_app.task(name="reindex_contract_structures", queue="contracts")
+def reindex_contract_structures_task(
+    tenant_id: str,
+    policy_number: str,
+    version_id: str,
+    pdf_storage_path: str,
+) -> dict:
+    """Переиндексировать CARVEOUT и POSITIVE LIST для существующей версии контракта."""
+
+    async def _run():
+        from layers.rag.indexer import reindex_contract_structures
+        from core.storage import get_storage_client
+
+        async with AsyncSessionLocal() as db:
+            storage = get_storage_client()
+
+            # Если PDF path есть (текст из PDF), скачать и извлечь текст
+            contract_text = None
+            if pdf_storage_path and pdf_storage_path.lower().endswith(".pdf"):
+                try:
+                    pdf_bytes = await storage.download(pdf_storage_path)
+                    from layers.rag.indexer import extract_text_from_pdf
+                    contract_text = extract_text_from_pdf(pdf_bytes)
+                except Exception as e:
+                    logger.error(
+                        "reindex_pdf_extract_error",
+                        policy_number=policy_number,
+                        version_id=version_id,
+                        error=str(e),
+                    )
+                    raise
+            elif pdf_storage_path and pdf_storage_path.lower().endswith(".txt"):
+                # Если текстовый файл (из index_contract_from_text)
+                contract_text = (await storage.download(pdf_storage_path)).decode("utf-8")
+
+            if not contract_text:
+                raise ValueError(f"Could not extract contract text from {pdf_storage_path}")
+
+            result = await reindex_contract_structures(
+                tenant_id=UUID(tenant_id),
+                policy_number=policy_number,
+                version_id=version_id,
+                contract_text=contract_text,
+                db=db,
+                storage=storage,
+            )
+            return {
+                "policy_number": policy_number,
+                "version_id": version_id,
+                **result,
+            }
+
+    return run_async(_run())
