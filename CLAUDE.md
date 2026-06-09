@@ -1400,9 +1400,13 @@ core_api_claims_base_url = ""  # пусто = использовать core_api_
 #    LiteMed API не предоставляет справочник ICD10.
 #    DiagnosID берётся из локальной таблицы icd10_diagnoses (icd10_enricher.py).
 
-# 5. get_providers() → []
-#    LiteMed API не предоставляет справочник провайдеров.
-#    PersID=0 используется как fallback (ClaimParsing_UNI вернёт код 3 если обязателен).
+# 5. get_providers() → list[ProviderData]
+#    Справочник провайдеров (клиник) содержит:
+#    - CUSTOMER (PersID) — код провайдера, используется в ClaimParsing_UNI
+#    - CSTNAME (имя клиники) — на английском или грузинском языке
+#    - TAXPAYER (ИНН) — идентификатор налогоплательщика
+#    Поиск по CSTNAME из OCR-документов с fuzzy matching (SequenceMatcher ≥ 0.70).
+#    Fallback: PersID=0 если клиника не найдена (ClaimParsing_UNI вернёт код 3 если обязателен).
 
 # 6. submit_claim(...) → SubmitClaimResult
 #    POST /LiteApi/LiteServiceJSON  {"METHODNAME": "ClaimParsing_UNI", "XML_DATA": {...}}
@@ -1447,8 +1451,14 @@ FKIND_MAP = {
 ### Открытые вопросы по кор-системе
 
 ```
-Формат PolicyList   ← Нужен тестовый personalNumber с активным ДМС-полисом
-                       чтобы убедиться в именах полей (RiskList, AnnualLimit и т.д.)
+1. Формат PolicyList   ← Нужен тестовый personalNumber с активным ДМС-полисом
+                          чтобы убедиться в именах полей (RiskList, AnnualLimit и т.д.)
+
+2. Доставка справочника провайдеров
+   ✓ Структура известна: CUSTOMER (PersID), CSTNAME (имя), TAXPAYER (ИНН)
+   ? Формат: CSV файл, REST API endpoint, или другое?
+   ? Frequency: каждый день, по требованию, или один раз при инициализации?
+   ? Кэширование: в памяти (Redis) или в БД (table providers)?
 ```
 
 ---
