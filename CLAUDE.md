@@ -716,6 +716,35 @@ class Settings(BaseSettings):
     rag_top_k: int = 12   # увеличено: отдельные запросы по диагнозам + исключения
     rag_rrf_k: int = 60   # константа Reciprocal Rank Fusion
 
+    # ── Enterprise: качество решений ──────────────────────────────
+    # Медицинская согласованность (Шаг 21)
+    decision_coherence_check_enabled: bool = True
+
+    # Chain-of-Thought: два прохода Claude (Шаг 26)
+    decision_chain_of_thought_enabled: bool = True
+
+    # Extended thinking: включается при сложных случаях (Шаг 26)
+    # Порог: total_claimed > этого значения ИЛИ len(diagnoses) > 1
+    decision_extended_thinking_enabled: bool = True
+    decision_extended_thinking_threshold: float = 300.0   # GEL
+    decision_extended_thinking_budget_tokens: int = 2000
+
+    # Второй проход для неуверенных диагнозов (Шаг 26)
+    decision_second_pass_confidence_threshold: float = 0.65
+
+    # Stochastic QA: доля автоодобренных → на случайную проверку (Шаг 28)
+    decision_stochastic_qa_rate: float = 0.05
+
+    # Периоды ожидания и суб-лимиты (Шаг 23)
+    decision_default_waiting_period_days: int = 30
+
+    # Калибровка confidence: обновляется ежедневно job-ом (Шаг 27)
+    # 1.0 = без коррекции. Задаётся через platform.tenant_configs, не здесь напрямую.
+    decision_confidence_calibration_factor: float = 1.0
+
+    # Бенчмаркинг суммы (Шаг 24) — включать после 3+ месяцев накопленных данных
+    fraud_amount_benchmark_enabled: bool = False
+
     # ВАЖНО: extra="ignore" обязателен — .env содержит POSTGRES_DB, REDIS_PASSWORD
     # и другие переменные для docker-compose, которых нет в Settings
     model_config = SettingsConfigDict(
@@ -1789,12 +1818,190 @@ def build_decision_prompt(
 ) -> str:
     """
     Собрать промпт из четырёх частей:
-    1. ## Данные заявки — JSON из extraction
+    1. ## Данные заявки — JSON из extraction (включает doctor_description)
     2. ## Медицинская иерархия — category_chain_ru для каждого диагноза
-    3. ## Финансовые данные — limits из кор-системы
-    4. ## Релевантные пункты договора — текст чанков с section_type
+    3. ## Риски и лимиты — актуальные данные из кор-системы
+    4. ## Релевантные пункты договора — чанки отсортированы: exclusions первыми
     """
 ```
+
+---
+
+### Enterprise-качество: улучшения логики решений
+
+Реализуются после базового pipeline (Шаги 1–20). Порядок: 21 → 28.
+
+#### Шаг 21 — Медицинская согласованность (Medical Coherence Check)
+
+**Файл:** `layers/decision/service.py` — добавить поле в `DECISION_TOOL`, расширить промпт.
+
+Проблема: Claude не проверяет соответствие **услуг** (line_items) **диагнозу**. МРТ позвоночника при J06.9 (ОРВИ) — явная несогласованность.
+
+```python
+# Добавить в DECISION_TOOL.input_schema:
+"coherence_flags": {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": "Несоответствия: например 'МРТ позвоночника не соответствует J06.9 (ОРВИ)'"
+}
+
+# Добавить в DECISION_SYSTEM_PROMPT:
+# "ДОПОЛНИТЕЛЬНО: проверь — логически ли связаны услуги из line_items с диагнозами?
+#  Несоответствие → coherence_flags, снизь confidence, но НЕ отказывай автоматически."
+```
+
+Несогласованность → флаг в `fraud_flags`, уменьшение `overall_confidence` на 0.10, маршрут `manual_review`.
+
+#### Шаг 22 — Проверка исключений через ICD10-дерево
+
+**Файл:** `layers/decision/service.py`, `layers/decision/icd10_enricher.py`
+
+Проблема: если в договоре «исключаются онкологические заболевания», Claude сопоставляет это текстово. Но код `C34.1` он может не связать с категорией «онкология» без явного указания.
+
+```python
+# В build_decision_prompt(): выделить exclusion-чанки в отдельную секцию
+exclusion_chunks = [c for c in sorted_chunks if c.section_type == "exclusions"]
+# Передать Claude отдельной секцией "## Исключения (проверить каждый диагноз против этого списка)"
+# + для каждого диагноза передать всю цепочку ancestors → Claude проверяет: входит ли
+#   любой предок диагноза в исключённую категорию
+```
+
+#### Шаг 23 — Суб-лимиты и периоды ожидания
+
+**Файл:** `layers/decision/service.py` — новые детерминированные функции уровня 1.
+
+Суб-лимиты (лимит на конкретный вид услуги) и периоды ожидания (первые N дней полиса — плановые операции не покрываются) — это **детерминированные** правила, не задача для Claude.
+
+```python
+def check_waiting_period(
+    policy_start_date: date,
+    event_date: date,
+    service_type: str,           # "planned" | "emergency"
+    waiting_days: int,           # из settings.decision_default_waiting_period_days
+) -> bool:
+    """Emergency cases bypass waiting period. Planned — must wait."""
+    if service_type == "emergency":
+        return True
+    return (event_date - policy_start_date).days >= waiting_days
+
+def check_sublimits(
+    line_items: list[LineItem],
+    risks_limits: RisksAndLimits,
+) -> list[str]:
+    """Проверить каждую позицию против суб-лимита риска. Возвращает список превышений."""
+```
+
+`policy_start_date` и суб-лимиты должны прийти из `get_risks_and_limits()` — уточнить поля у владельца кор-системы.
+
+#### Шаг 24 — Бенчмаркинг суммы по диагнозу
+
+**Включать только после 3+ месяцев накопленных данных** (`fraud_amount_benchmark_enabled = False` по умолчанию).
+
+```sql
+-- db/migrations/005_amount_benchmarks.sql
+CREATE TABLE diagnosis_amount_benchmarks (
+    tenant_id       UUID NOT NULL,
+    icd10_prefix    VARCHAR(10),    -- J06, Z00, etc.
+    service_type    VARCHAR(50),    -- consultation | lab | imaging | hospitalization
+    p25_amount      DECIMAL(10,2),
+    p75_amount      DECIMAL(10,2),
+    p95_amount      DECIMAL(10,2),
+    currency        VARCHAR(3),
+    sample_count    INT,            -- минимум 30 для надёжности
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, icd10_prefix, service_type, currency)
+);
+```
+
+Job обновляет таблицу еженедельно из одобренных заявок. В `check_fraud()` добавляется:
+```python
+# Если total_claimed > p95 для данного icd10_prefix → "amount_benchmark_exceeded"
+# Активируется только когда settings.fraud_amount_benchmark_enabled = True
+```
+
+#### Шаг 25 — Усиленная кросс-документная согласованность
+
+**Файл:** `layers/extraction/service.py` — расширить существующую кросс-валидацию.
+
+Текущая валидация: ФИО + дата рождения. Нужно добавить:
+
+```python
+# Диагноз form_100 vs диагноз в чеке — должны совпадать по prefix МКБ-10
+# Дата form_100 vs дата в чеке — расхождение > 3 дней → флаг
+# Название учреждения — нормализованное совпадение (SequenceMatcher ≥ 0.70)
+# Если несоответствие → flags.append("institution_mismatch"), confidence *= 0.85
+```
+
+#### Шаг 26 — Chain-of-Thought + Extended Thinking
+
+**Файл:** `layers/decision/service.py`
+
+**Chain-of-Thought (два прохода):** для сложных случаев — сначала вызов без `tool_choice` (Claude объясняет рассуждение), потом второй вызов с reasoning в контексте и `tool_choice="required"`. Reasoning сохраняется в `audit_log.output_data["reasoning"]`.
+
+**Extended Thinking:** включается при `total_claimed > settings.decision_extended_thinking_threshold` или `len(diagnoses) > 1`:
+
+```python
+use_extended = (
+    settings.decision_extended_thinking_enabled and (
+        len(extraction.event.diagnoses) > 1
+        or extraction.event.total_claimed > settings.decision_extended_thinking_threshold
+        or extraction.extraction_confidence < 0.85
+    )
+)
+if use_extended:
+    create_kwargs["thinking"] = {
+        "type": "enabled",
+        "budget_tokens": settings.decision_extended_thinking_budget_tokens,
+    }
+    create_kwargs["temperature"] = 1  # thinking требует temperature=1
+```
+
+**Второй проход для неуверенных диагнозов:** если после первого ответа Claude есть диагноз с `confidence < settings.decision_second_pass_confidence_threshold`:
+
+```python
+uncertain = [d for d in diagnoses if d.confidence < settings.decision_second_pass_confidence_threshold]
+if uncertain and not raw.get("requires_manual_review"):
+    # Второй узконаправленный вызов только по спорному диагнозу
+    # Merge: заменить решение по этому диагнозу в общем ответе
+```
+
+#### Шаг 27 — Feedback Loop: калибровка confidence
+
+**Файлы:** новый `services/worker/tasks_analytics.py`
+
+Ежедневный Celery Beat job сравнивает:
+- `audit_log.confidence["overall"]` при `step=decision`
+- Результат `manual_review_outcomes.expert_decision` (где оператор переопределил решение)
+
+```python
+# Вычислить: при каком диапазоне confidence AI ошибается
+# Обновить platform.tenant_configs: {"confidence_calibration_factor": 0.87}
+# В make_decision() применять:
+#   effective_confidence = raw_confidence * settings.decision_confidence_calibration_factor
+```
+
+Без этого `CONFIDENCE_AUTO_APPROVE=0.85` означает «AI думает что ошибается в 15% случаев», но реальная точность может быть другой.
+
+#### Шаг 28 — Stochastic QA Sampling
+
+**Файл:** `layers/decision/service.py` — добавить в конце `make_decision()` перед return.
+
+5% автоматически одобренных заявок отправляются в `manual_review` для измерения реальной точности:
+
+```python
+import random
+
+if (
+    decision.status == "approved"
+    and not decision.requires_manual_review
+    and random.random() < settings.decision_stochastic_qa_rate
+):
+    decision.requires_manual_review = True
+    decision.manual_review_reason = "stochastic_qa_sample"
+    # final_payout не меняем — оператор только верифицирует решение
+```
+
+Данные из QA-выборки → входят в калибровку (Шаг 27).
 
 ---
 
@@ -2334,6 +2541,59 @@ pytest-httpx==0.30.0
            Реализация: multilingual-e5-large embeddings + LogisticRegression
            Интеграция: заменить regex в classifier.py на ML-модель
                        (интерфейс classify_by_ocr_text() остаётся прежним)
+
+   ── Enterprise: качество решений (Шаги 21–28) ─────────────────────────────
+
+   Шаг 21: Медицинская согласованность (Medical Coherence Check)
+           Добавить поле coherence_flags в DECISION_TOOL
+           Расширить DECISION_SYSTEM_PROMPT: проверка соответствия line_items диагнозу
+           Несогласованность → fraud_flags + confidence -= 0.10 + manual_review
+           Файл: layers/decision/service.py
+
+   Шаг 22: Проверка исключений через ICD10-дерево
+           В build_decision_prompt() выделить exclusion-чанки в отдельную секцию
+           Claude проверяет каждого предка диагноза (через ancestors) против списка исключений
+           Файл: layers/decision/service.py
+
+   Шаг 23: Суб-лимиты и периоды ожидания
+           check_waiting_period() — детерминированная проверка уровня 1
+           check_sublimits() — проверка суб-лимитов по видам услуг
+           Данные: policy_start_date и sub_limits из get_risks_and_limits() кор-системы
+           Файл: layers/decision/service.py
+           Зависимость: Шаг 16 (уточнить поля у владельца кор-системы)
+
+   Шаг 24: Бенчмаркинг суммы по диагнозу
+           Создать таблицу diagnosis_amount_benchmarks
+           db/migrations/005_amount_benchmarks.sql
+           Job обновляет p25/p75/p95 еженедельно из одобренных заявок
+           Добавить проверку в check_fraud(): amount_benchmark_exceeded
+           Условие включения: fraud_amount_benchmark_enabled=True (после 3 месяцев данных)
+           Файл: services/worker/tasks_analytics.py (новый)
+
+   Шаг 25: Усиленная кросс-документная согласованность
+           Добавить в extraction/service.py: диагноз, дата, учреждение cross-check между документами
+           institution_mismatch, date_mismatch, diagnosis_mismatch → flags + confidence * 0.85
+           Файл: layers/extraction/service.py
+
+   Шаг 26: Chain-of-Thought + Extended Thinking
+           Два прохода: reasoning (без tool_use) → decision (с tool_use)
+           Reasoning → audit_log.output_data["reasoning"]
+           Extended thinking при total_claimed > decision_extended_thinking_threshold
+           или len(diagnoses) > 1 или extraction_confidence < 0.85
+           Второй проход для диагнозов с confidence < decision_second_pass_confidence_threshold
+           Файл: layers/decision/service.py
+
+   Шаг 27: Feedback Loop — калибровка confidence
+           Ежедневный Celery Beat job: сравнить audit_log.confidence vs manual_review_outcomes
+           Обновлять platform.tenant_configs["confidence_calibration_factor"]
+           Применять в make_decision(): effective_confidence = raw * calibration_factor
+           Файл: services/worker/tasks_analytics.py (новый)
+
+   Шаг 28: Stochastic QA Sampling
+           5% AUTO_APPROVED → manual_review с reason="stochastic_qa_sample"
+           Ставка: settings.decision_stochastic_qa_rate (0.05)
+           Данные QA-выборки → входят в калибровку (Шаг 27)
+           Файл: layers/decision/service.py (3 строки в конце make_decision)
 ```
 
 ---
@@ -2399,6 +2659,40 @@ pytest-httpx==0.30.0
 14. **ML-классификатор не обучен** (ждёт накопления данных, Шаг 20)  
     Сейчас работает regex (`classifier.py`). После ~600 подтверждённых документов  
     запустить `training_exporter --stats` и начать Шаг 20.
+
+### Enterprise TODO (качество решений, Шаги 21–28)
+
+15. **Медицинская согласованность не проверяется** (Шаг 21)  
+    Claude не верифицирует что line_items соответствуют диагнозу.  
+    `DECISION_TOOL` не содержит поле `coherence_flags`.
+
+16. **Проверка исключений не использует ICD10-дерево** (Шаг 22)  
+    Exclusions-чанки сортируются первыми в промпте, но Claude не получает  
+    явную инструкцию проверить каждого предка диагноза против списка исключений.
+
+17. **Суб-лимиты и периоды ожидания не реализованы** (Шаг 23)  
+    `check_waiting_period()` и `check_sublimits()` отсутствуют в `decision/service.py`.  
+    Зависит от Шага 16 — уточнить поля у владельца кор-системы.
+
+18. **Бенчмаркинг суммы по диагнозу** (Шаг 24)  
+    Таблица `diagnosis_amount_benchmarks` не создана, job не написан.  
+    Активировать только после 3+ месяцев накопленных данных.
+
+19. **Кросс-документная согласованность неполная** (Шаг 25)  
+    В `extraction/service.py` проверяется ФИО + дата рождения, но не диагноз / дата события /  
+    название учреждения между документами.
+
+20. **Chain-of-Thought и Extended Thinking не реализованы** (Шаг 26)  
+    Сейчас один вызов Claude с `tool_choice="required"`.  
+    Reasoning не сохраняется в audit_log. Extended thinking не включается для сложных заявок.
+
+21. **Confidence не откалиброван** (Шаг 27)  
+    `manual_review_outcomes` заполняется, но нет job-а который сравнивает  
+    AI-confidence с реальной точностью и обновляет `confidence_calibration_factor`.
+
+22. **Stochastic QA sampling отсутствует** (Шаг 28)  
+    Все AUTO_APPROVED уходят без выборочной проверки.  
+    Невозможно измерить реальную точность системы в production.
 
 ---
 
