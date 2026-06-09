@@ -1,9 +1,11 @@
 """
 Слой 6 — Core System Adapter: абстрактный интерфейс.
 
-Кор-система: Lite GROUP (http://192.168.0.249:8077)
-Аутентификация: POST /api/User/authenticate → JWT-токен
-Вызов методов: POST /LiteApi/LiteServiceJSON
+Кор-система Lite GROUP состоит из двух API:
+1. LiteMed API  — данные полисов: POST /api/Client/getpolicylist (Bearer-токен)
+2. Claims API   — создание убытка: POST /LiteApi/LiteServiceJSON (ClaimParsing_UNI)
+
+Аутентификация для обоих: POST /api/User/authenticate → Bearer-токен.
 """
 
 from abc import ABC, abstractmethod
@@ -15,35 +17,44 @@ class CoreSystemAdapter(ABC):
     """Абстрактный интерфейс кор-системы Lite GROUP."""
 
     @abstractmethod
-    async def get_contract(self, policy_number: str) -> ContractData:
+    async def get_contract(
+        self,
+        policy_number: str,
+        personal_number: str | None = None,
+    ) -> ContractData:
         """
-        Получить генеральный договор по номеру медицинской карточки.
-        Текст договора используется для RAG-индексации.
-        Метод: TODO_CONTRACT_METHOD (уточнить у владельца кор-системы)
+        Получить генеральный договор.
+        personal_number (личный номер застрахованного) требуется для LiteGroup API:
+        используется в POST /api/Client/getpolicylist для нахождения нужного полиса.
         """
 
     @abstractmethod
-    async def get_risks_and_limits(self, policy_number: str) -> RisksAndLimits:
+    async def get_risks_and_limits(
+        self,
+        policy_number: str,
+        personal_number: str | None = None,
+    ) -> RisksAndLimits:
         """
         Получить список рисков, % покрытия, лимиты и остатки.
-        Метод: TODO_RISKS_METHOD (уточнить у владельца кор-системы)
+        personal_number используется так же как в get_contract().
         """
 
     @abstractmethod
     async def get_icd10_list(self) -> list[ICD10Item]:
         """
-        Получить справочник диагнозов ICD10.
+        Получить справочник диагнозов ICD10 с DiagnosID для ClaimParsing_UNI.
         Результат кэшируется в Redis на 24 часа.
-        Метод: TODO_ICD10_METHOD (уточнить у владельца кор-системы)
+        Примечание: LiteMed API не предоставляет этот справочник.
+        Если кор-система его не отдаёт — DiagnosID берётся из локальной таблицы icd10_diagnoses.
         """
 
     @abstractmethod
     async def get_providers(self) -> list[ProviderInfo]:
         """
         Получить справочник провайдеров (медицинских учреждений).
-        Возвращает список с полями: PersID, название, ИНН.
+        Возвращает список с полями: PersID, название.
         Результат кэшируется в Redis на 24 часа.
-        Метод: TODO_PROVIDERS_METHOD (уточнить у владельца кор-системы)
+        Примечание: LiteMed API не предоставляет этот справочник напрямую.
         """
 
     @abstractmethod
@@ -60,7 +71,7 @@ class CoreSystemAdapter(ABC):
         comment: str,            # полный AI-вердикт
     ) -> SubmitClaimResult:
         """
-        Финальный шаг: создать убыток в кор-системе (ClaimParsing_UNI).
+        Финальный шаг: создать убыток через ClaimParsing_UNI.
         Вызывается ВСЕГДА — независимо от уровня уверенности AI.
         comment = полный вердикт Claude (решение + обоснование + уверенность).
 

@@ -44,9 +44,18 @@ def mock_db():
     db.flush = AsyncMock()
     db.commit = AsyncMock()
     db.rollback = AsyncMock()
-    db.execute = AsyncMock()
     db.add = MagicMock()
     db.get = AsyncMock()
+
+    # execute() возвращает синхронный объект с .scalars().all() и .scalar_one_or_none()
+    # (SQLAlchemy возвращает Result, не корутину — await только на execute())
+    _default_result = MagicMock()
+    _default_result.scalars.return_value.all.return_value = []
+    _default_result.scalar_one_or_none.return_value = None
+    _default_result.fetchone.return_value = None
+    _default_result.fetchall.return_value = []
+    db.execute = AsyncMock(return_value=_default_result)
+
     return db
 
 

@@ -7,12 +7,15 @@ import base64
 from core.models.claim import ClaimDocument
 from core.storage import StorageClient
 
-# fkind — тип файла в кор-системе Lite GROUP
-# TODO: уточнить реальные коды у владельца кор-системы
+# fkind — тип файла в кор-системе Lite GROUP (подтверждено владельцем)
+# 11 = ფორმა N 100    (Форма 100)
+# 12 = ექიმის დანიშნულება (Направление врача)
+# 14 = კვლევის პასუხები  (Результаты исследований / чек)
 FKIND_MAP = {
-    "form_100":    1,
-    "id_document": 2,
-    "receipt":     3,
+    "form_100":           11,
+    "doctor_prescription": 12,
+    "receipt":            14,
+    "id_document":        11,  # ID-документ прикладывается как форма 100 (нет отдельного fkind)
 }
 
 

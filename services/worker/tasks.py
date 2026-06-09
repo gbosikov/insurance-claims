@@ -187,12 +187,15 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                     )
                     raise
 
+            # personal_id_number доступен после extraction (шаг 4)
+            personal_number = extraction.insured.personal_id
+
             try:
                 contract_data, risks_limits, icd10_list, providers = await asyncio.gather(
-                    _tracked(core_adapter.get_contract(policy_number),          "get_contract"),
-                    _tracked(core_adapter.get_risks_and_limits(policy_number),  "get_risks_and_limits"),
-                    _tracked(core_adapter.get_icd10_list(),                     "get_icd10_list"),
-                    _tracked(core_adapter.get_providers(),                      "get_providers"),
+                    _tracked(core_adapter.get_contract(policy_number, personal_number),         "get_contract"),
+                    _tracked(core_adapter.get_risks_and_limits(policy_number, personal_number), "get_risks_and_limits"),
+                    _tracked(core_adapter.get_icd10_list(),                                     "get_icd10_list"),
+                    _tracked(core_adapter.get_providers(),                                      "get_providers"),
                 )
             except PolicyNotFoundError:
                 claim.status = ClaimStatus.REJECTED

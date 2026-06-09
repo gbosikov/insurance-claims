@@ -1,17 +1,25 @@
 """
 Слой 6 — Реализация Core System Adapter для Lite GROUP.
 
-Аутентификация: POST /api/User/authenticate → JWT-токен
-Токен кэшируется в Redis (TTL=1ч), обновляется при 401.
-Вызов методов: POST /LiteApi/LiteServiceJSON
-  Body: {"METHODNAME": "...", "XML_DATA": {...}}
-  Header: Authorization: <TOKEN>
+Два API:
+1. LiteMed API (данные полисов):
+     Auth:  POST {core_api_auth_url}/api/User/authenticate → {"token": "..."}
+     Data:  POST {core_api_base_url}/api/Client/getpolicylist
+            Body: {"personalnumber": "...", "STATE": "0", "schedule": "0"}
+            Header: Authorization: Bearer <token>
+
+2. Claims API (создание убытка):
+     POST {core_api_claims_base_url}/LiteApi/LiteServiceJSON
+     Body: {"METHODNAME": "ClaimParsing_UNI", "XML_DATA": {...}}
+     Header: Authorization: Bearer <token>
+     URL уточнить у владельца кор-системы (core_api_claims_base_url в .env).
+
+Ответ getpolicylist: {"PolicyList": "..."} — строка (пустая или JSON-массив).
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import time
 from datetime import date
@@ -37,27 +45,36 @@ settings = get_settings()
 RETRY_BACKOFF = [1, 3, 10]
 REDIS_TOKEN_KEY = "lite_group:jwt_token"
 REDIS_ICD10_KEY = "lite_group:icd10_list"
-TOKEN_TTL = 3600       # 1 час
-ICD10_CACHE_TTL = 86400  # 24 часа
+REDIS_PROVIDERS_KEY = "lite_group:providers"
+TOKEN_TTL = 3600        # 1 час
+ICD10_CACHE_TTL = 86400 # 24 часа
+
 
 
 class LiteGroupAdapter(CoreSystemAdapter):
     """
     Реализация для кор-системы Lite GROUP.
 
-    Работа с токеном:
-    - Первый запрос → получает токен через /api/User/authenticate
-    - Кэшируется в Redis (TTL=1ч) или in-memory (если Redis недоступен)
-    - При 401 → автоматически обновляет токен и повторяет запрос
+    Auth-токен кэшируется в Redis (TTL=1ч) с in-memory fallback.
+    При 401 — однократное обновление токена и повтор запроса.
     """
 
     def __init__(self) -> None:
-        self._base_url = settings.core_api_base_url.rstrip("/")
-        self._service_url = f"{self._base_url}/LiteApi/LiteServiceJSON"
-        self._auth_url = f"{self._base_url}/api/User/authenticate"
+        base = settings.core_api_base_url.rstrip("/")
+        self._data_base = base
+
+        # Auth-сервер: отдельный (прод) или тот же (дев/тест)
+        auth_base = settings.core_api_auth_url.rstrip("/") if settings.core_api_auth_url else base
+        self._auth_url = f"{auth_base}/api/User/authenticate"
+
+        # Сервер для ClaimParsing_UNI (может быть другим)
+        claims_base = settings.core_api_claims_base_url.rstrip("/") if settings.core_api_claims_base_url else base
+        self._claims_url = f"{claims_base}/LiteApi/LiteServiceJSON"
+
         self._timeout = settings.core_api_timeout
         self._max_retries = settings.core_api_retry
-        # Fallback in-memory token cache (если Redis недоступен)
+
+        # In-memory fallback для токена (если Redis недоступен)
         self._token_cache: str | None = None
         self._token_ts: float = 0.0
         self._redis = None  # lazy init
@@ -76,9 +93,7 @@ class LiteGroupAdapter(CoreSystemAdapter):
         return self._redis
 
     async def _get_token(self) -> str:
-        """Вернуть токен из кэша или запросить новый."""
         redis = await self._get_redis()
-
         if redis:
             try:
                 cached = await redis.get(REDIS_TOKEN_KEY)
@@ -87,14 +102,13 @@ class LiteGroupAdapter(CoreSystemAdapter):
             except Exception:
                 pass
 
-        # In-memory fallback
         if self._token_cache and (time.time() - self._token_ts) < TOKEN_TTL:
             return self._token_cache
 
         return await self._refresh_token()
 
     async def _refresh_token(self) -> str:
-        """Получить новый JWT-токен через /api/User/authenticate."""
+        """POST /api/User/authenticate → Bearer-токен."""
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(
                 self._auth_url,
@@ -105,13 +119,12 @@ class LiteGroupAdapter(CoreSystemAdapter):
             )
             resp.raise_for_status()
             data = resp.json()
-            # Поле может быть "TOKEN" или "token" в зависимости от версии API
-            token = data.get("TOKEN") or data.get("token") or data.get("Token", "")
+            # Поле "token" (нижний регистр — подтверждено тестовым сервером)
+            token = data.get("token") or data.get("TOKEN") or data.get("Token", "")
 
         if not token:
             raise CoreAPIUnavailableError(message="Empty token from /api/User/authenticate")
 
-        # Кэшируем в Redis
         redis = await self._get_redis()
         if redis:
             try:
@@ -119,21 +132,18 @@ class LiteGroupAdapter(CoreSystemAdapter):
             except Exception:
                 pass
 
-        # In-memory fallback
         self._token_cache = token
         self._token_ts = time.time()
-
         log.info("core_token_refreshed")
         return token
 
-    # ── Универсальный вызов метода ──────────────────────────────────
+    # ── Общий REST-вызов с retry и 401-refresh ─────────────────────
 
-    async def _call(self, method_name: str, xml_data: dict) -> dict:
+    async def _call_rest(self, url: str, body: dict) -> dict:
         """
-        POST /LiteApi/LiteServiceJSON
+        POST {url} с Bearer-авторизацией.
         Retry: max_retries попыток, backoff [1, 3, 10] сек.
-        При 401 → refresh_token + один inline повтор (не считается как attempt).
-        Два 401 подряд (после refresh) → CoreAPIUnavailableError.
+        При 401 → однократный refresh + повтор (не считается как attempt).
         """
         token = await self._get_token()
         last_error: Exception | None = None
@@ -141,28 +151,24 @@ class LiteGroupAdapter(CoreSystemAdapter):
         for attempt in range(self._max_retries):
             try:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    resp = await client.post(
-                        self._service_url,
-                        json={"METHODNAME": method_name, "XML_DATA": xml_data},
-                        headers={"Authorization": token, "Content-Type": "application/json"},
-                    )
+                    headers = {
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    }
+                    resp = await client.post(url, json=body, headers=headers)
 
                     if resp.status_code == 401:
-                        log.info("core_token_expired_refreshing", attempt=attempt)
+                        log.info("core_token_expired_refreshing", url=url, attempt=attempt)
                         token = await self._refresh_token()
-                        # Один inline повтор с новым токеном — не считается как attempt (#4)
-                        resp = await client.post(
-                            self._service_url,
-                            json={"METHODNAME": method_name, "XML_DATA": xml_data},
-                            headers={"Authorization": token, "Content-Type": "application/json"},
-                        )
+                        headers["Authorization"] = f"Bearer {token}"
+                        resp = await client.post(url, json=body, headers=headers)
                         if resp.status_code == 401:
                             raise CoreAPIUnavailableError(
-                                message=f"Method={method_name}: 401 after token refresh"
+                                message=f"401 after token refresh: {url}"
                             )
 
                     if resp.status_code == 404:
-                        raise PolicyNotFoundError(f"Method={method_name}, policy not found")
+                        raise PolicyNotFoundError(f"404 at {url}")
 
                     resp.raise_for_status()
                     return resp.json()
@@ -172,175 +178,216 @@ class LiteGroupAdapter(CoreSystemAdapter):
 
             except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
                 last_error = e
-                log.warning(
-                    "core_api_retry",
-                    method=method_name,
-                    attempt=attempt + 1,
-                    error=str(e),
-                )
+                log.warning("core_api_retry", url=url, attempt=attempt + 1, error=str(e))
                 if attempt < self._max_retries - 1:
                     await asyncio.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
 
         raise CoreAPIUnavailableError(
-            message=f"Method={method_name} failed after {self._max_retries} attempts: {last_error}"
+            message=f"Failed after {self._max_retries} attempts ({url}): {last_error}"
         )
 
-    # ── Метод 1: Получить генеральный договор ──────────────────────
+    # ── LiteMed API: getpolicylist ──────────────────────────────────
 
-    async def get_contract(self, policy_number: str) -> ContractData:
+    async def get_policy_list(self, personal_number: str) -> list[dict]:
         """
-        Получить генеральный договор по номеру медкарточки.
-        METHODNAME: TODO_CONTRACT_METHOD (уточнить у владельца)
+        POST /api/Client/getpolicylist
+        Body: {"personalnumber": "...", "STATE": "0", "schedule": "0"}
+        Ответ: {"PolicyList": "" | "[{...}]" | [{...}]}
         """
-        result = await self._call(
-            method_name="TODO_CONTRACT_METHOD",  # ← уточнить
-            xml_data={"PolicyNumber": policy_number},
+        url = f"{self._data_base}/api/Client/getpolicylist"
+        result = await self._call_rest(url, {
+            "personalnumber": personal_number,
+            "STATE": "0",
+            "schedule": "1",
+        })
+
+        policy_list = result.get("PolicyList", [])
+
+        # Кор-система может вернуть PolicyList как строку (в т.ч. пустую или JSON)
+        if isinstance(policy_list, str):
+            if not policy_list.strip():
+                return []
+            try:
+                policy_list = json.loads(policy_list)
+            except json.JSONDecodeError:
+                log.warning("policy_list_parse_failed", raw=policy_list[:200])
+                return []
+
+        return policy_list if isinstance(policy_list, list) else []
+
+    async def _find_policy(
+        self,
+        policy_number: str,
+        personal_number: str | None,
+    ) -> dict:
+        """
+        Найти полис по номеру медкарточки в списке полисов пользователя.
+        Если personal_number не задан — возвращает пустой dict (без ошибки).
+        Если список непустой но нужный полис не найден → PolicyNotFoundError.
+        """
+        if not personal_number:
+            log.warning(
+                "core_find_policy_no_personal_number",
+                policy_number=policy_number,
+            )
+            return {}
+
+        policies = await self.get_policy_list(personal_number)
+
+        if not policies:
+            # Нет активных полисов у пользователя
+            raise PolicyNotFoundError(
+                f"No active policies for personal_id={personal_number}"
+            )
+
+        # Перебираем возможные имена поля с номером полиса
+        _NUM_KEYS = (
+            "PolicyNumber", "policyNumber", "POLICY_NUMBER",
+            "policy_number", "MedCard", "medcard",
         )
-        data = result.get("responseData", [{}])
-        if isinstance(data, list):
-            data = data[0] if data else {}
+        for p in policies:
+            pnum = ""
+            for k in _NUM_KEYS:
+                if k in p:
+                    pnum = str(p[k])
+                    break
+            if pnum == policy_number:
+                return p
+
+        raise PolicyNotFoundError(
+            f"Policy {policy_number} not found for personal_id={personal_number}"
+        )
+
+    # ── Метод 1: Генеральный договор ───────────────────────────────
+
+    async def get_contract(
+        self,
+        policy_number: str,
+        personal_number: str | None = None,
+    ) -> ContractData:
+        """
+        Извлечь текст договора из данных полиса (getpolicylist).
+        Если текст договора не доступен через API — возвращает пустое поле content
+        (RAG-индексация не запустится, заявка уйдёт в manual_review).
+        """
+        policy = await self._find_policy(policy_number, personal_number)
+
+        content = (
+            policy.get("ContractText")
+            or policy.get("contractText")
+            or policy.get("Contract")
+            or policy.get("contract")
+            or ""
+        )
+        content_hash = (
+            policy.get("ContentHash")
+            or policy.get("contentHash")
+            or policy.get("content_hash")
+        )
+        version = (
+            policy.get("Version")
+            or policy.get("version")
+            or policy.get("PolicyVersion")
+        )
 
         return ContractData(
             policy_number=policy_number,
-            content=data.get("ContractText") or data.get("content", ""),
-            content_hash=data.get("ContentHash") or data.get("content_hash"),
-            version=data.get("Version") or data.get("version"),
+            content=str(content),
+            content_hash=str(content_hash) if content_hash else None,
+            version=str(version) if version else None,
         )
 
-    # ── Метод 2: Получить риски и лимиты ───────────────────────────
+    # ── Метод 2: Риски и лимиты ────────────────────────────────────
 
-    async def get_risks_and_limits(self, policy_number: str) -> RisksAndLimits:
-        """
-        Получить список рисков, % покрытия, лимиты.
-        METHODNAME: TODO_RISKS_METHOD (уточнить у владельца)
-        """
-        result = await self._call(
-            method_name="TODO_RISKS_METHOD",  # ← уточнить
-            xml_data={"PolicyNumber": policy_number},
+    async def get_risks_and_limits(
+        self,
+        policy_number: str,
+        personal_number: str | None = None,
+    ) -> RisksAndLimits:
+        """Извлечь риски, лимиты и остатки из данных полиса."""
+        policy = await self._find_policy(policy_number, personal_number)
+
+        risks: list[RiskInfo] = []
+        raw_risks = (
+            policy.get("RiskList")
+            or policy.get("riskList")
+            or policy.get("Risks")
+            or policy.get("risks")
+            or []
         )
-        data = result.get("responseData", [{}])
-        if isinstance(data, list):
-            data = data[0] if data else {}
+        if isinstance(raw_risks, str):
+            try:
+                raw_risks = json.loads(raw_risks)
+            except json.JSONDecodeError:
+                raw_risks = []
 
-        risks = []
-        for r in data.get("Risks", data.get("risks", [])):
-            risks.append(RiskInfo(
-                risk_id=int(r.get("RiskID", 0)),
-                name=r.get("RiskName", r.get("name", "")),
-                coverage_pct=float(r.get("CoveragePct", r.get("coverage_pct", 100))),
-                total_limit=float(r.get("TotalLimit", r.get("total_limit", 0))),
-                remaining_limit=float(r.get("RemainingLimit", r.get("remaining_limit", 0))),
-                currency=r.get("Currency", r.get("currency", "GEL")),
-                services=r.get("Services", r.get("services", [])),
-            ))
+        for r in (raw_risks if isinstance(raw_risks, list) else []):
+            try:
+                risks.append(RiskInfo(
+                    risk_id=int(
+                        r.get("RiskID") or r.get("riskId") or r.get("risk_id") or 0
+                    ),
+                    name=str(
+                        r.get("RiskName") or r.get("riskName") or r.get("name") or ""
+                    ),
+                    coverage_pct=float(
+                        r.get("CoveragePct") or r.get("coveragePct")
+                        or r.get("coverage_pct") or r.get("Percent") or 100
+                    ),
+                    total_limit=float(
+                        r.get("TotalLimit") or r.get("totalLimit")
+                        or r.get("total_limit") or r.get("Limit") or 0
+                    ),
+                    remaining_limit=float(
+                        r.get("RemainingLimit") or r.get("remainingLimit")
+                        or r.get("remaining_limit") or r.get("Remaining") or 0
+                    ),
+                    currency=str(r.get("Currency") or r.get("currency") or "GEL"),
+                    services=r.get("Services") or r.get("services") or [],
+                ))
+            except Exception as exc:
+                log.warning("risk_parse_error", error=str(exc), raw=str(r)[:200])
+
+        annual_limit = float(
+            policy.get("AnnualLimit") or policy.get("annualLimit")
+            or policy.get("annual_limit") or policy.get("Limit") or 0
+        )
+        remaining = float(
+            policy.get("Remaining") or policy.get("remaining")
+            or policy.get("RemainingLimit") or 0
+        )
+        currency = str(policy.get("Currency") or policy.get("currency") or "GEL")
 
         return RisksAndLimits(
             policy_number=policy_number,
             risks=risks,
-            annual_limit=float(data.get("AnnualLimit", data.get("annual_limit", 0))),
-            remaining=float(data.get("Remaining", data.get("remaining", 0))),
-            currency=data.get("Currency", "GEL"),
+            annual_limit=annual_limit,
+            remaining=remaining,
+            currency=currency,
         )
 
-    # ── Метод 3: Справочник диагнозов ICD10 ────────────────────────
+    # ── Метод 3: Справочник ICD10 ──────────────────────────────────
 
     async def get_icd10_list(self) -> list[ICD10Item]:
         """
-        Получить справочник диагнозов ICD10.
-        Кэшируется в Redis на 24 часа — меняется редко.
-        METHODNAME: TODO_ICD10_METHOD (уточнить у владельца)
+        LiteMed API не предоставляет справочник ICD10.
+        DiagnosID берётся из локальной таблицы icd10_diagnoses (icd10_enricher).
+        Возвращаем пустой список — decision layer использует локальный справочник.
         """
-        redis = await self._get_redis()
-        if redis:
-            try:
-                cached = await redis.get(REDIS_ICD10_KEY)
-                if cached:
-                    return [ICD10Item(**item) for item in json.loads(cached)]
-            except Exception:
-                pass
-
-        result = await self._call(
-            method_name="TODO_ICD10_METHOD",  # ← уточнить
-            xml_data={},
-        )
-        raw_list = result.get("responseData", [])
-        if not isinstance(raw_list, list):
-            raw_list = []
-
-        items = []
-        for r in raw_list:
-            try:
-                items.append(ICD10Item(
-                    diagnosid=int(r.get("DiagnosID", 0)),
-                    code=r.get("ICD10Code", r.get("code", "")),
-                    name=r.get("Description", r.get("name", "")),
-                ))
-            except Exception:
-                continue
-
-        if redis and items:
-            try:
-                await redis.setex(
-                    REDIS_ICD10_KEY,
-                    ICD10_CACHE_TTL,
-                    json.dumps([i.model_dump() for i in items]),
-                )
-            except Exception:
-                pass
-
-        return items
+        log.debug("icd10_list_from_local_db_used")
+        return []
 
     # ── Метод 4: Справочник провайдеров ────────────────────────────
 
-    REDIS_PROVIDERS_KEY = "lite_group:providers"
-    PROVIDERS_CACHE_TTL = 86400  # 24 часа
-
     async def get_providers(self) -> list[ProviderInfo]:
         """
-        Получить справочник медицинских учреждений (провайдеров).
-        Кэшируется в Redis на 24 часа.
-        METHODNAME: TODO_PROVIDERS_METHOD (уточнить у владельца)
-        Ожидаемый формат ответа: [{ PersID, Name, INN }]
+        LiteMed API не предоставляет endpoint для справочника провайдеров.
+        Список провайдеров задаётся статически (PersID подтверждены владельцем кор-системы).
         """
-        redis = await self._get_redis()
-        if redis:
-            try:
-                cached = await redis.get(self.REDIS_PROVIDERS_KEY)
-                if cached:
-                    return [ProviderInfo(**item) for item in json.loads(cached)]
-            except Exception:
-                pass
-
-        result = await self._call(
-            method_name="TODO_PROVIDERS_METHOD",  # ← уточнить
-            xml_data={},
-        )
-        raw_list = result.get("responseData", [])
-        if not isinstance(raw_list, list):
-            raw_list = []
-
-        items = []
-        for r in raw_list:
-            try:
-                items.append(ProviderInfo(
-                    pers_id=int(r.get("PersID", 0)),
-                    name=r.get("Name", r.get("name", "")),
-                    inn=str(r.get("INN", r.get("inn", ""))),
-                ))
-            except Exception:
-                continue
-
-        if redis and items:
-            try:
-                await redis.setex(
-                    self.REDIS_PROVIDERS_KEY,
-                    self.PROVIDERS_CACHE_TTL,
-                    json.dumps([i.model_dump() for i in items]),
-                )
-            except Exception:
-                pass
-
-        return items
+        return [
+            ProviderInfo(pers_id=2353, name="შპს ნიუ ჰოსპიტალს",                    inn="205210467"),
+            ProviderInfo(pers_id=3469, name='შპს ჰეპატოლოგიური კლინიკა „ჰეპა"', inn="205093147"),
+        ]
 
     # ── Метод 5: ClaimParsing_UNI ───────────────────────────────────
 
@@ -356,19 +403,35 @@ class LiteGroupAdapter(CoreSystemAdapter):
         file_fields: list[dict],
         comment: str,
     ) -> SubmitClaimResult:
-        """ClaimParsing_UNI — создать убыток в кор-системе."""
-        result = await self._call(
-            method_name="ClaimParsing_UNI",
-            xml_data={
-                "PolicyNumber":   policy_number,
-                "DiagnosID":      diagnosid,
-                "EventStartDate": event_start_date,
-                "EventEndDate":   event_end_date,
-                "PersID":         pers_id,
-                "ConfigKind":     config_kind,
-                "Comment":        comment,
-                "RisksList":      risks_list,
-                "file_fields":    file_fields,
+        """
+        Создать убыток через ClaimParsing_UNI.
+
+        URL: {core_api_claims_base_url}/LiteApi/LiteServiceJSON
+             core_api_claims_base_url задаётся в .env.
+             Уточнить у владельца кор-системы Lite GROUP.
+        """
+        if not settings.core_api_claims_base_url:
+            log.warning(
+                "claims_url_not_configured",
+                msg="core_api_claims_base_url не задан в .env. "
+                    "ClaimParsing_UNI вызывается на core_api_base_url.",
+            )
+
+        result = await self._call_rest(
+            self._claims_url,
+            {
+                "METHODNAME": "ClaimParsing_UNI",
+                "XML_DATA": {
+                    "PolicyNumber":   policy_number,
+                    "DiagnosID":      diagnosid,
+                    "EventStartDate": event_start_date,
+                    "EventEndDate":   event_end_date,
+                    "PersID":         pers_id,
+                    "ConfigKind":     config_kind,
+                    "Comment":        comment,
+                    "RisksList":      risks_list,
+                    "file_fields":    file_fields,
+                },
             },
         )
 
@@ -378,9 +441,9 @@ class LiteGroupAdapter(CoreSystemAdapter):
 
         status_code = int(data.get("status", -1))
         return SubmitClaimResult(
-            innum=data.get("Innum", ""),
+            innum=str(data.get("Innum") or data.get("innum") or ""),
             status=status_code,
-            status_text=data.get("StatusText", ""),
+            status_text=str(data.get("StatusText") or data.get("status_text") or ""),
         )
 
 
@@ -389,10 +452,14 @@ class LiteGroupAdapter(CoreSystemAdapter):
 class MockCoreAdapter(CoreSystemAdapter):
     """
     Заглушка для dev/тестов.
-    Активируется когда CORE_API_BASE_URL=http://mock-core.
+    Активируется когда ENVIRONMENT=development и core_api_base_url=http://mock-core.
     """
 
-    async def get_contract(self, policy_number: str) -> ContractData:
+    async def get_contract(
+        self,
+        policy_number: str,
+        personal_number: str | None = None,
+    ) -> ContractData:
         log.warning("mock_core_adapter_used", method="get_contract")
         return ContractData(
             policy_number=policy_number,
@@ -409,7 +476,11 @@ class MockCoreAdapter(CoreSystemAdapter):
             version="v1.0",
         )
 
-    async def get_risks_and_limits(self, policy_number: str) -> RisksAndLimits:
+    async def get_risks_and_limits(
+        self,
+        policy_number: str,
+        personal_number: str | None = None,
+    ) -> RisksAndLimits:
         log.warning("mock_core_adapter_used", method="get_risks_and_limits")
         return RisksAndLimits(
             policy_number=policy_number,
@@ -451,9 +522,8 @@ class MockCoreAdapter(CoreSystemAdapter):
     async def get_providers(self) -> list[ProviderInfo]:
         log.warning("mock_core_adapter_used", method="get_providers")
         return [
-            ProviderInfo(pers_id=1, name="Клиника Аврора",        inn="123456789"),
-            ProviderInfo(pers_id=2, name="МЦ Мединтер",           inn="987654321"),
-            ProviderInfo(pers_id=3, name="Диагностический центр", inn="111222333"),
+            ProviderInfo(pers_id=2353, name="შპს ნიუ ჰოსპიტალს",                    inn="205210467"),
+            ProviderInfo(pers_id=3469, name='შპს ჰეპატოლოგიური კლინიკა „ჰეპა"', inn="205093147"),
         ]
 
     async def submit_claim(

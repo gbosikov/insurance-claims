@@ -25,13 +25,23 @@ class Settings(BaseSettings):
     storage_provider: str = "local"  # local | gcs | s3  (local только для dev)
 
     # ── Кор-система Lite GROUP ─────────────────────────────────────
-    # JWT-токен получается через POST /api/User/authenticate, кэшируется в Redis
-    # При 401 — автоматическое обновление без остановки обработки
+    # LiteMed API (данные клиента и полисов): /api/Client/getpolicylist
+    # Аутентификация: POST /api/User/authenticate → Bearer-токен, кэшируется в Redis
     core_api_base_url: str = "http://192.168.0.249:8077"
     core_api_username: str = "webplatform"
     core_api_password: str = ""      # только через .env, не хардкодить
     core_api_timeout: int = 10
     core_api_retry: int = 3
+
+    # Отдельный auth-сервер (прод: 10.0.204.10:1010; dev: пусто = core_api_base_url)
+    core_api_auth_url: str = ""
+
+    # URL сервера для ClaimParsing_UNI (может отличаться от LiteMed API).
+    # Пусто = использовать core_api_base_url.
+    # Формат вызова: POST {core_api_claims_base_url}/LiteApi/LiteServiceJSON
+    # Тело: {"METHODNAME": "ClaimParsing_UNI", "XML_DATA": {...}}
+    # Уточнить реальный URL у владельца кор-системы.
+    core_api_claims_base_url: str = ""
 
     # ── Пороги принятия решений ────────────────────────────────────
     confidence_auto_approve: float = 0.85
@@ -67,7 +77,7 @@ class Settings(BaseSettings):
     claude_extraction_temperature: float = 0.0   # детерминированность
     claude_decision_temperature: float = 0.1     # небольшая вариативность
     claude_extraction_max_tokens: int = 1000
-    claude_decision_max_tokens: int = 2000
+    claude_decision_max_tokens: int = 4000
     claude_chunking_max_tokens: int = 4096
 
     # ── OCR ────────────────────────────────────────────────────────

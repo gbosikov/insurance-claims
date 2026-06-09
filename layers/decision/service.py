@@ -255,9 +255,17 @@ def build_risks_list(
     )
 
     if primary_risk:
-        # config_kind из первого сервиса риска
+        # config_kind из первого сервиса риска.
+        # Значения: 1=направление, 2=акт возмещения, 3=гарантийное письмо.
+        # В проекте используется 2 (акт возмещения).
         if primary_risk.services:
-            config_kind = primary_risk.services[0].get("config_kind") or primary_risk.services[0].get("ConfigKind")
+            config_kind = (
+                primary_risk.services[0].get("config_kind")
+                or primary_risk.services[0].get("ConfigKind")
+            )
+        # Fallback: акт возмещения (значение по умолчанию)
+        if not config_kind:
+            config_kind = 2
 
         for li in decision_line_items:
             if li.approved_amount <= 0:

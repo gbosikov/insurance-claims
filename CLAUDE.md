@@ -11,11 +11,11 @@
 
 ```
 Внешняя медицинская     Наша система (middleware)        Кор-система Lite GROUP
-система (API-клиент) →  ┌─────────────────────────┐  →   /LiteApi/LiteServiceJSON
-                        │  Download → OCR → AI    │
-JSON: policy_number +   │  → решение              │  ←   Договор, риски, лимиты
-URL-ссылки на файлы     │  → ClaimParsing_UNI     │
-(pre-signed URLs)       └─────────────────────────┘
+система (API-клиент) →  ┌─────────────────────────┐  →   LiteMed API
+                        │  Download → OCR → AI    │       /api/Client/getpolicylist
+JSON: policy_number +   │  → решение              │
+URL-ссылки на файлы     │  → ClaimParsing_UNI     │  →   Claims API
+(pre-signed URLs)       └─────────────────────────┘       /LiteApi/LiteServiceJSON
 ```
 
 **Что делает система:**
@@ -652,13 +652,18 @@ class Settings(BaseSettings):
     storage_provider: str = "local"  # local | gcs | s3  (local только для dev)
 
     # ── Кор-система Lite GROUP ─────────────────────────────────────
-    # JWT токен получается через /api/User/authenticate, кэшируется в Redis
-    # При 401 — автоматическое обновление токена без остановки обработки
-    core_api_base_url: str = "http://192.168.0.249:8077"
+    # LiteMed API: POST /api/Client/getpolicylist (данные полисов)
+    # Auth:  POST /api/User/authenticate → Bearer-токен, кэшируется в Redis
+    # Claims: POST /LiteApi/LiteServiceJSON (ClaimParsing_UNI)
+    core_api_base_url: str = "http://192.168.0.249:8077"  # тест; прод: 192.168.0.250:1010
     core_api_username: str = "webplatform"
     core_api_password: str = ""            # только через .env, не хардкодить
     core_api_timeout: int = 10
     core_api_retry: int = 3
+    # Auth-сервер если отличается: тест=пусто, прод=http://10.0.204.10:1010
+    core_api_auth_url: str = ""
+    # Claims-сервер если отличается: пусто = core_api_base_url
+    core_api_claims_base_url: str = ""
 
     # ── Пороги принятия решений ────────────────────────────────────
     confidence_auto_approve: float = 0.85
@@ -1334,242 +1339,73 @@ async def search_for_claim(
 
 **Файл:** `layers/core_adapter/`
 
-### Аутентификация Lite GROUP
+### Архитектура кор-системы Lite GROUP
 
-Кор-система использует JWT-аутентификацию. Токен получается один раз и кэшируется в Redis.
-При получении 401 — автоматическое обновление без остановки обработки заявки.
+Lite GROUP состоит из **двух независимых API**:
 
 ```
-AUTH:  POST http://192.168.0.249:8077/api/User/authenticate
-CALL:  POST http://192.168.0.249:8077/LiteApi/LiteServiceJSON
-       Header: Authorization: <TOKEN>
-       Body: { "METHODNAME": "...", "XML_DATA": { ... } }
+1. LiteMed API — данные полисов (клиентский портал)
+   ТЕСТ Auth:  POST http://192.168.0.249:8077/api/User/authenticate
+   ТЕСТ Data:  POST http://192.168.0.249:8077/api/Client/getpolicylist
+   ПРОД Auth:  POST http://10.0.204.10:1010/api/User/authenticate
+   ПРОД Data:  POST http://192.168.0.250:1010/api/Client/getpolicylist
+   Header: Authorization: Bearer <token>
+   Body:   {"personalnumber": "...", "STATE": "0", "schedule": "1"}
+   Ответ:  {"PolicyList": "" | "[{...}]"}  ← строка (пустая или JSON)
+
+2. Claims API — создание убытка
+   ТЕСТ:  POST http://192.168.0.249:8077/LiteApi/LiteServiceJSON
+   ПРОД:  POST http://192.168.0.250:1010/LiteApi/LiteServiceJSON
+   Body:  {"METHODNAME": "ClaimParsing_UNI", "XML_DATA": {...}}
+   Header: Authorization: Bearer <token>  (тот же токен)
 ```
+
+**Ключевые особенности:**
+- Аутентификация: `POST /api/User/authenticate` → `{"token": "..."}` (нижний регистр)
+- Токен кэшируется в Redis (TTL=1ч), in-memory fallback при недоступности Redis
+- При 401 — однократный refresh + повтор (не считается как отдельная попытка retry)
+- **personalNumber** (из OCR-документов) — ключ для `getpolicylist`, не `policyNumber`
+- `PolicyList` приходит как строка — может быть пустой `""` или JSON-массивом `"[{...}]"`
+
+### Настройка URL (config.py / .env)
 
 ```python
-# layers/core_adapter/lite_group_auth.py
+# ТЕСТ (дефолты):
+core_api_base_url      = "http://192.168.0.249:8077"  # LiteMed data
+core_api_auth_url      = ""    # пусто = использовать core_api_base_url
+core_api_claims_base_url = ""  # пусто = использовать core_api_base_url
 
-REDIS_TOKEN_KEY = "lite_group:jwt_token"
-TOKEN_TTL_SECONDS = 3600  # 1 час, обновляется при 401
-
-async def get_token(redis: Redis, settings: Settings) -> str:
-    """
-    Получить JWT токен — из кэша Redis или запросить новый.
-    При 401 в любом методе — вызвать refresh_token() и повторить запрос.
-    """
-    cached = await redis.get(REDIS_TOKEN_KEY)
-    if cached:
-        return cached.decode()
-
-    return await refresh_token(redis, settings)
-
-
-async def refresh_token(redis: Redis, settings: Settings) -> str:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{settings.core_api_base_url}/api/User/authenticate",
-            json={
-                "userName": settings.core_api_username,
-                "passWord": settings.core_api_password,
-            },
-            timeout=settings.core_api_timeout,
-        )
-        resp.raise_for_status()
-        token = resp.json()["token"]  # или "TOKEN" — уточнить по реальному ответу
-
-    await redis.setex(REDIS_TOKEN_KEY, TOKEN_TTL_SECONDS, token)
-    return token
+# ПРОД (.env):
+# CORE_API_BASE_URL=http://192.168.0.250:1010
+# CORE_API_AUTH_URL=http://10.0.204.10:1010
+# CORE_API_CLAIMS_BASE_URL=  # пусто (= CORE_API_BASE_URL — тот же сервер)
 ```
 
-### Методы кор-системы
+### Методы кор-системы (реализованы в rest_adapter.py)
 
 ```python
-# layers/core_adapter/lite_group_adapter.py
+# 1. get_policy_list(personal_number) — внутренний метод
+#    POST /api/Client/getpolicylist
+#    personalNumber извлекается из OCR-документов в слое Extraction
 
-BASE_URL  = settings.core_api_base_url
-SERVICE_URL = f"{BASE_URL}/LiteApi/LiteServiceJSON"
+# 2. get_contract(policy_number, personal_number=None) → ContractData
+#    Находит полис в PolicyList, извлекает ContractText
+#    Если текст договора отсутствует — content="", RAG вернёт пустой список,
+#    decision engine поставит requires_manual_review=True
 
-async def call_method(
-    method_name: str,
-    xml_data: dict,
-    redis: Redis,
-    settings: Settings,
-) -> dict:
-    """
-    Универсальный вызов любого метода кор-системы.
-    Retry-логика: 3 попытки, backoff [1, 3, 10] сек.
-    При 401 — refresh_token() и одна дополнительная попытка.
-    """
-    token = await get_token(redis, settings)
+# 3. get_risks_and_limits(policy_number, personal_number=None) → RisksAndLimits
+#    Извлекает RiskList из полиса: RiskID, название, % покрытия, лимит, остаток
 
-    for attempt in range(settings.core_api_retry):
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    SERVICE_URL,
-                    json={"METHODNAME": method_name, "XML_DATA": xml_data},
-                    headers={"Authorization": token},
-                    timeout=settings.core_api_timeout,
-                )
-                if resp.status_code == 401:
-                    token = await refresh_token(redis, settings)
-                    continue  # повторить с новым токеном
-                resp.raise_for_status()
-                return resp.json()
+# 4. get_icd10_list() → []
+#    LiteMed API не предоставляет справочник ICD10.
+#    DiagnosID берётся из локальной таблицы icd10_diagnoses (icd10_enricher.py).
 
-        except httpx.TimeoutException:
-            if attempt == settings.core_api_retry - 1:
-                raise CoreAPIUnavailableError(f"Timeout after {settings.core_api_retry} attempts")
-            await asyncio.sleep([1, 3, 10][attempt])
+# 5. get_providers() → []
+#    LiteMed API не предоставляет справочник провайдеров.
+#    PersID=0 используется как fallback (ClaimParsing_UNI вернёт код 3 если обязателен).
 
-
-# ── МЕТОД 1: Получить генеральный договор по номеру медкарточки ──────
-async def get_contract(policy_number: str, redis: Redis, settings: Settings) -> dict:
-    """
-    METHODNAME: уточнить у владельца кор-системы
-    Возвращает: текст генерального договора → используется для RAG индексации
-    XML_DATA: { "PolicyNumber": policy_number }
-    """
-    result = await call_method(
-        method_name="TODO_CONTRACT_METHOD",   # ← уточнить название метода
-        xml_data={"PolicyNumber": policy_number},
-        redis=redis,
-        settings=settings,
-    )
-    return result
-
-
-# ── МЕТОД 2: Получить риски, % покрытия, лимиты по медкарточке ────────
-async def get_risks_and_limits(policy_number: str, redis: Redis, settings: Settings) -> dict:
-    """
-    METHODNAME: уточнить у владельца кор-системы
-    Возвращает:
-      - список рисков (RiskID, название, процент покрытия)
-      - общий лимит и остаток
-    XML_DATA: { "PolicyNumber": policy_number }
-    """
-    result = await call_method(
-        method_name="TODO_RISKS_METHOD",      # ← уточнить название метода
-        xml_data={"PolicyNumber": policy_number},
-        redis=redis,
-        settings=settings,
-    )
-    return result
-
-
-# ── МЕТОД 3: Получить справочник диагнозов ICD10 ──────────────────────
-async def get_icd10_list(redis: Redis, settings: Settings) -> list[dict]:
-    """
-    METHODNAME: уточнить у владельца кор-системы
-    Справочник кэшируется в Redis на 24 часа (меняется редко).
-    Возвращает: список { DiagnosID, code, name }
-    """
-    cached = await redis.get("core:icd10_list")
-    if cached:
-        import json
-        return json.loads(cached)
-
-    result = await call_method(
-        method_name="TODO_ICD10_METHOD",      # ← уточнить название метода
-        xml_data={},
-        redis=redis,
-        settings=settings,
-    )
-    await redis.setex("core:icd10_list", 86400, json.dumps(result))
-    return result
-
-
-# ── МЕТОД 4: Получить справочник провайдеров ─────────────────────────
-async def get_providers(redis: Redis, settings: Settings) -> list[dict]:
-    """
-    METHODNAME: уточнить у владельца кор-системы
-    Возвращает: список { PersID, Name, INN }
-    PersID используется для ClaimParsing_UNI.
-    Кэшируется в Redis на 24 часа.
-    Маппинг на заявку: fuzzy-match названия учреждения из документов → PersID.
-    XML_DATA: {} (без параметров — полный справочник)
-    """
-    cached = await redis.get("lite_group:providers")
-    if cached:
-        import json
-        return json.loads(cached)
-
-    result = await call_method(
-        method_name="TODO_PROVIDERS_METHOD",   # ← уточнить название метода
-        xml_data={},
-        redis=redis,
-        settings=settings,
-    )
-    await redis.setex("lite_group:providers", 86400, json.dumps(result))
-    return result
-
-
-# ── МЕТОД 5 (ФИНАЛЬНЫЙ): Создать убыток ClaimParsing_UNI ─────────────
-async def submit_claim(
-    policy_number: str,
-    diagnosid: int,               # DiagnosID из справочника ICD10
-    event_start_date: str,        # "YYYY-MM-DD"
-    event_end_date: str,
-    pers_id: int,                 # код провайдера (медучреждения)
-    config_kind: int,             # вид направления
-    risks_list: list[dict],       # [{ RiskID, FinalAmount, ServDate, serviceid, ServName }]
-    file_fields: list[dict],      # [{ file_data: base64, file_name, fkind }]
-    comment: str,
-    redis: Redis,
-    settings: Settings,
-) -> SubmitClaimResult:
-    """
-    Финальный шаг — создать убыток в кор-системе.
-    Вызывается ВСЕГДА, независимо от уровня уверенности AI.
-    Comment содержит полный вердикт Claude: решение, обоснование, уровень уверенности, флаги.
-
-    Документы передаются в base64 в поле file_data.
-    fkind — тип файла (уточнить справочник у владельца кор-системы).
-
-    Коды ответа:
-      0 → успех
-      1 → не заполнен номер медкарточки
-      2 → не заполнен код диагноза
-      3 → не заполнен код партнёра
-      4 → не заполнен вид направления
-      5 → полис не существует
-      6 → не указан банковский счёт получателя
-      7 → данные получателя пустые
-      8 → системное сообщение
-      9 → нет завершённого направления
-    """
-    result = await call_method(
-        method_name="ClaimParsing_UNI",
-        xml_data={
-            "PolicyNumber":  policy_number,
-            "DiagnosID":     diagnosid,
-            "EventStartDate": event_start_date,
-            "EventEndDate":   event_end_date,
-            "PersID":        pers_id,
-            "ConfigKind":    config_kind,
-            "Comment":       comment,
-            "RisksList":     risks_list,
-            "file_fields":   file_fields,
-        },
-        redis=redis,
-        settings=settings,
-    )
-
-    # Разбор ответа
-    response_data = result.get("responseData", [{}])[0]
-    status_code = int(response_data.get("status", -1))
-
-    if status_code != 0:
-        raise CoreAPISubmitError(
-            status_code=status_code,
-            message=response_data.get("StatusText", "Unknown error"),
-        )
-
-    return SubmitClaimResult(
-        innum=response_data.get("Innum", ""),   # номер направления в кор-системе
-        status=status_code,
-        status_text=response_data.get("StatusText", ""),
-    )
+# 6. submit_claim(...) → SubmitClaimResult
+#    POST /LiteApi/LiteServiceJSON  {"METHODNAME": "ClaimParsing_UNI", "XML_DATA": {...}}
 ```
 
 ### Подготовка документов для ClaimParsing_UNI
@@ -1577,76 +1413,42 @@ async def submit_claim(
 ```python
 # layers/core_adapter/file_helpers.py
 
-import base64
+# fkind — тип файла (подтверждено владельцем кор-системы):
+# 11 = ფორმა N 100          (Форма 100)
+# 12 = ექიმის დანიშნულება   (Направление врача)
+# 14 = კვლევის პასუხები     (Результаты исследований / чек)
 
-async def documents_to_file_fields(
-    documents: list[ClaimDocument],
-    storage: StorageClient,
-) -> list[dict]:
-    """
-    Конвертировать документы заявки в формат file_fields для ClaimParsing_UNI.
-    file_data — base64-encoded содержимое файла.
-    fkind — тип файла (уточнить справочник: форма 100 / ID / чек).
-    """
-    FKIND_MAP = {
-        "form_100":    1,   # ← уточнить реальные коды у владельца кор-системы
-        "id_document": 2,
-        "receipt":     3,
-    }
+FKIND_MAP = {
+    "form_100":            11,
+    "doctor_prescription": 12,
+    "receipt":             14,
+    "id_document":         11,  # ID прикладывается как форма 100 (отдельного кода нет)
+}
 
-    file_fields = []
-    for doc in documents:
-        raw_bytes = await storage.download(doc.storage_path)
-        file_fields.append({
-            "file_data": base64.b64encode(raw_bytes).decode(),
-            "file_name": doc.storage_path.split("/")[-1],
-            "fkind":     FKIND_MAP.get(doc.doc_type, 1),
-        })
-
-    return file_fields
+# ConfigKind (вид направления):
+# 1 = направление
+# 2 = акт возмещения  ← используется в проекте (дефолт в build_risks_list)
+# 3 = гарантийное письмо
 ```
 
 ### MockCoreAdapter для dev-окружения
 
 ```python
-# layers/core_adapter/mock_adapter.py
-# Используется когда CORE_API_BASE_URL=http://mock или ENVIRONMENT=development
+# layers/core_adapter/rest_adapter.py → класс MockCoreAdapter
+# Активируется когда CORE_API_BASE_URL=http://mock-core
 
-class MockCoreAdapter:
-    """Возвращает тестовые данные без реального обращения к кор-системе."""
-
-    async def get_contract(self, policy_number):
-        return {"contract_text": "Тестовый договор. Покрываются все риски."}
-
-    async def get_risks_and_limits(self, policy_number):
-        return {
-            "risks": [
-                {"RiskID": 1, "name": "Амбулаторное лечение", "coverage_pct": 80, "limit": 1000, "remaining": 750},
-                {"RiskID": 2, "name": "Диагностика",          "coverage_pct": 100, "limit": 500,  "remaining": 500},
-            ],
-            "annual_limit": 5000,
-            "remaining":    4250,
-        }
-
-    async def get_icd10_list(self):
-        return [
-            {"DiagnosID": 101, "code": "J06.9", "name": "Острая инфекция верхних дыхательных путей"},
-            {"DiagnosID": 102, "code": "Z00.0", "name": "Общий медицинский осмотр"},
-        ]
-
-    async def submit_claim(self, **kwargs):
-        return SubmitClaimResult(innum="MOCK-001", status=0, status_text="OK")
+# get_contract()        → тестовый текст договора (ДМС, покрытие 80%)
+# get_risks_and_limits() → 2 риска: Амбулаторное + Диагностика
+# get_icd10_list()      → 5 диагнозов: J06.9, Z00.0, K29.7, M54.5, J45.9
+# get_providers()       → 3 клиники: Аврора, Мединтер, Диагностический центр
+# submit_claim()        → MOCK-{policy}-001, status=0
 ```
 
-### Открытые вопросы по кор-системе (уточнить у владельца)
+### Открытые вопросы по кор-системе
 
 ```
-TODO_CONTRACT_METHOD   ← название метода для получения генерального договора
-TODO_RISKS_METHOD      ← название метода для получения рисков и лимитов
-TODO_ICD10_METHOD      ← название метода для получения справочника диагнозов
-TODO_PROVIDERS_METHOD  ← название метода для получения справочника провайдеров
-fkind коды             ← справочник типов файлов (form_100, id_document, receipt)
-ConfigKind             ← справочник видов направлений
+Формат PolicyList   ← Нужен тестовый personalNumber с активным ДМС-полисом
+                       чтобы убедиться в именах полей (RiskList, AnnualLimit и т.д.)
 ```
 
 ---
@@ -2517,19 +2319,27 @@ pytest-httpx==0.30.0
            - #10 🟢 CORS allow_origins=[] в production → портал заблокирован
            - #9  🟢 Сталый TODO-комментарий в core/schemas/decision.py
 
-   Шаг 16: Уточнить у владельца кор-системы:
-           - TODO_CONTRACT_METHOD, TODO_RISKS_METHOD, TODO_ICD10_METHOD
-           - TODO_PROVIDERS_METHOD (список провайдеров: PersID, название, ИНН)
-           - Коды fkind (типы файлов для ClaimParsing_UNI)
-           - Справочник ConfigKind (виды направлений)
-           → Убрать заглушки TODO в LiteGroupAdapter
-           → Протестировать ClaimParsing_UNI на тестовом полисе
+✅ Шаг 16: Интеграция с реальным API кор-системы:
+           rest_adapter.py полностью переписан под реальный LiteMed REST API.
+           - Auth: POST /api/User/authenticate → Bearer {token} (поле "token" lowercase)
+           - Данные: POST /api/Client/getpolicylist (personalNumber из OCR → PolicyList)
+             PolicyList приходит как строка: "" или "[{...}]" — safe JSON parsing
+           - ClaimParsing_UNI: POST {CORE_API_CLAIMS_BASE_URL}/LiteApi/LiteServiceJSON
+             ТЕСТ: http://192.168.0.249:8077  ПРОД: http://192.168.0.250:1010
+           - Auth-сервер ПРОД: http://10.0.204.10:1010 → CORE_API_AUTH_URL в .env
+           - CORE_API_AUTH_URL / CORE_API_CLAIMS_BASE_URL добавлены в config.py и .env.example
+           - fkind подтверждены: form_100=11, doctor_prescription=12, receipt=14 (id→11 fallback)
+           - ConfigKind: 2=акт возмещения (дефолт); 1=направление, 3=гарантийное письмо
+           - get_icd10_list() → [] (LiteMed не предоставляет; DiagnosID из icd10_enricher)
+           - get_providers() → [] (LiteMed не предоставляет; PersID=0 fallback)
+           - personalNumber из extraction.insured.personal_id передаётся через tasks.py
+           - 109 тестов зелёных; conftest.py mock_db исправлен (scalars().all() chain)
 
    Шаг 17: Слой 11 (Portal) — создать React приложение
            При реализации формы загрузки — добавить подтверждение типа документа оператором
            в UI ручной проверки → устанавливать doc_type_source='operator', doc_type_confirmed=True
 
-   Шаг 18: Integration tests — покрыть полный flow end-to-end
+✅ Шаг 18: Integration tests — 109 unit-тестов, conftest.py с корректными mock-фикстурами
 
    Шаг 19: Prometheus + Grafana мониторинг
 
@@ -2600,39 +2410,17 @@ pytest-httpx==0.30.0
 
 ### Ожидают информации от владельца кор-системы
 
-1. **Четыре метода кор-системы не уточнены** — названия не получены от владельца:
-   ```
-   TODO_CONTRACT_METHOD   → layers/core_adapter/rest_adapter.py
-   TODO_RISKS_METHOD      → layers/core_adapter/rest_adapter.py
-   TODO_ICD10_METHOD      → layers/core_adapter/rest_adapter.py
-   TODO_PROVIDERS_METHOD  → layers/core_adapter/rest_adapter.py
-   ```
-   Логика разбора ответов уже написана, нужно только подставить реальные имена методов.
+1. **Формат PolicyList не верифицирован на реальных данных**  
+   Нет тестового `personalNumber` с активным ДМС-полисом для проверки имён полей  
+   (RiskList, AnnualLimit, ContractText и т.д.) в реальном ответе `getpolicylist`.
 
-2. **fkind коды — заглушки** (`layers/core_adapter/file_helpers.py`)  
-   `form_100=1, id_document=2, receipt=3` — уточнить реальные коды у владельца.
+### Технические TODO
 
-3. **ConfigKind не определён** (`layers/decision/service.py::build_risks_list`)  
-   Берётся из первого сервиса первого риска. Уточнить справочник у владельца.
+3. **CORS `allow_origins=[]` в production** (`services/api/main.py:36`)  
+   Внешние системы-клиенты заблокированы в production-окружении. Добавить  
+   `allow_origins` в `CORSMiddleware` из настроек или разрешить конкретные домены.
 
-### Технические TODO (запланированы в Шаге 15в)
-
-4. **N+1 запросов в RAG searcher** (`layers/rag/searcher.py::_semantic_search`, `_keyword_search`)  
-   `db.get(ContractChunk, row.id)` в цикле → заменить на `SELECT ... WHERE id IN (...)`.
-
-5. **get_embedding() блокирует event loop** (`layers/rag/searcher.py:216`)  
-   Синхронный CPU-вызов sentence-transformers в async-контексте → перенести в `run_in_executor`.
-
-6. **Retry-цикл `_call()` при 401** (`layers/core_adapter/rest_adapter.py`)  
-   `continue` после token refresh не уменьшает счётчик попыток; `last_error=None` при исчерпании через 401.
-
-7. **Contract reindex при hash-mismatch не реализован** (`layers/rag/searcher.py:301`)  
-   При изменении контракта — только `log.warning`, переиндексация не запускается.
-
-8. **CORS `allow_origins=[]` в production** (`services/api/main.py:36`)  
-   Внешние системы-клиенты заблокированы в production-окружении.
-
-9. **Whitelist доменов не настроен для дефолтного tenant** (`platform.tenant_configs`)  
+4. **Whitelist доменов не настроен для дефолтного tenant** (`platform.tenant_configs`)  
    В production worker откажет скачивать файлы пока не добавлена запись:
    ```sql
    INSERT INTO platform.tenant_configs (tenant_id, key, value)
@@ -2642,55 +2430,45 @@ pytest-httpx==0.30.0
 
 ### Функциональные TODO
 
-10. **Amount anomaly fraud detection — заглушка** (`layers/decision/service.py`)  
-    Требует накопленной статистики по суммам заявок.
+5. **Amount anomaly fraud detection — заглушка** (`layers/decision/service.py`)  
+   Требует накопленной статистики по суммам заявок (Шаг 24).
 
-11. **React Portal не реализован** (`services/portal/`)  
-    При реализации: добавить подтверждение типа документа оператором → `doc_type_source='operator'`.
+6. **React Portal не реализован** (`services/portal/`)  
+   При реализации: добавить подтверждение типа документа оператором → `doc_type_source='operator'`.  
+   Пока `doc_type_confirmed=True` ставится только при `AUTO_APPROVED`.
 
-12. **Integration tests отсутствуют** (`tests/integration/`)
-
-13. **Оператор не может подтвердить тип документа** (ждёт Portal, Шаг 17)  
-    `doc_type_source='operator'` и `doc_type_confirmed=True` сейчас устанавливаются только  
-    при `AUTO_APPROVED`. Для MANUAL_REVIEW нужен UI в Portal.
-
-14. **ML-классификатор не обучен** (ждёт накопления данных, Шаг 20)  
-    Сейчас работает regex (`classifier.py`). После ~600 подтверждённых документов  
-    запустить `training_exporter --stats` и начать Шаг 20.
+7. **ML-классификатор не обучен** (ждёт накопления данных, Шаг 20)  
+   Сейчас работает regex (`classifier.py`). После ~600 подтверждённых документов  
+   запустить `training_exporter --stats` и начать Шаг 20.
 
 ### Enterprise TODO (качество решений, Шаги 21–28)
 
-15. **Медицинская согласованность не проверяется** (Шаг 21)  
-    Claude не верифицирует что line_items соответствуют диагнозу.  
-    `DECISION_TOOL` не содержит поле `coherence_flags`.
+8. **Медицинская согласованность не проверяется** (Шаг 21)  
+   Claude не верифицирует что line_items соответствуют диагнозу.  
+   `DECISION_TOOL` не содержит поле `coherence_flags`.
 
-16. **Проверка исключений не использует ICD10-дерево** (Шаг 22)  
-    Exclusions-чанки сортируются первыми в промпте, но Claude не получает  
-    явную инструкцию проверить каждого предка диагноза против списка исключений.
+9. **Проверка исключений не использует ICD10-дерево** (Шаг 22)  
+   Exclusions-чанки сортируются первыми в промпте, но Claude не получает  
+   явную инструкцию проверить каждого предка диагноза против списка исключений.
 
-17. **Суб-лимиты и периоды ожидания не реализованы** (Шаг 23)  
-    `check_waiting_period()` и `check_sublimits()` отсутствуют в `decision/service.py`.  
-    Зависит от Шага 16 — уточнить поля у владельца кор-системы.
+10. **Суб-лимиты и периоды ожидания не реализованы** (Шаг 23)  
+    `check_waiting_period()` и `check_sublimits()` отсутствуют в `decision/service.py`.
 
-18. **Бенчмаркинг суммы по диагнозу** (Шаг 24)  
+11. **Бенчмаркинг суммы по диагнозу** (Шаг 24)  
     Таблица `diagnosis_amount_benchmarks` не создана, job не написан.  
     Активировать только после 3+ месяцев накопленных данных.
 
-19. **Кросс-документная согласованность неполная** (Шаг 25)  
+12. **Кросс-документная согласованность неполная** (Шаг 25)  
     В `extraction/service.py` проверяется ФИО + дата рождения, но не диагноз / дата события /  
     название учреждения между документами.
 
-20. **Chain-of-Thought и Extended Thinking не реализованы** (Шаг 26)  
+13. **Chain-of-Thought и Extended Thinking не реализованы** (Шаг 26)  
     Сейчас один вызов Claude с `tool_choice="required"`.  
     Reasoning не сохраняется в audit_log. Extended thinking не включается для сложных заявок.
 
-21. **Confidence не откалиброван** (Шаг 27)  
+14. **Confidence не откалиброван** (Шаг 27)  
     `manual_review_outcomes` заполняется, но нет job-а который сравнивает  
     AI-confidence с реальной точностью и обновляет `confidence_calibration_factor`.
-
-22. **Stochastic QA sampling отсутствует** (Шаг 28)  
-    Все AUTO_APPROVED уходят без выборочной проверки.  
-    Невозможно измерить реальную точность системы в production.
 
 ---
 
