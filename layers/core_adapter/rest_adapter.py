@@ -381,13 +381,59 @@ class LiteGroupAdapter(CoreSystemAdapter):
 
     async def get_providers(self) -> list[ProviderInfo]:
         """
-        LiteMed API не предоставляет endpoint для справочника провайдеров.
-        Список провайдеров задаётся статически (PersID подтверждены владельцем кор-системы).
+        Загрузить справочник провайдеров из локальной БД (таблица providers).
+        Кэшируется в Redis на 24 часа для избежания частых запросов к БД.
         """
-        return [
-            ProviderInfo(pers_id=2353, name="შპს ნიუ ჰოსპიტალს",                    inn="205210467"),
-            ProviderInfo(pers_id=3469, name='შპს ჰეპატოლოგიური კლინიკა „ჰეპა"', inn="205093147"),
-        ]
+        redis = await self._get_redis()
+
+        # Попытка получить из Redis кэша
+        if redis:
+            try:
+                cached = await redis.get(REDIS_PROVIDERS_KEY)
+                if cached:
+                    import json
+                    data = json.loads(cached)
+                    return [ProviderInfo(**item) for item in data]
+            except Exception as e:
+                log.warning("redis_cache_miss", key=REDIS_PROVIDERS_KEY, error=str(e))
+
+        # Загрузить из БД
+        from sqlalchemy import select
+        from core.database import AsyncSessionLocal
+        from core.models.provider import Provider
+
+        try:
+            async with AsyncSessionLocal() as db:
+                stmt = select(Provider).where(Provider.is_active == True)
+                result = await db.execute(stmt)
+                rows = result.scalars().all()
+
+            providers = [
+                ProviderInfo(pers_id=p.customer_id, name=p.cstname, inn=p.taxpayer)
+                for p in rows
+            ]
+
+            # Кэшировать в Redis на 24 часа
+            if redis:
+                try:
+                    import json
+                    cache_data = [
+                        {"pers_id": p.pers_id, "name": p.name, "inn": p.inn}
+                        for p in providers
+                    ]
+                    await redis.setex(
+                        REDIS_PROVIDERS_KEY,
+                        86400,  # 24 часа
+                        json.dumps(cache_data),
+                    )
+                except Exception as e:
+                    log.warning("redis_cache_set_failed", key=REDIS_PROVIDERS_KEY, error=str(e))
+
+            return providers
+
+        except Exception as e:
+            log.error("providers_load_failed", error=str(e))
+            return []
 
     # ── Метод 5: ClaimParsing_UNI ───────────────────────────────────
 
@@ -521,6 +567,26 @@ class MockCoreAdapter(CoreSystemAdapter):
 
     async def get_providers(self) -> list[ProviderInfo]:
         log.warning("mock_core_adapter_used", method="get_providers")
+        # Mock тоже загружает из БД если есть данные, или возвращает примеры
+        from sqlalchemy import select
+        from core.database import AsyncSessionLocal
+        from core.models.provider import Provider
+
+        try:
+            async with AsyncSessionLocal() as db:
+                stmt = select(Provider).where(Provider.is_active == True)
+                result = await db.execute(stmt)
+                rows = result.scalars().all()
+
+            if rows:
+                return [
+                    ProviderInfo(pers_id=p.customer_id, name=p.cstname, inn=p.taxpayer)
+                    for p in rows
+                ]
+        except Exception:
+            pass
+
+        # Fallback на примеры если БД не настроена
         return [
             ProviderInfo(pers_id=2353, name="შპს ნიუ ჰოსპიტალს",                    inn="205210467"),
             ProviderInfo(pers_id=3469, name='შპს ჰეპატოლოგიური კლინიკა „ჰეპა"', inn="205093147"),

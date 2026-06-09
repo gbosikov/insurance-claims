@@ -6,6 +6,7 @@ from core.models.audit import AuditLog
 from core.models.review import ManualReviewQueue, ManualReviewOutcome
 from core.models.appeal import Appeal
 from core.models.fraud import ClaimFrequency
+from core.models.provider import Provider
 
 __all__ = [
     "Claim",
@@ -19,4 +20,5 @@ __all__ = [
     "ManualReviewOutcome",
     "Appeal",
     "ClaimFrequency",
+    "Provider",
 ]

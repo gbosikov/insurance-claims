@@ -79,13 +79,18 @@ insurance-claims/
 │   │   ├── 001_initial.sql      ← начальная схема
 │   │   ├── 002_doc_type_training.sql ← поля для обучающей выборки классификатора
 │   │   ├── 003_source_url.sql   ← source_url в claim_documents, storage_path nullable
-│   │   └── 004_icd10_local.sql  ← таблица icd10_diagnoses (локальный справочник МКБ-10)
+│   │   ├── 004_icd10_local.sql  ← таблица icd10_diagnoses (локальный справочник МКБ-10)
+│   │   └── 005_providers.sql    ← таблица providers (справочник клиник)
 │   ├── loaders/
-│   │   └── load_icd10.py        ← загрузчик справочника МКБ-10 из CSV/Excel
+│   │   ├── load_icd10.py        ← загрузчик справочника МКБ-10 из CSV/Excel
+│   │   └── load_providers.py    ← загрузчик справочника провайдеров из CSV/Excel
 │   └── data/
-│       └── ICD10.csv            ← справочник МКБ-10 (UTF-8, ~12 000 записей)
-│                                   Колонки: ID, NAME_A (KA), NAME_E, NAME_R, AVAILABLE, PID, EXTCOD
-│                                   Не в git (.gitignore). Загружается автоматически при старте API.
+│       ├── ICD10.csv            ← справочник МКБ-10 (UTF-8, ~12 000 записей)
+│       │                           Колонки: ID, NAME_A (KA), NAME_E, NAME_R, AVAILABLE, PID, EXTCOD
+│       │                           Не в git (.gitignore). Загружается автоматически при старте API.
+│       └── providers.csv        ← справочник провайдеров (клиник)
+│                                   Колонки: CUSTOMER (PersID), CSTNAME (имя), TAXPAYER (ИНН)
+│                                   Не в git. Загружается автоматически при старте API.
 │
 └── tests/
     ├── unit/
@@ -1401,10 +1406,9 @@ core_api_claims_base_url = ""  # пусто = использовать core_api_
 #    DiagnosID берётся из локальной таблицы icd10_diagnoses (icd10_enricher.py).
 
 # 5. get_providers() → list[ProviderData]
-#    Справочник провайдеров (клиник) содержит:
-#    - CUSTOMER (PersID) — код провайдера, используется в ClaimParsing_UNI
-#    - CSTNAME (имя клиники) — на английском или грузинском языке
-#    - TAXPAYER (ИНН) — идентификатор налогоплательщика
+#    Загружаются из таблицы providers (загружена из db/data/providers.csv при старте).
+#    Кэшируются в Redis на 24 часа для избежания частых запросов к БД.
+#    Структура: CUSTOMER (PersID) → pers_id, CSTNAME → name, TAXPAYER → inn.
 #    Поиск по CSTNAME из OCR-документов с fuzzy matching (SequenceMatcher ≥ 0.70).
 #    Fallback: PersID=0 если клиника не найдена (ClaimParsing_UNI вернёт код 3 если обязателен).
 
@@ -2168,9 +2172,10 @@ CMD ["uvicorn", "services.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 ```bash
 #!/bin/bash
-# Запускается перед uvicorn: загружает справочник МКБ-10 если таблица пустая.
+# Запускается перед uvicorn: загружает справочники если таблицы пустые.
 set -e
 
+# ── Справочник МКБ-10 ────────────────────────────────────────────────
 ICD10_FILE="/app/db/data/ICD10.csv"
 
 if [ -f "$ICD10_FILE" ]; then
@@ -2180,11 +2185,24 @@ else
     echo "[entrypoint] Файл $ICD10_FILE не найден, пропускаю загрузку МКБ-10."
 fi
 
+# ── Справочник провайдеров ───────────────────────────────────────────
+PROVIDERS_FILE="/app/db/data/providers.csv"
+
+if [ -f "$PROVIDERS_FILE" ]; then
+    echo "[entrypoint] Проверяю справочник провайдеров..."
+    python -m db.loaders.load_providers --file "$PROVIDERS_FILE" --skip-if-loaded
+else
+    echo "[entrypoint] Файл $PROVIDERS_FILE не найден, пропускаю загрузку провайдеров."
+fi
+
 exec "$@"
 ```
 
-**Важно:** файл `db/data/ICD10.csv` хранится в репозитории (3.6 МБ, 12 435 записей).
-Загружается автоматически при старте контейнера через `entrypoint.sh --skip-if-loaded`.
+**Важно:**
+- `db/data/ICD10.csv` — справочник МКБ-10 (3.6 МБ, 12 435 записей). Хранится в репозитории.
+- `db/data/providers.csv` — справочник провайдеров (клиник). **Не в git**.
+  Загрузить ваш CSV файл в `db/data/providers.csv` перед развёртыванием.
+  Структура: `CUSTOMER,CSTNAME,TAXPAYER` (CUSTOMER = PersID).
 
 ### requirements.txt
 
@@ -2423,6 +2441,11 @@ pytest-httpx==0.30.0
 1. **Формат PolicyList не верифицирован на реальных данных**  
    Нет тестового `personalNumber` с активным ДМС-полисом для проверки имён полей  
    (RiskList, AnnualLimit, ContractText и т.д.) в реальном ответе `getpolicylist`.
+
+2. **Способ доставки справочника провайдеров**  
+   ✅ Структура известна: CUSTOMER (PersID), CSTNAME (имя), TAXPAYER (ИНН)  
+   ? Как доставляется: CSV файл в репо, REST API endpoint, или SQL dump?  
+   ? Частота обновления: ежедневно, по требованию, или один раз при деплое?
 
 ### Технические TODO
 
