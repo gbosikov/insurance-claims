@@ -14,7 +14,13 @@ logs:
 	docker compose logs -f api worker
 
 migrate:
-	docker compose exec api python -m db.migrate
+	docker compose exec api alembic upgrade head
+
+migrate-status:
+	docker compose exec api alembic current
+
+migrate-new:
+	@echo "docker compose exec api alembic revision -m \"описание\"  (или --autogenerate)"
 
 test:
 	docker compose exec api pytest tests/ -v --tb=short

@@ -32,6 +32,7 @@ from core.models.claim import Claim, ClaimDocument, ClaimStatus
 from core.schemas.decision import ClaimDecision, DiagnosisDecisionSchema
 from tests.integration.conftest import (
     CLAIM_ID,
+    POLICY_NUMBER,
     TENANT_ID,
     make_claim,
     make_claude_decision_response,
@@ -201,6 +202,7 @@ async def test_decision_invalid_event_date_returns_manual_review():
         decision = await make_decision(
             claim_id=CLAIM_ID,
             tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
             extraction=bad_extraction,
             risks_limits=make_risks_and_limits(),
             icd10_list=make_icd10_list(),
@@ -234,6 +236,7 @@ async def test_decision_exhausted_limit_returns_manual_review():
         decision = await make_decision(
             claim_id=CLAIM_ID,
             tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
             extraction=extraction,
             risks_limits=exhausted_limits,
             icd10_list=make_icd10_list(),
@@ -280,6 +283,7 @@ async def test_decision_requires_manual_review_flag_propagates():
         decision = await make_decision(
             claim_id=CLAIM_ID,
             tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
             extraction=make_extraction_result(),
             risks_limits=make_risks_and_limits(),
             icd10_list=make_icd10_list(),
@@ -462,14 +466,23 @@ async def test_stochastic_qa_routes_approved_to_manual_review():
         mock_settings.manual_review_currency = "GEL"
         mock_settings.fraud_frequency_window_days = 30
         mock_settings.fraud_frequency_max_claims = 10
-        mock_settings.claude_model = "claude-sonnet-4-20250514"
+        mock_settings.claude_model = "claude-sonnet-4-6"
         mock_settings.claude_decision_temperature = 0.1
         mock_settings.claude_decision_max_tokens = 4000
         mock_settings.decision_stochastic_qa_rate = 1.0  # 100% → всегда срабатывает
+        mock_settings.decision_extended_thinking_enabled = False
+        mock_settings.decision_chain_of_thought_enabled = False
+        mock_settings.decision_coherence_check_enabled = True
+        mock_settings.decision_coherence_confidence_penalty = 0.10
+        mock_settings.decision_second_pass_confidence_threshold = 0.65
+        mock_settings.decision_confidence_calibration_factor = 1.0
+        mock_settings.decision_reasoning_audit_max_chars = 4000
+        mock_settings.decision_default_waiting_period_days = 30
 
         decision = await make_decision(
             claim_id=CLAIM_ID,
             tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
             extraction=make_extraction_result(),
             risks_limits=make_risks_and_limits(),
             icd10_list=make_icd10_list(),
@@ -518,15 +531,24 @@ async def test_stochastic_qa_at_rate_zero_never_triggers():
         mock_settings.manual_review_currency = "GEL"
         mock_settings.fraud_frequency_window_days = 30
         mock_settings.fraud_frequency_max_claims = 10
-        mock_settings.claude_model = "claude-sonnet-4-20250514"
+        mock_settings.claude_model = "claude-sonnet-4-6"
         mock_settings.claude_decision_temperature = 0.1
         mock_settings.claude_decision_max_tokens = 4000
         mock_settings.decision_stochastic_qa_rate = 0.0  # никогда не срабатывает
+        mock_settings.decision_extended_thinking_enabled = False
+        mock_settings.decision_chain_of_thought_enabled = False
+        mock_settings.decision_coherence_check_enabled = True
+        mock_settings.decision_coherence_confidence_penalty = 0.10
+        mock_settings.decision_second_pass_confidence_threshold = 0.65
+        mock_settings.decision_confidence_calibration_factor = 1.0
+        mock_settings.decision_reasoning_audit_max_chars = 4000
+        mock_settings.decision_default_waiting_period_days = 30
 
         for _ in range(5):  # несколько попыток
             decision = await make_decision(
                 claim_id=CLAIM_ID,
                 tenant_id=TENANT_ID,
+                policy_number=POLICY_NUMBER,
                 extraction=make_extraction_result(),
                 risks_limits=make_risks_and_limits(),
                 icd10_list=make_icd10_list(),

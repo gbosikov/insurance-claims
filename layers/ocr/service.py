@@ -86,12 +86,38 @@ def _ocr_with_vision_api(image_bytes: bytes) -> list[TextBlock]:
                 for word in para.words:
                     word_text = "".join(s.text for s in word.symbols)
                     block_text += word_text + " "
+            bbox = None
+            if block.bounding_box and block.bounding_box.vertices:
+                bbox = {"vertices": [{"x": v.x, "y": v.y} for v in block.bounding_box.vertices]}
             blocks.append(TextBlock(
                 text=block_text.strip(),
                 confidence=block.confidence,
+                bounding_box=bbox,
             ))
 
     return blocks
+
+
+def _document_ai_text_confidence(document) -> float:
+    """
+    Confidence полного текста Document AI.
+    Document AI не даёт document-level confidence — выводим из доступных данных:
+    среднее по layout страниц → среднее по entities → 0.0 (неизвестно).
+    """
+    page_confs = [
+        page.layout.confidence
+        for page in document.pages
+        if page.layout and page.layout.confidence
+    ]
+    if page_confs:
+        return sum(page_confs) / len(page_confs)
+
+    entity_confs = [e.confidence for e in document.entities if e.confidence]
+    if entity_confs:
+        return sum(entity_confs) / len(entity_confs)
+
+    log.warning("docai_confidence_unavailable")
+    return 0.0
 
 
 def _ocr_with_document_ai(image_bytes: bytes) -> list[TextBlock]:
@@ -130,7 +156,7 @@ def _ocr_with_document_ai(image_bytes: bytes) -> list[TextBlock]:
     if document.text:
         blocks.insert(0, TextBlock(
             text=document.text,
-            confidence=0.90,
+            confidence=_document_ai_text_confidence(document),
         ))
 
     return blocks
@@ -200,23 +226,38 @@ async def ocr_document(
         # Вычисляем средний confidence
         if blocks:
             avg_confidence = sum(b.confidence for b in blocks) / len(blocks)
+            min_confidence = min(b.confidence for b in blocks)
         else:
             avg_confidence = 0.0
+            min_confidence = 0.0
 
-        # Считаем блоки с низким confidence
-        low_conf_blocks = sum(
-            1 for b in blocks if b.confidence < settings.ocr_min_confidence
-        )
+        # Блоки с низким confidence: количество + индексы (для локализации проблем)
+        low_conf_indices = [
+            i for i, b in enumerate(blocks) if b.confidence < settings.ocr_min_confidence
+        ]
+        low_conf_blocks = len(low_conf_indices)
 
         # Полный текст — конкатенация блоков
         full_text = "\n".join(b.text for b in blocks if b.text.strip())
 
-        # Сохраняем в БД
+        strategy = OCR_STRATEGIES.get(doc.doc_type, "vision_text_detection")
+
+        # Сохраняем в БД: текст + агрегат + per-block данные (миграция 009)
         doc.ocr_text = full_text
         doc.ocr_confidence = avg_confidence
+        doc.ocr_blocks = {
+            "strategy": strategy,
+            "low_confidence_blocks": low_conf_blocks,
+            "blocks": [
+                {
+                    "text": b.text[:settings.ocr_block_text_max_chars],
+                    "confidence": round(b.confidence, 3),
+                    "bbox": b.bounding_box,
+                }
+                for b in blocks
+            ],
+        }
         await db.flush()
-
-    strategy = OCR_STRATEGIES.get(doc.doc_type, "vision_text_detection")
 
     await write_audit_entry(
         db,
@@ -226,11 +267,13 @@ async def ocr_document(
         input_data={"doc_id": str(doc.id), "doc_type": doc.doc_type.value, "strategy": strategy},
         output_data={
             "avg_confidence": round(avg_confidence, 3),
+            "min_confidence": round(min_confidence, 3),
             "blocks_count": len(blocks),
             "low_confidence_blocks": low_conf_blocks,
+            "low_confidence_block_indices": low_conf_indices,
             "text_length": len(full_text),
         },
-        confidence={"avg": round(avg_confidence, 3)},
+        confidence={"avg": round(avg_confidence, 3), "min": round(min_confidence, 3)},
         duration_ms=timer.duration_ms,
     )
 

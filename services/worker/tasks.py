@@ -233,6 +233,7 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
             decision = await make_decision(
                 claim_id=claim_uuid,
                 tenant_id=tenant_uuid,
+                policy_number=policy_number,
                 extraction=extraction,
                 risks_limits=risks_limits,
                 icd10_list=icd10_list,
@@ -445,7 +446,7 @@ def reindex_contract_structures_task(
                 pdf_storage_path = contract_version.pdf_path
                 version_id = contract_version.version_id
 
-                logger.info(
+                log.info(
                     "reindex_contract_version_resolved",
                     policy_number=policy_number,
                     version_id=version_id,
@@ -460,7 +461,7 @@ def reindex_contract_structures_task(
                     from layers.rag.indexer import extract_text_from_pdf
                     contract_text = extract_text_from_pdf(pdf_bytes)
                 except Exception as e:
-                    logger.error(
+                    log.error(
                         "reindex_pdf_extract_error",
                         policy_number=policy_number,
                         version_id=version_id,
@@ -477,7 +478,7 @@ def reindex_contract_structures_task(
                     f"Could not extract contract text from {pdf_storage_path}"
                 )
 
-            logger.info(
+            log.info(
                 "reindex_contract_text_extracted",
                 policy_number=policy_number,
                 version_id=version_id,
@@ -494,7 +495,7 @@ def reindex_contract_structures_task(
                 storage=storage,
             )
 
-            logger.info(
+            log.info(
                 "reindex_contract_complete",
                 policy_number=policy_number,
                 version_id=version_id,

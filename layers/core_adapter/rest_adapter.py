@@ -5,16 +5,30 @@
 1. LiteMed API (данные полисов):
      Auth:  POST {core_api_auth_url}/api/User/authenticate → {"token": "..."}
      Data:  POST {core_api_base_url}/api/Client/getpolicylist
-            Body: {"personalnumber": "...", "STATE": "0", "schedule": "0"}
-            Header: Authorization: Bearer <token>
+            Body: {"personalnumber": "...", "STATE": "0", "schedule": "1"}
+            Header: Authorization: {core_api_auth_scheme} <token>
 
 2. Claims API (создание убытка):
      POST {core_api_claims_base_url}/LiteApi/LiteServiceJSON
      Body: {"METHODNAME": "ClaimParsing_UNI", "XML_DATA": {...}}
-     Header: Authorization: Bearer <token>
      URL уточнить у владельца кор-системы (core_api_claims_base_url в .env).
 
-Ответ getpolicylist: {"PolicyList": "..."} — строка (пустая или JSON-массив).
+Реальная структура ответа getpolicylist (верифицирована 2026-06-11):
+  {"PolicyList": {"Policy": [{
+      "Number": "MED 536638", "CardNumber": "UNI 700003/1", "OldNumber": "...",
+      "StartDate": "01/01/2026", "EndDate": "01/01/2027", "StopDate": "",
+      "ObjectList": {"Objects": {           ← dict ИЛИ list (XML→JSON артефакт!)
+          "PersonalNumber": "...", "StartDate": "...", "ObjectData": "...",
+          "InsuranceTypeList": {"InsuranceType": [{
+              "TypeID": "23", "Amount": "27000.00", "AmountCurrency": "GEL",
+              "RiskList": {"Risk": [{       ← dict ИЛИ list
+                  "RiskId": "...", "RiskParentId": "0", "RiskName": "...",
+                  "LimitAmount": "3000.00", "LimitCount": "",
+                  "LinitPercent": "80",     ← опечатка в API (Linit)
+                  "LimitAmountLeft": "2927.81", "LimitCountLeft": "0"}]}}]}}}}]}}
+
+Особенности: все значения — строки; даты DD/MM/YYYY; одноэлементные списки
+свёрнуты в dict; текст договора в ответе ОТСУТСТВУЕТ (ClauseList="").
 """
 
 from __future__ import annotations
@@ -22,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import date
+from datetime import date, datetime
 
 import httpx
 import structlog
@@ -48,6 +62,53 @@ REDIS_ICD10_KEY = "lite_group:icd10_list"
 REDIS_PROVIDERS_KEY = "lite_group:providers"
 TOKEN_TTL = 3600        # 1 час
 ICD10_CACHE_TTL = 86400 # 24 часа
+
+
+# ── Нормализация ответа кор-системы (XML→JSON артефакты) ──────────
+
+def _ensure_list(value) -> list:
+    """Одноэлементные списки приходят свёрнутыми в dict; пустые — как ""."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def _parse_core_date(value) -> date | None:
+    """Даты кор-системы: DD/MM/YYYY. Пусто/невалидно → None."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int_or_none(value) -> int | None:
+    """"" → None; "0" → 0 (значимо: исчерпанный количественный лимит)."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def _norm_number(value) -> str:
+    """Номер полиса/карточки для сравнения: без пробелов, верхний регистр."""
+    return str(value or "").replace(" ", "").upper()
 
 
 
@@ -139,9 +200,15 @@ class LiteGroupAdapter(CoreSystemAdapter):
 
     # ── Общий REST-вызов с retry и 401-refresh ─────────────────────
 
+    @staticmethod
+    def _auth_header_value(token: str) -> str:
+        """Схема настраивается: "Bearer <token>" или сырой токен (см. config)."""
+        scheme = settings.core_api_auth_scheme.strip()
+        return f"{scheme} {token}" if scheme else token
+
     async def _call_rest(self, url: str, body: dict) -> dict:
         """
-        POST {url} с Bearer-авторизацией.
+        POST {url} с авторизацией (схема — core_api_auth_scheme).
         Retry: max_retries попыток, backoff [1, 3, 10] сек.
         При 401 → однократный refresh + повтор (не считается как attempt).
         """
@@ -152,7 +219,7 @@ class LiteGroupAdapter(CoreSystemAdapter):
             try:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
                     headers = {
-                        "Authorization": f"Bearer {token}",
+                        "Authorization": self._auth_header_value(token),
                         "Content-Type": "application/json",
                     }
                     resp = await client.post(url, json=body, headers=headers)
@@ -160,7 +227,7 @@ class LiteGroupAdapter(CoreSystemAdapter):
                     if resp.status_code == 401:
                         log.info("core_token_expired_refreshing", url=url, attempt=attempt)
                         token = await self._refresh_token()
-                        headers["Authorization"] = f"Bearer {token}"
+                        headers["Authorization"] = self._auth_header_value(token)
                         resp = await client.post(url, json=body, headers=headers)
                         if resp.status_code == 401:
                             raise CoreAPIUnavailableError(
@@ -191,8 +258,9 @@ class LiteGroupAdapter(CoreSystemAdapter):
     async def get_policy_list(self, personal_number: str) -> list[dict]:
         """
         POST /api/Client/getpolicylist
-        Body: {"personalnumber": "...", "STATE": "0", "schedule": "0"}
-        Ответ: {"PolicyList": "" | "[{...}]" | [{...}]}
+        Body: {"personalnumber": "...", "STATE": "0", "schedule": "1"}
+        Ответ (верифицирован): {"PolicyList": {"Policy": [...] | {...}}}.
+        Защита: строковый вариант ("" | "[...]") тоже разбирается.
         """
         url = f"{self._data_base}/api/Client/getpolicylist"
         result = await self._call_rest(url, {
@@ -203,15 +271,19 @@ class LiteGroupAdapter(CoreSystemAdapter):
 
         policy_list = result.get("PolicyList", [])
 
-        # Кор-система может вернуть PolicyList как строку (в т.ч. пустую или JSON)
+        # Защита: кор-система может вернуть PolicyList строкой (пустой или JSON)
         if isinstance(policy_list, str):
             if not policy_list.strip():
                 return []
             try:
                 policy_list = json.loads(policy_list)
             except json.JSONDecodeError:
-                log.warning("policy_list_parse_failed", raw=policy_list[:200])
+                log.warning("policy_list_parse_failed", raw_length=len(policy_list))
                 return []
+
+        # Реальный формат: {"Policy": [...]} (одноэлементный может быть dict)
+        if isinstance(policy_list, dict):
+            return _ensure_list(policy_list.get("Policy"))
 
         return policy_list if isinstance(policy_list, list) else []
 
@@ -221,9 +293,15 @@ class LiteGroupAdapter(CoreSystemAdapter):
         personal_number: str | None,
     ) -> dict:
         """
-        Найти полис по номеру медкарточки в списке полисов пользователя.
-        Если personal_number не задан — возвращает пустой dict (без ошибки).
-        Если список непустой но нужный полис не найден → PolicyNotFoundError.
+        Найти ДМС-полис в списке полисов пользователя.
+
+        Рассматриваются ТОЛЬКО медицинские продукты
+        (Policy.ProductName ∈ core_api_medical_product_names) —
+        имущественные и прочие полисы клиента игнорируются.
+        Номер сверяется (без пробелов, без регистра) с полями:
+        CardNumber (номер медкарточки — основной идентификатор для ДМС),
+        Number (номер полиса), OldNumber (старый номер договора).
+        Расторгнутые полисы (StopDate непустой) пропускаются.
         """
         if not personal_number:
             log.warning(
@@ -240,23 +318,38 @@ class LiteGroupAdapter(CoreSystemAdapter):
                 f"No active policies for personal_id={personal_number}"
             )
 
-        # Перебираем возможные имена поля с номером полиса
-        _NUM_KEYS = (
-            "PolicyNumber", "policyNumber", "POLICY_NUMBER",
-            "policy_number", "MedCard", "medcard",
-        )
+        allowed_products = {
+            name.strip() for name in settings.core_api_medical_product_names
+        }
+        target = _norm_number(policy_number)
+
         for p in policies:
-            pnum = ""
-            for k in _NUM_KEYS:
-                if k in p:
-                    pnum = str(p[k])
-                    break
-            if pnum == policy_number:
+            if str(p.get("StopDate") or "").strip():
+                continue  # полис расторгнут
+            product = str(p.get("ProductName") or "").strip()
+            if allowed_products and product not in allowed_products:
+                continue  # не медицинский продукт (имущество, НС и т.п.)
+            candidates = (p.get("CardNumber"), p.get("Number"), p.get("OldNumber"))
+            if any(_norm_number(c) == target for c in candidates if c):
                 return p
 
         raise PolicyNotFoundError(
-            f"Policy {policy_number} not found for personal_id={personal_number}"
+            f"Medical policy {policy_number} not found for personal_id={personal_number}"
         )
+
+    @staticmethod
+    def _extract_insured_object(policy: dict, personal_number: str | None) -> dict:
+        """
+        Застрахованный объект полиса (ObjectList.Objects — dict или list).
+        При нескольких застрахованных выбирается по личному номеру.
+        """
+        objects = _ensure_list((policy.get("ObjectList") or {}).get("Objects"))
+        if personal_number:
+            target = str(personal_number).strip()
+            for obj in objects:
+                if str(obj.get("PersonalNumber") or "").strip() == target:
+                    return obj
+        return objects[0] if objects else {}
 
     # ── Метод 1: Генеральный договор ───────────────────────────────
 
@@ -266,35 +359,34 @@ class LiteGroupAdapter(CoreSystemAdapter):
         personal_number: str | None = None,
     ) -> ContractData:
         """
-        Извлечь текст договора из данных полиса (getpolicylist).
-        Если текст договора не доступен через API — возвращает пустое поле content
-        (RAG-индексация не запустится, заявка уйдёт в manual_review).
+        Текст договора из данных полиса.
+
+        ВЕРИФИЦИРОВАНО (2026-06-11): getpolicylist НЕ возвращает текст договора —
+        в реальном ответе есть только ClauseList (пустой в примере). Пробуем
+        ClauseList на случай, если он заполняется; иначе content="" →
+        RAG вернёт пустой список → decision поставит requires_manual_review.
+        ОТКРЫТО: канал доставки текста договора — вопрос владельцу Lite GROUP
+        (пока договоры загружаются вручную через POST /v1/contracts).
         """
         policy = await self._find_policy(policy_number, personal_number)
 
-        content = (
-            policy.get("ContractText")
-            or policy.get("contractText")
-            or policy.get("Contract")
-            or policy.get("contract")
-            or ""
-        )
-        content_hash = (
-            policy.get("ContentHash")
-            or policy.get("contentHash")
-            or policy.get("content_hash")
-        )
-        version = (
-            policy.get("Version")
-            or policy.get("version")
-            or policy.get("PolicyVersion")
-        )
+        clause_list = policy.get("ClauseList") or ""
+        if isinstance(clause_list, (dict, list)):
+            content = json.dumps(clause_list, ensure_ascii=False)
+        else:
+            content = str(clause_list)
+
+        if not content.strip():
+            log.info(
+                "contract_text_not_in_policy_response",
+                policy_number=policy_number,
+            )
 
         return ContractData(
             policy_number=policy_number,
-            content=str(content),
-            content_hash=str(content_hash) if content_hash else None,
-            version=str(version) if version else None,
+            content=content,
+            content_hash=None,
+            version=None,
         )
 
     # ── Метод 2: Риски и лимиты ────────────────────────────────────
@@ -304,59 +396,72 @@ class LiteGroupAdapter(CoreSystemAdapter):
         policy_number: str,
         personal_number: str | None = None,
     ) -> RisksAndLimits:
-        """Извлечь риски, лимиты и остатки из данных полиса."""
+        """
+        Риски, лимиты и остатки из данных полиса (структура верифицирована).
+
+        Путь: Policy → ObjectList.Objects (по личному номеру) →
+        InsuranceTypeList.InsuranceType (медицинские TypeID из настройки) →
+        RiskList.Risk.
+
+        annual_limit = страховая сумма медицинского типа (Amount).
+        remaining: на уровне полиса остатка нет — берётся максимум
+        LimitAmountLeft по рискам с собственным денежным лимитом
+        (все суб-лимиты исчерпаны → 0 → manual_review «limit_exhausted»).
+        """
         policy = await self._find_policy(policy_number, personal_number)
+        insured = self._extract_insured_object(policy, personal_number)
+
+        ins_types = _ensure_list(
+            (insured.get("InsuranceTypeList") or {}).get("InsuranceType")
+        )
+        medical_types = [
+            t for t in ins_types
+            if _to_int_or_none(t.get("TypeID")) in settings.core_api_medical_type_ids
+        ]
+        selected_types = medical_types or ins_types
+        if ins_types and not medical_types:
+            log.warning(
+                "medical_insurance_type_not_found",
+                policy_number=policy_number,
+                type_ids=[t.get("TypeID") for t in ins_types],
+            )
 
         risks: list[RiskInfo] = []
-        raw_risks = (
-            policy.get("RiskList")
-            or policy.get("riskList")
-            or policy.get("Risks")
-            or policy.get("risks")
-            or []
-        )
-        if isinstance(raw_risks, str):
-            try:
-                raw_risks = json.loads(raw_risks)
-            except json.JSONDecodeError:
-                raw_risks = []
+        annual_limit = 0.0
+        currency = "GEL"
 
-        for r in (raw_risks if isinstance(raw_risks, list) else []):
-            try:
-                risks.append(RiskInfo(
-                    risk_id=int(
-                        r.get("RiskID") or r.get("riskId") or r.get("risk_id") or 0
-                    ),
-                    name=str(
-                        r.get("RiskName") or r.get("riskName") or r.get("name") or ""
-                    ),
-                    coverage_pct=float(
-                        r.get("CoveragePct") or r.get("coveragePct")
-                        or r.get("coverage_pct") or r.get("Percent") or 100
-                    ),
-                    total_limit=float(
-                        r.get("TotalLimit") or r.get("totalLimit")
-                        or r.get("total_limit") or r.get("Limit") or 0
-                    ),
-                    remaining_limit=float(
-                        r.get("RemainingLimit") or r.get("remainingLimit")
-                        or r.get("remaining_limit") or r.get("Remaining") or 0
-                    ),
-                    currency=str(r.get("Currency") or r.get("currency") or "GEL"),
-                    services=r.get("Services") or r.get("services") or [],
-                ))
-            except Exception as exc:
-                log.warning("risk_parse_error", error=str(exc), raw=str(r)[:200])
+        for ins_type in selected_types:
+            type_currency = str(ins_type.get("AmountCurrency") or "GEL")
+            type_amount = _to_float(ins_type.get("Amount"))
+            if type_amount > annual_limit:
+                annual_limit = type_amount
+                currency = type_currency
 
-        annual_limit = float(
-            policy.get("AnnualLimit") or policy.get("annualLimit")
-            or policy.get("annual_limit") or policy.get("Limit") or 0
+            for r in _ensure_list((ins_type.get("RiskList") or {}).get("Risk")):
+                try:
+                    limit_amount = _to_float(r.get("LimitAmount"))
+                    parent_id = _to_int_or_none(r.get("RiskParentId"))
+                    risks.append(RiskInfo(
+                        risk_id=_to_int_or_none(r.get("RiskId")) or 0,
+                        name=str(r.get("RiskName") or "").strip(),
+                        # LinitPercent — опечатка в самом API кор-системы
+                        coverage_pct=_to_float(r.get("LinitPercent"), default=100.0),
+                        total_limit=limit_amount,
+                        remaining_limit=_to_float(r.get("LimitAmountLeft")),
+                        currency=type_currency,
+                        sublimit=limit_amount if limit_amount > 0 else None,
+                        parent_risk_id=parent_id if parent_id else None,  # "0" = корневой
+                        limit_count=_to_int_or_none(r.get("LimitCount")),
+                        limit_count_left=_to_int_or_none(r.get("LimitCountLeft")),
+                    ))
+                except Exception as exc:
+                    log.warning("risk_parse_error", error=str(exc), risk_id=r.get("RiskId"))
+
+        limited_risks = [r for r in risks if (r.sublimit or 0) > 0]
+        remaining = max(
+            (r.remaining_limit for r in limited_risks),
+            default=annual_limit,
         )
-        remaining = float(
-            policy.get("Remaining") or policy.get("remaining")
-            or policy.get("RemainingLimit") or 0
-        )
-        currency = str(policy.get("Currency") or policy.get("currency") or "GEL")
 
         return RisksAndLimits(
             policy_number=policy_number,
@@ -364,6 +469,13 @@ class LiteGroupAdapter(CoreSystemAdapter):
             annual_limit=annual_limit,
             remaining=remaining,
             currency=currency,
+            policy_start_date=_parse_core_date(
+                insured.get("StartDate") or policy.get("StartDate")
+            ),
+            policy_end_date=_parse_core_date(
+                insured.get("EndDate") or policy.get("EndDate")
+            ),
+            object_data=str(insured.get("ObjectData") or "").strip() or None,
         )
 
     # ── Метод 3: Справочник ICD10 ──────────────────────────────────

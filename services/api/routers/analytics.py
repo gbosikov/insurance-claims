@@ -10,21 +10,23 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.auth import get_tenant_id
 from core.database import get_db
 from core.models.claim import Claim, ClaimStatus
 
 router = APIRouter()
 
-DEFAULT_TENANT_ID = UUID("00000000-0000-0000-0000-000000000001")
-
 
 @router.get("/summary")
-async def get_summary(db: AsyncSession = Depends(get_db)):
+async def get_summary(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(get_tenant_id),
+):
     """Сводная статистика по заявкам."""
     # Количество заявок по статусам
     status_counts = await db.execute(
         select(Claim.status, func.count(Claim.id))
-        .where(Claim.tenant_id == DEFAULT_TENANT_ID)
+        .where(Claim.tenant_id == tenant_id)
         .group_by(Claim.status)
     )
     status_data = {str(row[0].value): row[1] for row in status_counts}
@@ -33,7 +35,7 @@ async def get_summary(db: AsyncSession = Depends(get_db)):
     avg_confidence = await db.execute(
         select(func.avg(Claim.overall_confidence))
         .where(
-            Claim.tenant_id == DEFAULT_TENANT_ID,
+            Claim.tenant_id == tenant_id,
             Claim.overall_confidence.isnot(None),
         )
     )
@@ -43,7 +45,7 @@ async def get_summary(db: AsyncSession = Depends(get_db)):
     payout_stats = await db.execute(
         select(func.sum(Claim.final_payout), func.avg(Claim.final_payout))
         .where(
-            Claim.tenant_id == DEFAULT_TENANT_ID,
+            Claim.tenant_id == tenant_id,
             Claim.final_payout.isnot(None),
         )
     )
@@ -64,7 +66,10 @@ async def get_summary(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/accuracy")
-async def get_accuracy_metrics(db: AsyncSession = Depends(get_db)):
+async def get_accuracy_metrics(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(get_tenant_id),
+):
     """
     Метрики точности (требуют данных из manual_review_outcomes).
     Доступно после накопления достаточного объёма ручных проверок.
@@ -74,7 +79,7 @@ async def get_accuracy_metrics(db: AsyncSession = Depends(get_db)):
 
     total_reviews = await db.execute(
         select(func.count(ManualReviewOutcome.id))
-        .where(ManualReviewOutcome.tenant_id == DEFAULT_TENANT_ID)
+        .where(ManualReviewOutcome.tenant_id == tenant_id)
     )
     reviews_count = total_reviews.scalar() or 0
 

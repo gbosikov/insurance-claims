@@ -22,7 +22,14 @@ from core.audit import AuditTimer, write_audit_entry
 from core.config import get_settings
 from core.exceptions import CrossValidationError, ExtractionFailedError
 from core.models.claim import ClaimDocument, DocType
-from core.schemas.claim import DiagnoisItem, EventData, ExtractionResult, InsuredData, LineItem
+from core.schemas.claim import (
+    CrossDocumentData,
+    DiagnoisItem,
+    EventData,
+    ExtractionResult,
+    InsuredData,
+    LineItem,
+)
 from layers.extraction.classifier import reclassify_documents
 from layers.ocr.service import OCRResult
 
@@ -30,7 +37,8 @@ log = structlog.get_logger()
 settings = get_settings()
 
 # Версия промпта — фиксируется в аудит-логе
-PROMPT_VERSION = "extraction/v1.0.0"
+# v1.1.0: добавлен cross_document (Шаг 25 — кросс-документная согласованность)
+PROMPT_VERSION = "extraction/v1.1.0"
 
 # ── Tool definition для Claude API ────────────────────────────────
 
@@ -132,6 +140,43 @@ EXTRACTION_TOOL: dict[str, Any] = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Проблемы: low_confidence_name | missing_date | missing_policy | amount_unclear | icd10_unclear"
+            },
+            "cross_document": {
+                "type": "object",
+                "description": "Значения, как они видны В КАЖДОМ документе ПО ОТДЕЛЬНОСТИ "
+                               "(для кросс-проверки согласованности). Заполняй только из явно "
+                               "присутствующего текста; если документ или поле отсутствует — null.",
+                "properties": {
+                    "form_100": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "full_name":   {"type": ["string", "null"]},
+                            "birth_date":  {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+                            "date":        {"type": ["string", "null"], "description": "Дата события YYYY-MM-DD"},
+                            "institution": {"type": ["string", "null"]},
+                            "diagnoses":   {"type": "array", "items": {"type": "string"},
+                                            "description": "Коды МКБ-10 как в документе"},
+                            "total":       {"type": ["number", "null"]},
+                        },
+                    },
+                    "id_document": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "full_name":   {"type": ["string", "null"]},
+                            "birth_date":  {"type": ["string", "null"]},
+                            "personal_id": {"type": ["string", "null"]},
+                        },
+                    },
+                    "receipt": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "date":        {"type": ["string", "null"]},
+                            "institution": {"type": ["string", "null"]},
+                            "diagnoses":   {"type": "array", "items": {"type": "string"}},
+                            "total":       {"type": ["number", "null"]},
+                        },
+                    },
+                },
             }
         },
         "required": ["insured", "event", "extraction_confidence"]
@@ -151,6 +196,13 @@ SYSTEM_PROMPT = """Ты — система извлечения данных и�
 - Если поле отсутствует — верни null, не придумывай
 - Если данные нечёткие — добавь флаг и снизь extraction_confidence
 - При неоднозначности снижай confidence, добавляй флаг — не придумывай данные
+
+КРОСС-ДОКУМЕНТНЫЕ ДАННЫЕ (cross_document):
+- Для каждого документа (form_100 / id_document / receipt) заполни значения,
+  как они написаны ИМЕННО В ЭТОМ документе — даже если они расходятся между документами
+- НЕ нормализуй расхождения и НЕ выбирай «правильное» значение —
+  система сама сверит документы между собой
+- Если документ отсутствует в наборе — верни null для всего объекта
 
 ОПРЕДЕЛЕНИЕ SERVICE_URGENCY (тип услуги):
 ════════════════════════════════════════════════════════════════════════════
@@ -231,21 +283,32 @@ def _fuzzy_name_match(name1: str, name2: str) -> float:
     return SequenceMatcher(None, n1, n2).ratio()
 
 
+def _icd10_prefix(code: str) -> str:
+    """Префикс кода МКБ-10 для сравнения между документами: J06.9 → J06."""
+    return code.upper().split(".")[0].strip()
+
+
 def cross_validate(
     extraction: ExtractionResult,
     ocr_results: list[OCRResult],
     submission_date: date,
 ) -> tuple[ExtractionResult, list[str]]:
     """
-    Кросс-валидация между документами.
+    Кросс-валидация между документами (Шаг 25).
 
     Правила:
-    1. ФИО из form_100 vs id_document (fuzzy ≥ 0.90)
-    2. event_date ≤ submission_date
-    3. Сумма в form_100 ≈ сумма строк receipt (±1%)
+    1. event_date ≤ submission_date
+    2. Сумма строк ≈ total_claimed (± extraction_amount_mismatch_pct)
+    По cross_document (если Claude его заполнил):
+    3. ФИО form_100 vs id_document (fuzzy ≥ extraction_name_match_threshold)
+    4. birth_date form_100 vs id_document — точное совпадение
+    5. Диагнозы form_100 vs receipt — совпадение по префиксу МКБ-10
+    6. Даты form_100 vs receipt — расхождение ≤ extraction_date_mismatch_max_days
+    7. Учреждение form_100 vs receipt (fuzzy ≥ extraction_institution_match_threshold)
+       → при расхождении confidence *= extraction_institution_mismatch_penalty
 
     Возвращает (обновлённый ExtractionResult, список предупреждений).
-    При критическом несоответствии — снижаем confidence и добавляем флаг.
+    При несоответствии — снижаем confidence и добавляем флаг (не отказ: manual_review решит).
     """
     warnings: list[str] = []
     flags = list(extraction.flags)
@@ -265,9 +328,67 @@ def cross_validate(
         total_claimed = extraction.event.total_claimed
         if total_claimed > 0:
             diff_pct = abs(items_total - total_claimed) / total_claimed
-            if diff_pct > 0.01:  # более 1% расхождение
+            if diff_pct > settings.extraction_amount_mismatch_pct:
                 flags.append("amount_mismatch")
                 warnings.append(f"Line items total {items_total:.2f} vs claimed {total_claimed:.2f} ({diff_pct:.1%} diff)")
+
+    # ── Кросс-документные проверки (по данным cross_document) ──────
+    cross = extraction.cross_document
+    form = cross.form_100 if cross else None
+    id_doc = cross.id_document if cross else None
+    receipt = cross.receipt if cross else None
+
+    # 3. ФИО: form_100 vs id_document
+    # ВАЖНО: warnings попадают в логи — сами значения (ФИО, даты рождения,
+    # учреждения) в текст не включаем. Оператор увидит расхождение в
+    # claim_documents.extracted_data (as_seen_in_document).
+    if form and id_doc and form.full_name and id_doc.full_name:
+        ratio = _fuzzy_name_match(form.full_name, id_doc.full_name)
+        if ratio < settings.extraction_name_match_threshold:
+            flags.append("name_mismatch")
+            warnings.append(
+                f"Name mismatch between form_100 and id_document (ratio={ratio:.2f})"
+            )
+
+    # 4. Дата рождения: точное совпадение
+    if form and id_doc and form.birth_date and id_doc.birth_date:
+        if form.birth_date != id_doc.birth_date:
+            flags.append("birth_date_mismatch")
+            warnings.append("Birth date mismatch between form_100 and id_document")
+
+    # 5. Диагнозы: form_100 vs receipt по префиксу МКБ-10
+    if form and receipt and form.diagnoses and receipt.diagnoses:
+        form_prefixes = {_icd10_prefix(c) for c in form.diagnoses}
+        receipt_prefixes = {_icd10_prefix(c) for c in receipt.diagnoses}
+        if not (form_prefixes & receipt_prefixes):
+            flags.append("diagnosis_mismatch")
+            warnings.append(
+                f"Diagnosis mismatch: form_100={sorted(form_prefixes)} vs "
+                f"receipt={sorted(receipt_prefixes)} (no common ICD-10 prefix)"
+            )
+
+    # 6. Даты: form_100 vs receipt
+    if form and receipt and form.date and receipt.date:
+        try:
+            delta_days = abs((date.fromisoformat(form.date) - date.fromisoformat(receipt.date)).days)
+            if delta_days > settings.extraction_date_mismatch_max_days:
+                flags.append("date_mismatch")
+                warnings.append(
+                    f"Date mismatch: form_100={form.date} vs receipt={receipt.date} ({delta_days} days)"
+                )
+        except ValueError:
+            flags.append("invalid_cross_document_date")
+
+    # 7. Учреждение: form_100 vs receipt
+    institution_mismatch = False
+    if form and receipt and form.institution and receipt.institution:
+        ratio = _fuzzy_name_match(form.institution, receipt.institution)
+        if ratio < settings.extraction_institution_match_threshold:
+            institution_mismatch = True
+            flags.append("institution_mismatch")
+            warnings.append(
+                f"Institution mismatch between form_100 and receipt (ratio={ratio:.2f})"
+            )
 
     # Обновляем extraction с новыми флагами
     updated_confidence = extraction.extraction_confidence
@@ -275,15 +396,78 @@ def cross_validate(
         # Снижаем confidence за каждый новый флаг
         new_flags_count = len(flags) - len(extraction.flags)
         updated_confidence = max(0.0, extraction.extraction_confidence - new_flags_count * 0.05)
+    if institution_mismatch:
+        updated_confidence = max(0.0, updated_confidence * settings.extraction_institution_mismatch_penalty)
 
     updated = ExtractionResult(
         insured=extraction.insured,
         event=extraction.event,
         extraction_confidence=updated_confidence,
         flags=flags,
+        cross_document=extraction.cross_document,
     )
 
     return updated, warnings
+
+
+# ── Персистентность результата извлечения ─────────────────────────
+
+async def _persist_extracted_data(
+    extraction: ExtractionResult,
+    ocr_results: list[OCRResult],
+    db: AsyncSession,
+    tenant_id: UUID,
+) -> None:
+    """
+    Сохранить атрибутируемый срез extraction в ClaimDocument.extracted_data.
+
+    form_100    → insured + event (диагнозы, даты, услуги)
+    receipt     → line_items + total_claimed
+    id_document → insured
+    + as_seen_in_document: значения из cross_document для этого типа документа.
+    """
+    from sqlalchemy import select
+
+    doc_ids = [r.doc_id for r in ocr_results]
+    if not doc_ids:
+        return
+
+    result = await db.execute(
+        select(ClaimDocument).where(
+            ClaimDocument.id.in_(doc_ids),
+            ClaimDocument.tenant_id == tenant_id,
+        )
+    )
+    docs = {doc.id: doc for doc in result.scalars().all()}
+    cross = extraction.cross_document
+
+    for ocr in ocr_results:
+        doc = docs.get(ocr.doc_id)
+        if doc is None:
+            continue
+
+        if ocr.doc_type == DocType.FORM_100:
+            data: dict[str, Any] = {
+                "insured": extraction.insured.model_dump(),
+                "event": extraction.event.model_dump(),
+            }
+            if cross and cross.form_100:
+                data["as_seen_in_document"] = cross.form_100.model_dump()
+        elif ocr.doc_type == DocType.RECEIPT:
+            data = {
+                "line_items": [li.model_dump() for li in extraction.event.line_items],
+                "total_claimed": extraction.event.total_claimed,
+            }
+            if cross and cross.receipt:
+                data["as_seen_in_document"] = cross.receipt.model_dump()
+        else:  # ID_DOCUMENT
+            data = {"insured": extraction.insured.model_dump()}
+            if cross and cross.id_document:
+                data["as_seen_in_document"] = cross.id_document.model_dump()
+
+        doc.extracted_data = data
+
+    await db.flush()
 
 
 # ── Основная функция ──────────────────────────────────────────────
@@ -361,11 +545,21 @@ async def extract_claim_data(
                 total_claimed=event_raw["total_claimed"],
                 service_urgency=service_urgency,
             )
+            # Кросс-документные данные (Шаг 25): опциональны, ошибки парсинга не критичны
+            cross_raw = raw.get("cross_document")
+            cross_document: CrossDocumentData | None = None
+            if cross_raw:
+                try:
+                    cross_document = CrossDocumentData(**cross_raw)
+                except ValueError:
+                    log.warning("cross_document_parse_failed", claim_id=str(claim_id))
+
             extraction = ExtractionResult(
                 insured=insured,
                 event=event,
                 extraction_confidence=raw.get("extraction_confidence", 0.5),
                 flags=raw.get("flags", []),
+                cross_document=cross_document,
             )
         except (KeyError, ValueError) as e:
             raise ExtractionFailedError(f"Failed to parse extraction result: {e}") from e
@@ -375,6 +569,9 @@ async def extract_claim_data(
 
         if warnings:
             log.warning("cross_validation_warnings", claim_id=str(claim_id), warnings=warnings)
+
+        # Персистентность: атрибутируемый срез extraction → ClaimDocument.extracted_data
+        await _persist_extracted_data(extraction, ocr_results, db, tenant_id)
 
     await write_audit_entry(
         db,
@@ -390,6 +587,8 @@ async def extract_claim_data(
             "service_urgency": extraction.event.service_urgency,
             "flags": extraction.flags,
             "cross_validation_warnings": warnings,
+            # Полный результат извлечения — для пост-аудита и fine-tuning датасета (Шаг 35)
+            "extraction": extraction.model_dump(),
         },
         confidence={"extraction": extraction.extraction_confidence},
         prompt_version=PROMPT_VERSION,

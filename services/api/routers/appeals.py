@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.auth import get_tenant_id
 from core.config import get_settings
 from core.database import get_db
 from core.models.appeal import Appeal
@@ -19,8 +20,6 @@ from core.models.claim import Claim, ClaimStatus
 
 router = APIRouter()
 settings = get_settings()
-
-DEFAULT_TENANT_ID = UUID("00000000-0000-0000-0000-000000000001")
 
 
 class AppealCreate(BaseModel):
@@ -32,6 +31,7 @@ class AppealCreate(BaseModel):
 async def create_appeal(
     body: AppealCreate,
     db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(get_tenant_id),
 ):
     """
     Подать апелляцию на решение по заявке.
@@ -40,7 +40,7 @@ async def create_appeal(
     result = await db.execute(
         select(Claim).where(
             Claim.id == body.claim_id,
-            Claim.tenant_id == DEFAULT_TENANT_ID,
+            Claim.tenant_id == tenant_id,
         )
     )
     claim = result.scalar_one_or_none()
@@ -64,7 +64,7 @@ async def create_appeal(
 
     appeal = Appeal(
         claim_id=body.claim_id,
-        tenant_id=DEFAULT_TENANT_ID,
+        tenant_id=tenant_id,
         status="RECEIVED",
         client_reason=body.client_reason,
         deadline_at=datetime.utcnow() + timedelta(days=settings.appeal_review_sla_days),

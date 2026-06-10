@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.auth import get_tenant_id
 from core.database import get_db
 from core.models.audit import AuditLog
 from core.models.claim import Claim
@@ -19,13 +20,12 @@ from services.worker.celery_app import celery_app
 
 router = APIRouter()
 
-DEFAULT_TENANT_ID = UUID("00000000-0000-0000-0000-000000000001")
-
 
 @router.post("", response_model=ClaimResponse, status_code=201)
 async def create_claim(
     request: ClaimCreateRequest,
     db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(get_tenant_id),
 ):
     """
     Принять новую страховую заявку.
@@ -37,7 +37,7 @@ async def create_claim(
     Файлы скачиваются асинхронно в фоновом worker-е после постановки задачи в очередь.
     """
     return await receive_claim(
-        tenant_id=DEFAULT_TENANT_ID,
+        tenant_id=tenant_id,
         request=request,
         db=db,
         celery_app=celery_app,
@@ -48,12 +48,13 @@ async def create_claim(
 async def get_claim_status(
     claim_id: UUID,
     db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(get_tenant_id),
 ):
     """Получить текущий статус заявки."""
     result = await db.execute(
         select(Claim).where(
             Claim.id == claim_id,
-            Claim.tenant_id == DEFAULT_TENANT_ID,
+            Claim.tenant_id == tenant_id,
         )
     )
     claim = result.scalar_one_or_none()
@@ -67,13 +68,14 @@ async def get_claim_status(
 async def get_claim_audit(
     claim_id: UUID,
     db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(get_tenant_id),
 ):
     """Получить аудит-лог заявки (для операторов и аудиторов)."""
     result = await db.execute(
         select(AuditLog)
         .where(
             AuditLog.claim_id == claim_id,
-            AuditLog.tenant_id == DEFAULT_TENANT_ID,
+            AuditLog.tenant_id == tenant_id,
         )
         .order_by(AuditLog.timestamp)
     )

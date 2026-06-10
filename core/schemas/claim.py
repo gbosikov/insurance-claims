@@ -42,6 +42,39 @@ class EventData(BaseModel):
     # None = не указано врачом → требуется heuristic-определение
 
 
+# ── Кросс-документные данные (Шаг 25) ─────────────────────────────
+# Значения, как они видны в каждом документе по отдельности.
+# Заполняются Claude только из явно присутствующего текста —
+# нужны для кросс-проверки согласованности между документами.
+
+class CrossDocForm100(BaseModel):
+    full_name:   str | None = None
+    birth_date:  str | None = None          # YYYY-MM-DD
+    date:        str | None = None          # дата события, YYYY-MM-DD
+    institution: str | None = None
+    diagnoses:   list[str] = Field(default_factory=list)  # коды МКБ-10
+    total:       float | None = None
+
+
+class CrossDocIdDocument(BaseModel):
+    full_name:   str | None = None
+    birth_date:  str | None = None
+    personal_id: str | None = None
+
+
+class CrossDocReceipt(BaseModel):
+    date:        str | None = None
+    institution: str | None = None
+    diagnoses:   list[str] = Field(default_factory=list)
+    total:       float | None = None
+
+
+class CrossDocumentData(BaseModel):
+    form_100:    CrossDocForm100 | None = None
+    id_document: CrossDocIdDocument | None = None
+    receipt:     CrossDocReceipt | None = None
+
+
 # ── Результат извлечения (выход Слоя 4) ───────────────────────────
 
 class ExtractionResult(BaseModel):
@@ -49,7 +82,9 @@ class ExtractionResult(BaseModel):
     event:                  EventData
     extraction_confidence:  float = Field(ge=0.0, le=1.0)
     flags:                  list[str] = Field(default_factory=list)
-    # low_confidence_name | missing_date | amount_mismatch | cross_validation_failed
+    # low_confidence_name | missing_date | amount_mismatch | cross_validation_failed |
+    # name_mismatch | birth_date_mismatch | diagnosis_mismatch | date_mismatch | institution_mismatch
+    cross_document:         CrossDocumentData | None = None
 
 
 # ── API-схемы заявки ──────────────────────────────────────────────

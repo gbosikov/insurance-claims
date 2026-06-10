@@ -7,7 +7,8 @@ from datetime import date
 import pytest
 from fastapi.testclient import TestClient
 
-from services.api.routers.contracts import router, DEFAULT_TENANT_ID
+from core.auth import DEFAULT_TENANT_ID
+from services.api.routers.contracts import router
 
 
 class TestReindexContractEndpoint:

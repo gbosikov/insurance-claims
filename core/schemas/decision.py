@@ -20,6 +20,8 @@ class LineItemDecisionSchema(BaseModel):
     claimed_amount:  float
     approved_amount: float
     linked_icd10:    str | None = None
+    # Услуга найдена в POSITIVE LIST договора → покрыта 100% независимо от диагноза
+    positive_list_applied: bool = False
 
 
 class ClaimDecision(BaseModel):

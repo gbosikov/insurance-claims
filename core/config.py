@@ -43,6 +43,22 @@ class Settings(BaseSettings):
     # Уточнить реальный URL у владельца кор-системы.
     core_api_claims_base_url: str = ""
 
+    # Схема Authorization-заголовка: "Bearer" или "" (сырой токен).
+    # Документация getpolicylist показывает сырой GUID без префикса;
+    # тестовый сервер ранее принимал Bearer. При 401 — переключить через .env.
+    core_api_auth_scheme: str = "Bearer"
+
+    # Отбираются ТОЛЬКО полисы этих продуктов (Policy.ProductName) —
+    # имущественные/прочие полисы того же клиента игнорируются.
+    core_api_medical_product_names: list[str] = ["სამედიცინო (ჯანმრთელობის) დაზღვევა"]
+
+    # TypeID медицинского страхования в InsuranceTypeList (23 = სამედიცინო).
+    # Риски берутся из этих типов; если ни один не найден — из всех (с warning).
+    core_api_medical_type_ids: list[int] = [23]
+
+    # Маркер в Objects.ObjectData: объект освобождён от периода ожидания
+    core_api_waiting_period_exempt_marker: str = "არ ეკუთვნის მოცდის პერიოდი"
+
     # ── Пороги принятия решений ────────────────────────────────────
     confidence_auto_approve: float = 0.85
     confidence_manual_review: float = 0.80
@@ -67,6 +83,11 @@ class Settings(BaseSettings):
     environment: str = "development"
     secret_key: str = "change_me"
 
+    # ── API-аутентификация (platform.api_keys) ─────────────────────
+    api_key_header: str = "X-API-Key"
+    # Лимит запросов/мин если у ключа не задан rate_limit_rpm
+    api_rate_limit_default_rpm: int = 60
+
     # ── Webhook Security ────────────────────────────────────────────
     # Секретный ключ для подписи webhook от CoreAPI
     # Используется для HMAC-SHA256 верификации
@@ -83,7 +104,10 @@ class Settings(BaseSettings):
 
     # ── Claude API ─────────────────────────────────────────────────
     # Не менять без обновления prompts/ и записи в changelog
-    claude_model: str = "claude-sonnet-4-20250514"
+    # 2026-06-10: claude-sonnet-4-20250514 → claude-sonnet-4-6
+    # (старая модель прекращает работу 15.06.2026; промпты совместимы,
+    #  temperature и forced tool_choice работают без изменений)
+    claude_model: str = "claude-sonnet-4-6"
     claude_extraction_temperature: float = 0.0   # детерминированность
     claude_decision_temperature: float = 0.1     # небольшая вариативность
     claude_extraction_max_tokens: int = 1000
@@ -97,6 +121,16 @@ class Settings(BaseSettings):
     # Полный путь к процессору Document AI:
     # projects/{project_id}/locations/{location}/processors/{processor_id}
     gcp_document_ai_processor: str = "projects/insurance-claims-dev/locations/us/processors/FORM_PARSER"
+    # Максимум символов текста на блок при сохранении в claim_documents.ocr_blocks
+    # (полный текст уже хранится в ocr_text; блоки — для анализа confidence/регионов)
+    ocr_block_text_max_chars: int = 200
+
+    # ── Кросс-документная согласованность (Шаг 25) ────────────────
+    extraction_name_match_threshold: float = 0.90        # fuzzy ФИО form_100 vs id_document
+    extraction_institution_match_threshold: float = 0.70 # fuzzy название учреждения
+    extraction_institution_mismatch_penalty: float = 0.85 # множитель confidence при расхождении
+    extraction_date_mismatch_max_days: int = 3            # допустимое расхождение дат между документами
+    extraction_amount_mismatch_pct: float = 0.01          # допуск расхождения сумм (±1%)
 
     # ── Quality Gate ───────────────────────────────────────────────
     quality_min_resolution_dpi: int = 150
@@ -111,15 +145,34 @@ class Settings(BaseSettings):
 
     # ── Enterprise: качество решений (Шаги 21–28) ─────────────────
     decision_coherence_check_enabled: bool = True
+    # Штраф к overall_confidence при медицинской несогласованности (Шаг 21)
+    decision_coherence_confidence_penalty: float = 0.10
     decision_chain_of_thought_enabled: bool = True
     decision_extended_thinking_enabled: bool = True
     decision_extended_thinking_threshold: float = 300.0   # GEL
-    decision_extended_thinking_budget_tokens: int = 2000
+    decision_extended_thinking_budget_tokens: int = 2000  # transitional; Sonnet 4.6 → adaptive
+    # Порог extraction_confidence ниже которого включается thinking (Шаг 26)
+    decision_extended_thinking_extraction_conf_threshold: float = 0.85
+    # max_tokens для пути с thinking (reasoning-токены считаются в лимит)
+    claude_decision_max_tokens_thinking: int = 8000
+    # Усечение reasoning при записи в audit_log.output_data["reasoning"]
+    decision_reasoning_audit_max_chars: int = 4000
     decision_second_pass_confidence_threshold: float = 0.65
     decision_stochastic_qa_rate: float = 0.05   # 5% AUTO_APPROVED → случайная проверка
     decision_default_waiting_period_days: int = 30
+    # Дефолт калибровочного фактора; рабочее значение живёт в
+    # platform.tenant_configs['confidence_calibration_factor'] и читается в make_decision()
     decision_confidence_calibration_factor: float = 1.0
     fraud_amount_benchmark_enabled: bool = False   # включить после 3+ месяцев данных
+
+    # ── Петля обучения (Шаги 29–35) ───────────────────────────────
+    learning_feedback_loop_enabled: bool = True
+    learning_calibration_window_days: int = 30      # окно расчёта точности
+    learning_min_samples_for_calibration: int = 30  # минимум проверенных заявок
+    learning_calibration_significant_diff: float = 0.05  # |actual - claimed| для обновления
+    # Кламп фактора — одна плохая неделя не должна обнулить автоодобрение
+    learning_calibration_factor_min: float = 0.5
+    learning_calibration_factor_max: float = 1.2
 
     model_config = SettingsConfigDict(
         env_file=".env",

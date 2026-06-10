@@ -15,10 +15,13 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from core.auth import ApiKeyAuthMiddleware
 from core.config import get_settings
 from core.database import check_db_connection
-from services.api.routers import analytics, appeals, claims, contracts, webhooks
+from core.logging import configure_logging
+from services.api.routers import analytics, appeals, claims, contracts, reviews, webhooks
 
+configure_logging()  # JSON-логи + маскирование ПД (core/logging.py)
 log = structlog.get_logger()
 settings = get_settings()
 
@@ -29,6 +32,10 @@ app = FastAPI(
     docs_url="/docs" if settings.environment == "development" else None,
     redoc_url="/redoc" if settings.environment == "development" else None,
 )
+
+# ── Аутентификация API-ключей ─────────────────────────────────────
+# Добавляется ДО CORS: CORS должен быть внешним слоем (preflight без ключа).
+app.add_middleware(ApiKeyAuthMiddleware)
 
 # ── CORS ──────────────────────────────────────────────────────────
 app.add_middleware(
@@ -44,6 +51,7 @@ app.include_router(claims.router,    prefix="/v1/claims",    tags=["claims"])
 app.include_router(contracts.router, prefix="/v1/contracts", tags=["contracts"])
 app.include_router(appeals.router,   prefix="/v1/appeals",   tags=["appeals"])
 app.include_router(analytics.router, prefix="/v1/analytics", tags=["analytics"])
+app.include_router(reviews.router,   prefix="/v1/reviews",   tags=["reviews"])
 app.include_router(webhooks.router,  prefix="/internal/hooks", tags=["webhooks"])
 
 

@@ -10,12 +10,11 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.auth import get_tenant_id
 from core.database import get_db
 from core.storage import get_storage_client
 
 router = APIRouter()
-
-DEFAULT_TENANT_ID = UUID("00000000-0000-0000-0000-000000000001")
 
 
 @router.post("", status_code=202)
@@ -24,6 +23,7 @@ async def upload_contract(
     valid_from: str = Form(..., description="Дата начала действия (YYYY-MM-DD)"),
     file: UploadFile = File(..., description="PDF контракта"),
     db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(get_tenant_id),
 ):
     """
     Загрузить контракт и поставить в очередь индексации.
@@ -37,7 +37,7 @@ async def upload_contract(
     pdf_bytes = await file.read()
     storage = get_storage_client()
 
-    pdf_path = f"tenants/{DEFAULT_TENANT_ID}/contracts/{policy_number}/raw_{valid_from}.pdf"
+    pdf_path = f"tenants/{tenant_id}/contracts/{policy_number}/raw_{valid_from}.pdf"
     await storage.upload(pdf_bytes, pdf_path, content_type="application/pdf")
 
     # Ставим задачу в очередь
@@ -45,7 +45,7 @@ async def upload_contract(
     celery_app.send_task(
         "index_contract",
         kwargs={
-            "tenant_id": str(DEFAULT_TENANT_ID),
+            "tenant_id": str(tenant_id),
             "policy_number": policy_number,
             "pdf_storage_path": pdf_path,
             "valid_from": valid_from,
@@ -64,6 +64,7 @@ async def upload_contract(
 async def get_contract_status(
     policy_number: str,
     db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(get_tenant_id),
 ):
     """Получить статус индексации контракта."""
     from sqlalchemy import select
@@ -71,7 +72,7 @@ async def get_contract_status(
 
     result = await db.execute(
         select(ContractVersion).where(
-            ContractVersion.tenant_id == DEFAULT_TENANT_ID,
+            ContractVersion.tenant_id == tenant_id,
             ContractVersion.policy_number == policy_number,
         ).order_by(ContractVersion.created_at.desc())
     )
@@ -100,6 +101,7 @@ async def reindex_contract(
     policy_number: str,
     version_id: str | None = None,
     db: AsyncSession = Depends(get_db),
+    tenant_id: UUID = Depends(get_tenant_id),
 ):
     """
     Переиндексировать CARVEOUT и POSITIVE LIST для контракта.
@@ -127,7 +129,7 @@ async def reindex_contract(
 
     # Найти версию контракта
     query = select(ContractVersion).where(
-        ContractVersion.tenant_id == DEFAULT_TENANT_ID,
+        ContractVersion.tenant_id == tenant_id,
         ContractVersion.policy_number == policy_number,
     )
 
@@ -149,7 +151,7 @@ async def reindex_contract(
     celery_app.send_task(
         "reindex_contract_structures",
         kwargs={
-            "tenant_id": str(DEFAULT_TENANT_ID),
+            "tenant_id": str(tenant_id),
             "policy_number": policy_number,
             "version_id": contract_version.version_id,
             "pdf_storage_path": contract_version.pdf_path,

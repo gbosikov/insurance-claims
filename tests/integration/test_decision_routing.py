@@ -427,6 +427,7 @@ async def test_full_decision_routing_with_mock_adapter_data():
         decision = await make_decision(
             claim_id=CLAIM_ID,
             tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
             extraction=extraction,
             risks_limits=risks_limits,
             icd10_list=icd10_list,

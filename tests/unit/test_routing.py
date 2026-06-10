@@ -36,7 +36,7 @@ def make_decision(
         fraud_flags=fraud_flags or [],
         overall_confidence=confidence,
         prompt_version="decision/v1.0.0",
-        model_version="claude-sonnet-4-20250514",
+        model_version="claude-sonnet-4-6",
     )
 
 

@@ -345,6 +345,7 @@ async def test_stochastic_qa_sets_manual_review_reason():
         from layers.decision.service import make_decision
         decision = await make_decision(
             claim_id=CLAIM_ID, tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
             extraction=extraction, risks_limits=risks,
             icd10_list=[ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ")],
             providers=[], contract_chunks=[],
@@ -410,6 +411,7 @@ async def test_fraud_task_is_asyncio_task():
             from layers.decision.service import make_decision
             await make_decision(
                 claim_id=CLAIM_ID, tenant_id=TENANT_ID,
+                policy_number=POLICY_NUMBER,
                 extraction=extraction, risks_limits=risks,
                 icd10_list=icd10, providers=[],
                 contract_chunks=[], submission_date=date(2026, 1, 20),
@@ -418,3 +420,155 @@ async def test_fraud_task_is_asyncio_task():
 
         spy_create_task.assert_called_once()
         assert mock_check_fraud.called
+
+
+@pytest.mark.asyncio
+async def test_make_decision_applies_positive_list_coverage():
+    """Регрессия (Фаза 0): make_decision с POSITIVE LIST совпадением проходит end-to-end.
+
+    Раньше падало дважды:
+      1. NameError — check_positive_list вызывался с claim.policy_number,
+         а параметра claim в make_decision() нет;
+      2. ValueError — line_item.is_covered, поля is_covered у
+         LineItemDecisionSchema не существует.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from core.schemas.claim import DiagnoisItem, EventData, ExtractionResult, InsuredData, LineItem
+    from core.schemas.core_api import ICD10Item, RiskInfo, RisksAndLimits
+    from layers.decision.service import make_decision
+
+    mock_check_fraud = AsyncMock(return_value=[])
+    mock_positive_list = AsyncMock(return_value={"Полипэктомия": (True, "Полипэктомия")})
+
+    tool_block = MagicMock()
+    tool_block.type = "tool_use"
+    tool_block.input = {
+        "diagnoses": [{"icd10_code": "K29.7", "is_covered": True, "approved_amount": 400.0, "confidence": 0.95}],
+        "line_items": [{"description": "Полипэктомия", "claimed_amount": 500.0, "approved_amount": 400.0}],
+        "total_approved": 400.0,
+        "deductible_applied": 0.0,
+        "final_payout": 400.0,
+        "requires_manual_review": False,
+        "manual_review_reason": None,
+        "overall_confidence": 0.95,
+        "summary": "Одобрено: K29.7, Полипэктомия из POSITIVE LIST.",
+    }
+    mock_response = MagicMock()
+    mock_response.content = [tool_block]
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+    extraction = ExtractionResult(
+        insured=InsuredData(full_name="Иванов И.И.", birth_date="1985-01-01", personal_id="12345678901"),
+        event=EventData(
+            date="2026-01-15", institution=None,
+            diagnoses=[DiagnoisItem(icd10_code="K29.7", description="Гастрит")],
+            line_items=[LineItem(description="Полипэктомия", amount=500.0)],
+            total_claimed=500.0,
+        ),
+        extraction_confidence=0.95,
+    )
+    risks = RisksAndLimits(
+        policy_number=POLICY_NUMBER,
+        risks=[RiskInfo(risk_id=1, name="Амбулаторное", coverage_pct=80.0,
+                        total_limit=2000.0, remaining_limit=1500.0, currency="GEL")],
+        annual_limit=5000.0, remaining=1500.0, currency="GEL",
+    )
+    db = AsyncMock()
+
+    with patch("layers.decision.service.check_fraud", mock_check_fraud), \
+         patch("layers.decision.service.check_positive_list", mock_positive_list), \
+         patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client), \
+         patch("layers.decision.service.write_audit_entry", AsyncMock()), \
+         patch("layers.decision.service.enrich_all", AsyncMock(return_value={})), \
+         patch("layers.decision.service.random.random", return_value=0.99):  # QA не срабатывает
+        decision = await make_decision(
+            claim_id=CLAIM_ID, tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
+            extraction=extraction, risks_limits=risks,
+            icd10_list=[ICD10Item(diagnosid=201, code="K29.7", name="Гастрит")],
+            providers=[], contract_chunks=[],
+            submission_date=date(2026, 1, 20), db=db,
+        )
+
+    # policy_number дошёл до check_positive_list из параметра (не NameError)
+    assert mock_positive_list.await_args.kwargs["policy_number"] == POLICY_NUMBER
+
+    # POSITIVE LIST применён: 100% покрытие, флаг выставлен, привязка к диагнозу снята
+    assert decision.status == "approved"
+    line_item = decision.line_items[0]
+    assert line_item.positive_list_applied is True
+    assert line_item.approved_amount == line_item.claimed_amount == 500.0
+    assert line_item.linked_icd10 is None
+
+
+@pytest.mark.asyncio
+async def test_make_decision_applies_calibration_factor():
+    """Калибровочный фактор из tenant_configs масштабирует confidence (Шаги 27/29).
+
+    raw=0.95, factor=0.8 → effective=0.76; в audit пишутся оба значения —
+    без raw калибровочный job компаундил бы фактор.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from core.schemas.claim import DiagnoisItem, EventData, ExtractionResult, InsuredData, LineItem
+    from core.schemas.core_api import ICD10Item, RiskInfo, RisksAndLimits
+    from layers.decision.service import make_decision
+
+    tool_block = MagicMock()
+    tool_block.type = "tool_use"
+    tool_block.input = {
+        "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "confidence": 0.95}],
+        "line_items": [],
+        "total_approved": 120.0,
+        "deductible_applied": 0.0,
+        "final_payout": 120.0,
+        "requires_manual_review": False,
+        "manual_review_reason": None,
+        "overall_confidence": 0.95,
+        "summary": "Одобрено",
+    }
+    mock_response = MagicMock()
+    mock_response.content = [tool_block]
+    mock_client = AsyncMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+    extraction = ExtractionResult(
+        insured=InsuredData(full_name="Иванов И.И.", birth_date="1985-01-01", personal_id="12345678901"),
+        event=EventData(
+            date="2026-01-15", institution=None,
+            diagnoses=[DiagnoisItem(icd10_code="J06.9", description="ОРВИ")],
+            line_items=[LineItem(description="Консультация", amount=120.0)],
+            total_claimed=120.0,
+        ),
+        extraction_confidence=0.95,
+    )
+    risks = RisksAndLimits(
+        policy_number=POLICY_NUMBER,
+        risks=[RiskInfo(risk_id=1, name="Амбулаторное", coverage_pct=80.0,
+                        total_limit=2000.0, remaining_limit=1500.0, currency="GEL")],
+        annual_limit=5000.0, remaining=1500.0, currency="GEL",
+    )
+    mock_audit = AsyncMock()
+
+    with patch("layers.decision.service.check_fraud", AsyncMock(return_value=[])), \
+         patch("layers.decision.service.check_positive_list", AsyncMock(return_value={})), \
+         patch("layers.decision.service.get_tenant_config_float", AsyncMock(return_value=0.8)), \
+         patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client), \
+         patch("layers.decision.service.write_audit_entry", mock_audit), \
+         patch("layers.decision.service.enrich_all", AsyncMock(return_value={})), \
+         patch("layers.decision.service.random.random", return_value=0.99):
+        decision = await make_decision(
+            claim_id=CLAIM_ID, tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
+            extraction=extraction, risks_limits=risks,
+            icd10_list=[ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ")],
+            providers=[], contract_chunks=[],
+            submission_date=date(2026, 1, 20), db=AsyncMock(),
+        )
+
+    assert decision.overall_confidence == pytest.approx(0.95 * 0.8)
+
+    audit_confidence = mock_audit.await_args.kwargs["confidence"]
+    assert audit_confidence["overall"] == pytest.approx(0.76)
+    assert audit_confidence["overall_raw"] == pytest.approx(0.95)
+    assert audit_confidence["calibration_factor"] == pytest.approx(0.8)

@@ -56,6 +56,22 @@ class PreprocessedDocument:
     page_paths: list[str]         # для многостраничных PDF
 
 
+def _quality_metrics_payload(reports: list[QualityReport]) -> list[dict]:
+    """Per-page метрики для claim_documents.quality_metrics (миграция 009)."""
+    return [
+        {
+            "page": i + 1,
+            "resolution_dpi": round(r.resolution_dpi, 1),
+            "blur_score": round(r.blur_score, 2),
+            "brightness": round(r.brightness, 1),
+            "skew_angle": round(r.skew_angle, 2),
+            "score": r.score,
+            "flags": r.flags,
+        }
+        for i, r in enumerate(reports)
+    ]
+
+
 def check_quality(image: np.ndarray, dpi: float = 0.0) -> QualityReport:
     """
     Проверяет качество изображения по всем критериям quality gate.
@@ -215,9 +231,10 @@ async def preprocess_document(
                 first_flag = report.flags[0]
                 detail = QUALITY_ERROR_MESSAGES.get(first_flag, "Документ не прошёл проверку качества.")
 
-                # Обновляем статус документа
+                # Обновляем статус документа (метрики всех проверенных страниц включительно)
                 doc.quality_score = report.score
                 doc.quality_flags = report.flags
+                doc.quality_metrics = _quality_metrics_payload(all_reports)
                 await db.flush()
 
                 await write_audit_entry(
@@ -230,8 +247,10 @@ async def preprocess_document(
                         "passed": False,
                         "flags": report.flags,
                         "score": report.score,
+                        "resolution_dpi": round(report.resolution_dpi, 1),
                         "blur_score": report.blur_score,
                         "brightness": report.brightness,
+                        "skew_angle": round(report.skew_angle, 2),
                     }},
                     duration_ms=timer.duration_ms,
                 )
@@ -267,6 +286,9 @@ async def preprocess_document(
         doc.preprocessed_path = page_paths[0] if page_paths else doc.storage_path
         doc.quality_score = best_report.score
         doc.quality_flags = []
+        # Сырые per-page метрики сохраняем даже при успехе —
+        # около-пороговые значения нужны аналитике и петле обучения
+        doc.quality_metrics = _quality_metrics_payload(all_reports)
         await db.flush()
 
     await write_audit_entry(
@@ -279,6 +301,7 @@ async def preprocess_document(
             "quality_passed": True,
             "pages_processed": len(page_paths),
             "quality_scores": [r.score for r in all_reports],
+            "quality_metrics": _quality_metrics_payload(all_reports),
         },
         duration_ms=timer.duration_ms,
     )

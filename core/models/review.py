@@ -33,5 +33,9 @@ class ManualReviewOutcome(Base):
     auto_decision      = Column(JSONB)   # что решила система
     expert_decision    = Column(JSONB)   # что решил эксперт
     discrepancy_reason = Column(Text)
+    # Что исправил оператор: amount | diagnosis | coverage | none (Шаг 30, миграция 008)
+    correction_type    = Column(String(30))
+    # Почему Claude ошибся: ocr_quality | contract_gap | extraction_error | fraud_missed | correct
+    claude_error_reason = Column(String(50))
     operator_id        = Column(UUID(as_uuid=True), nullable=False)
     reviewed_at        = Column(DateTime(timezone=True), server_default=func.now())

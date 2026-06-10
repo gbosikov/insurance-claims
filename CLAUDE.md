@@ -56,9 +56,22 @@ insurance-claims/
 ├── core/                        ← общий код для всех сервисов
 │   ├── config.py
 │   ├── database.py
+│   ├── auth.py                  ← API-ключи: middleware, скоупы, rate limit, get_tenant_id
+│   ├── logging.py               ← конфигурация structlog + маскирование ПД в логах
 │   ├── models/
 │   ├── schemas/
+│   ├── tenant_config.py         ← чтение per-tenant конфигов (калибровочный фактор)
 │   └── exceptions.py
+│
+├── scripts/
+│   └── create_api_key.py        ← генерация API-ключа тенанта (хэш → platform.api_keys)
+│
+├── alembic/                     ← управление схемой БД (см. «Миграции» ниже)
+│   ├── env.py                   ← async-движок, URL из core.config
+│   └── versions/
+│       ├── 0001_initial_schema.py          ← legacy 001-007 (guard: пропуск если схема есть)
+│       └── 0002_learning_loop_and_metrics.py ← legacy 008-010 (идемпотентные)
+├── alembic.ini
 │
 ├── layers/                      ← бизнес-логика по слоям
 │   ├── intake/                  ← слой 1
@@ -86,7 +99,10 @@ insurance-claims/
 │   │   ├── 005_providers.sql    ← таблица providers (справочник клиник)
 │   │   ├── 006_carveout_structure.sql    ← CARVEOUT структуры контракта
 │   │   ├── 007_positive_list_procedures.sql ← POSITIVE LIST процедуры
-│   │   └── 008_review_correction_types.sql  ← correction_type + claude_error_reason (Шаг 30)
+│   │   ├── 008_review_correction_types.sql  ← correction_type + claude_error_reason (Шаг 30)
+│   │   ├── 009_document_metrics.sql     ← quality_metrics + ocr_blocks в claim_documents
+│   │   └── 010_amount_benchmarks.sql    ← diagnosis_amount_benchmarks (Шаг 24/33)
+│   ├── migration_utils.py       ← чтение/разбиение legacy SQL для Alembic-ревизий
 │   ├── loaders/
 │   │   ├── load_icd10.py        ← загрузчик справочника МКБ-10 из CSV/Excel
 │   │   └── load_providers.py    ← загрузчик справочника провайдеров из CSV/Excel
@@ -133,7 +149,11 @@ insurance-claims/
 #   loop = asyncio.get_running_loop(); await loop.run_in_executor(None, func, *args)
 # Из синхронного контекста (Celery) запускать async через asyncio.run(), не get_event_loop()
 # Типизируй всё через Pydantic v2
-# Логируй через structlog (JSON-формат)
+# Логируй через structlog (JSON-формат; конфигурация — core/logging.py)
+# ПД В ЛОГАХ ЗАПРЕЩЕНЫ: не логируй ФИО, личные номера, даты рождения,
+#   полные pre-signed URL. В события — claim_id (безопасный указатель);
+#   маскирующий processor (core/logging.py) — страховка, не оправдание.
+#   audit_log — НЕ лог: там ПД хранятся по назначению под контролем доступа.
 # Обработка ошибок — кастомные исключения из core/exceptions.py
 # Тесты — pytest + pytest-asyncio
 ```
@@ -311,7 +331,7 @@ STORAGE_PROVIDER=gcs          # gcs | s3 | local (local только для dev)
 # Аутентификация: POST /api/User/authenticate → JWT токен (кэшируется)
 CORE_API_BASE_URL=http://192.168.0.249:8077
 CORE_API_USERNAME=webplatform
-CORE_API_PASSWORD=839459ef0bc96d557fa5d1eda47a45bc
+CORE_API_PASSWORD=core_api_password
 CORE_API_TIMEOUT=10
 CORE_API_RETRY=3
 # Токен кэшируется в Redis, обновляется автоматически при истечении
@@ -352,7 +372,7 @@ logs:
 	docker compose logs -f api worker
 
 migrate:
-	docker compose exec api python -m db.migrate
+	docker compose exec api alembic upgrade head
 
 test:
 	docker compose exec api pytest tests/ -v
@@ -706,7 +726,8 @@ class Settings(BaseSettings):
 
     # ── Claude API ─────────────────────────────────────────────────
     # Не менять без обновления prompts/ и записи в changelog
-    claude_model: str = "claude-sonnet-4-20250514"
+    # 2026-06-10: мигрировано с claude-sonnet-4-20250514 (retired 15.06.2026)
+    claude_model: str = "claude-sonnet-4-6"
     claude_extraction_temperature: float = 0.0
     claude_decision_temperature: float = 0.1
     claude_extraction_max_tokens: int = 1000
@@ -1470,17 +1491,47 @@ FKIND_MAP = {
 # submit_claim()        → MOCK-{policy}-001, status=0
 ```
 
+### Формат getpolicylist — ВЕРИФИЦИРОВАН (2026-06-11, реальный ответ)
+
+```
+Структура: {"PolicyList": {"Policy": [...]}} — НЕ строка.
+  ФИЛЬТР: берутся только полисы с ProductName="სამედიცინო (ჯანმრთელობის) დაზღვევა"
+  (настройка core_api_medical_product_names) — имущественные/НС игнорируются.
+  Policy: Number / CardNumber (медкарточка — основной идентификатор для ДМС) /
+          OldNumber / StartDate / EndDate / StopDate (расторгнут) / ...
+  → ObjectList.Objects (застрахованные; выбор по PersonalNumber)
+    StartDate/EndDate объекта, ObjectData ("არ ეკუთვნის მოცდის პერიოდი" =
+    освобождён от периода ожидания → bypass Шага 23)
+  → InsuranceTypeList.InsuranceType (медицинский TypeID=23, настройка
+    core_api_medical_type_ids; Amount = страховая сумма/annual_limit)
+  → RiskList.Risk: RiskId / RiskParentId (иерархия) / RiskName /
+    LimitAmount (= суб-лимит) / LimitAmountLeft (остаток) /
+    LinitPercent (% покрытия — ОПЕЧАТКА В САМОМ API) /
+    LimitCount / LimitCountLeft (количественные лимиты)
+
+ВАЖНО для парсинга (реализовано в rest_adapter.py):
+  - все значения приходят строками ("27000.00", "1")
+  - даты в формате DD/MM/YYYY
+  - одноэлементные списки свёрнуты в dict (XML→JSON): _ensure_list()
+  - остатка на уровне полиса нет → remaining = max(LimitAmountLeft рисков
+    с собственным лимитом); все исчерпаны → 0 → manual_review
+  - Authorization: документация показывает сырой GUID без "Bearer" —
+    схема настраивается (core_api_auth_scheme, дефолт "Bearer";
+    при 401 на проде выставить CORE_API_AUTH_SCHEME="")
+  - текст договора в ответе ОТСУТСТВУЕТ (ClauseList="" в примере)
+```
+
 ### Открытые вопросы по кор-системе
 
 ```
-1. Формат PolicyList   ← Нужен тестовый personalNumber с активным ДМС-полисом
-                          чтобы убедиться в именах полей (RiskList, AnnualLimit и т.д.)
+1. Канал доставки ТЕКСТА ДОГОВОРА  ← getpolicylist его не возвращает.
+   Пока договоры загружаются вручную: POST /v1/contracts (PDF).
+   ? Заполняется ли ClauseList и чем? Есть ли отдельный метод?
 
 2. Доставка справочника провайдеров
    ✓ Структура известна: CUSTOMER (PersID), CSTNAME (имя), TAXPAYER (ИНН)
    ? Формат: CSV файл, REST API endpoint, или другое?
    ? Frequency: каждый день, по требованию, или один раз при инициализации?
-   ? Кэширование: в памяти (Redis) или в БД (table providers)?
 ```
 
 ---
@@ -2209,7 +2260,7 @@ print('Credentials type:', type(credentials).__name__)
 
 ## Слой 10 — FastAPI (API Gateway)
 
-**Файл:** `services/api/main.py`
+**Файлы:** `services/api/main.py`, `core/auth.py`
 
 ```python
 app = FastAPI(
@@ -2218,17 +2269,46 @@ app = FastAPI(
     docs_url="/docs" if settings.environment == "development" else None,
 )
 
-# Middleware
-app.add_middleware(TenantMiddleware)      # извлекает tenant_id из API-ключа
-app.add_middleware(RateLimitMiddleware)   # rate limiting по tenant
-app.add_middleware(RequestLogMiddleware) # логирование всех запросов
+# Middleware (реализовано 2026-06-10, core/auth.py)
+# ApiKeyAuthMiddleware: X-API-Key → SHA-256 → platform.api_keys →
+#   tenant_id + скоупы + rate limit (Redis, fixed window по rate_limit_rpm).
+# Добавляется ДО CORS — CORS внешний слой (preflight без ключа).
+app.add_middleware(ApiKeyAuthMiddleware)
+app.add_middleware(CORSMiddleware, ...)
 
 # Роуты
 app.include_router(claims_router,    prefix="/v1/claims")
 app.include_router(contracts_router, prefix="/v1/contracts")
-app.include_router(webhooks_router,  prefix="/v1/webhooks")
+app.include_router(reviews_router,   prefix="/v1/reviews")
 app.include_router(analytics_router, prefix="/v1/analytics")
 app.include_router(internal_router,  prefix="/internal")  # для webhook от кор-системы
+```
+
+### Аутентификация API (core/auth.py)
+
+```
+Заголовок: X-API-Key (настройка api_key_header)
+Хранение:  platform.api_keys — только SHA-256 хэш, сам ключ не хранится
+Проверки:  revoked_at / expires_at / tenant.status / скоуп маршрута / rate limit
+Результат: request.state.tenant_id → роутеры через Depends(get_tenant_id)
+
+Скоупы (deny-by-default — неизвестный путь требует 'admin'):
+  claims:read|write       /v1/claims, /v1/appeals  (внешняя медсистема — дефолт ключа)
+  contracts:read|write    /v1/contracts
+  analytics:read          /v1/analytics
+  reviews:read|write      /v1/reviews — ТОЛЬКО операторы (питает петлю обучения)
+
+Исключения из аутентификации:
+  /, /health, /docs, /redoc, /openapi.json — публичные
+  /internal/hooks/* — HMAC-подпись кор-системы (webhook_secret_key)
+
+Dev-режим: environment != production без заголовка → дефолтный тенант
+с предупреждением в логах (как пустой whitelist в downloader). Production: 401.
+
+Создание ключа (выводится ОДИН РАЗ):
+  docker compose exec api python -m scripts.create_api_key \
+      --tenant-slug default --name "Medsystem production"
+Отзыв: UPDATE platform.api_keys SET revoked_at = NOW() WHERE name = '...';
 ```
 
 **Роуты:**
@@ -2246,6 +2326,9 @@ POST   /v1/webhooks                         Зарегистрировать web
 
 GET    /v1/analytics/summary               Статистика
 GET    /v1/analytics/accuracy              Метрики точности
+
+GET    /v1/reviews                          Открытые элементы очереди ручной проверки
+POST   /v1/reviews/{claim_id}/outcome      Результат проверки (correction_type, Шаг 30)
 
 POST   /internal/hooks/contract-updated    Webhook от кор-системы
 POST   /internal/hooks/policy-status-changed
@@ -2523,50 +2606,73 @@ pytest-httpx==0.30.0
 
    ── Enterprise: качество решений (Шаги 21–28) ─────────────────────────────
 
-   Шаг 21: Медицинская согласованность (Medical Coherence Check)
-           Добавить поле coherence_flags в DECISION_TOOL
-           Расширить DECISION_SYSTEM_PROMPT: проверка соответствия line_items диагнозу
-           Несогласованность → fraud_flags + confidence -= 0.10 + manual_review
+✅ Шаг 21: Медицинская согласованность (Medical Coherence Check) — 2026-06-10
+           coherence_flags в DECISION_TOOL + инструкция в DECISION_SYSTEM_PROMPT.
+           Несогласованность → confidence -= decision_coherence_confidence_penalty (0.10)
+           + manual_review с reason="medical_coherence: ...".
+           ОТКЛОНЕНИЕ ОТ СПЕКИ: флаги НЕ добавляются в fraud_flags — fraud_flags
+           форсируют FRAUD_FLAG-роутинг с priority=urgent, что чрезмерно для
+           несоответствия «МРТ при ОРВИ». manual_review соответствует духу спеки.
            Файл: layers/decision/service.py
 
-   Шаг 22: Проверка исключений через ICD10-дерево
-           В build_decision_prompt() выделить exclusion-чанки в отдельную секцию
-           Claude проверяет каждого предка диагноза (через ancestors) против списка исключений
+✅ Шаг 22: Проверка исключений через ICD10-дерево — 2026-06-10
+           build_decision_prompt(): exclusion-чанки → отдельная секция
+           «## Исключения (проверь КАЖДЫЙ диагноз И КАЖДОГО его предка...)»;
+           для каждого диагноза рендерится полный список ancestors с кодами;
+           system prompt инструктирует применять исключение если ЛЮБОЙ предок
+           входит в исключённую категорию (с учётом CARVEOUT).
            Файл: layers/decision/service.py
 
-   Шаг 23: Суб-лимиты и периоды ожидания
-           check_waiting_period() — детерминированная проверка уровня 1
-           check_sublimits() — проверка суб-лимитов по видам услуг
-           Данные: policy_start_date и sub_limits из get_risks_and_limits() кор-системы
-           Файл: layers/decision/service.py
-           Зависимость: Шаг 16 (уточнить поля у владельца кор-системы)
+✅ Шаг 23: Суб-лимиты и периоды ожидания — 2026-06-10, АКТИВИРОВАН 2026-06-11
+           check_waiting_period() и check_sublimits() — детерминированный уровень 1.
+           Данные приходят из getpolicylist (формат верифицирован):
+           Objects.StartDate/EndDate → policy_start_date/policy_end_date,
+           Risk.LimitAmount/LimitAmountLeft → sublimit/остаток.
+           + Проверка активности полиса на дату события (event_outside_policy_period).
+           + ObjectData-маркер "არ ეკუთვნის მოცდის პერიოდი" → bypass периода
+             ожидания (waiting_period_check="exempt_by_policy").
+           Нарушение периода → manual_review (не отказ); превышение суб-лимита →
+           manual_review с reason="sublimit_exceeded".
+           Файлы: layers/decision/service.py, core/schemas/core_api.py,
+                  layers/core_adapter/rest_adapter.py
 
-   Шаг 24: Бенчмаркинг суммы по диагнозу
-           Создать таблицу diagnosis_amount_benchmarks
-           db/migrations/005_amount_benchmarks.sql
-           Job обновляет p25/p75/p95 еженедельно из одобренных заявок
-           Добавить проверку в check_fraud(): amount_benchmark_exceeded
+   Шаг 24: Бенчмаркинг суммы по диагнозу [каркас готов, активация по гейту]
+           ✅ Таблица diagnosis_amount_benchmarks (db/migrations/010_amount_benchmarks.sql)
+           ✅ Еженедельный job update_amount_benchmarks (tasks_analytics.py) —
+              no-op пока fraud_amount_benchmark_enabled=False
+           ⏳ Проверка amount_benchmark_exceeded в check_fraud() — добавить при активации
            Условие включения: fraud_amount_benchmark_enabled=True (после 3 месяцев данных)
-           Файл: services/worker/tasks_analytics.py (новый)
 
-   Шаг 25: Усиленная кросс-документная согласованность
-           Добавить в extraction/service.py: диагноз, дата, учреждение cross-check между документами
-           institution_mismatch, date_mismatch, diagnosis_mismatch → flags + confidence * 0.85
-           Файл: layers/extraction/service.py
+✅ Шаг 25: Усиленная кросс-документная согласованность — 2026-06-10
+           EXTRACTION_TOOL расширен объектом cross_document: значения как они видны
+           в каждом документе (form_100/id_document/receipt). cross_validate() проверяет:
+           ФИО (fuzzy ≥ 0.90), birth_date (точно), диагнозы (префикс МКБ-10),
+           даты (≤ 3 дней), учреждение (fuzzy ≥ 0.70 + confidence *= 0.85).
+           Все пороги — settings (extraction_*). PROMPT_VERSION → extraction/v1.1.0.
+           Файлы: layers/extraction/service.py, core/schemas/claim.py
 
-   Шаг 26: Chain-of-Thought + Extended Thinking
-           Два прохода: reasoning (без tool_use) → decision (с tool_use)
-           Reasoning → audit_log.output_data["reasoning"]
-           Extended thinking при total_claimed > decision_extended_thinking_threshold
-           или len(diagnoses) > 1 или extraction_confidence < 0.85
-           Второй проход для диагнозов с confidence < decision_second_pass_confidence_threshold
+✅ Шаг 26: Chain-of-Thought + Extended Thinking — 2026-06-10
+           Триггер _is_complex_case(): len(diagnoses)>1 ИЛИ total_claimed > порога
+           ИЛИ extraction_confidence < порога.
+           Thinking (Sonnet 4.6 = adaptive, budget_tokens устарел) — приоритетный путь;
+           изолирован в _build_thinking_kwargs(). Ограничения API: с thinking
+           tool_choice=auto (+ текстовая инструкция) и без temperature.
+           CoT (два прохода) — только когда thinking выключен.
+           Reasoning → audit_log.output_data["reasoning"] (усечение по настройке).
+           Второй проход _second_pass_diagnosis() для диагнозов с
+           confidence < decision_second_pass_confidence_threshold (макс. 1 доп. вызов),
+           audit step="decision_second_pass".
            Файл: layers/decision/service.py
 
-   Шаг 27: Feedback Loop — калибровка confidence
-           Ежедневный Celery Beat job: сравнить audit_log.confidence vs manual_review_outcomes
-           Обновлять platform.tenant_configs["confidence_calibration_factor"]
-           Применять в make_decision(): effective_confidence = raw * calibration_factor
-           Файл: services/worker/tasks_analytics.py (новый)
+✅ Шаг 27: Feedback Loop — калибровка confidence — 2026-06-10
+           Ежедневный Celery Beat job calibrate_confidence (tasks_analytics.py).
+           make_decision() читает фактор из platform.tenant_configs через
+           core/tenant_config.get_tenant_config_float() (НЕ из Settings — lru_cache
+           заморозил бы ежедневное обновление) и применяет:
+           effective = clamp(raw * factor, 0, 1).
+           audit confidence = {overall, overall_raw, calibration_factor} —
+           raw обязателен, иначе фактор компаундился бы.
+           Файлы: services/worker/tasks_analytics.py, core/tenant_config.py
 
 ✅ Шаг 28: Stochastic QA Sampling — реализован
            5% AUTO_APPROVED → manual_review с reason="stochastic_qa_sample"
@@ -2576,49 +2682,41 @@ pytest-httpx==0.30.0
 
    ── Петля обучения (Шаги 29–35) — замкнуть цикл данные → решение → улучшение ──
 
-   Шаг 29: Feedback Loop — замкнуть петлю [ПРИОРИТЕТ 1, делать сразу после 28]
-           Файл: services/worker/tasks_analytics.py (новый)
-           Ежедневный Celery Beat job calibrate_confidence:
-             1. Читает audit_log (step=decision) → claimed confidence
-             2. Соединяет с manual_review_outcomes (QA-выборки за N дней)
-             3. Вычисляет actual_accuracy = confirmed_correct / total_qa_checks
-             4. Если |actual - claimed| > 0.05 → обновляет confidence_calibration_factor
-                в platform.tenant_configs
-             5. В make_decision(): effective_confidence = raw * calibration_factor
-           Минимум 30 QA-проверенных заявок перед первым обновлением
-           Зависимость: Шаг 28 — QA-выборки уже накапливаются
-           Проверка: SELECT count(*) FROM manual_review_outcomes WHERE
-                     reviewed_at > NOW() - INTERVAL '30 days' — должно быть ≥30
+✅ Шаг 29: Feedback Loop — петля замкнута — 2026-06-10
+           services/worker/tasks_analytics.py: calibrate_confidence (ежедневно 02:30 UTC
+           через Celery Beat, диспетчер calibrate_confidence_all по активным тенантам).
+           Алгоритм: проверенные outcomes за learning_calibration_window_days
+           + raw confidence из audit_log (LATERAL JOIN по последней decision-записи)
+           → actual_accuracy = count(correction_type='none')/count(*)
+           → при |actual − claimed| > 0.05: новый фактор = actual/claimed с клампом
+             [learning_calibration_factor_min=0.5, learning_calibration_factor_max=1.2]
+           → upsert platform.tenant_configs['confidence_calibration_factor'].
+           Минимум learning_min_samples_for_calibration=30 проверок.
+           Каждый запуск журналируется в platform.usage_events (calibration_run).
+           Очередь "analytics" добавлена в worker (-Q celery,claims,contracts,analytics).
 
-   Шаг 30: Детальная аналитика расхождений [ПРИОРИТЕТ 1]
-           db/migrations/008_review_correction_types.sql:
-             ALTER TABLE manual_review_outcomes
-               ADD COLUMN correction_type VARCHAR(30),
-               -- amount | diagnosis | coverage | none
-               ADD COLUMN claude_error_reason VARCHAR(50);
-               -- ocr_quality | contract_gap | extraction_error | fraud_missed | correct
-           Portal (Шаг 17 должен быть реализован): оператор выбирает тип ошибки
-           Файлы: db/migrations/008_review_correction_types.sql
-                  services/portal/ — UI для выбора correction_type
-           Цель: через 2–3 месяца данные покажут где Claude систематически ошибается
-           Вывод используется для: точечного улучшения промптов, RAG, quality gate
+✅ Шаг 30: Детальная аналитика расхождений — 2026-06-10 (API готов, Portal UI — Шаг 17)
+           db/migrations/008_review_correction_types.sql: correction_type +
+           claude_error_reason в manual_review_outcomes (+ индекс для калибровки).
+           services/api/routers/reviews.py:
+             GET  /v1/reviews — открытые элементы очереди (worklist через Swagger
+                  пока Portal не реализован)
+             POST /v1/reviews/{claim_id}/outcome — оператор фиксирует
+                  correction_type/claude_error_reason; auto_decision снимается из
+                  audit_log автоматически; очередь резолвится; при correction_type='none'
+                  документы помечаются doc_type_confirmed=True, source='operator'
+                  (питает Шаги 34–35).
 
-   Шаг 31: Chain-of-Thought + Extended Thinking [ПРИОРИТЕТ 2]
-           (см. детали в Шаге 26)
-           Реализовать ПОСЛЕ Шага 29 — нужны baseline метрики до включения CoT
-           чтобы измерить реальный эффект (снижение ручных проверок, рост confidence)
-           Ожидаемый эффект: −15–20% manual_review для пограничных случаев
+✅ Шаг 31: = Шаг 26 (реализован 2026-06-10, см. выше)
 
-   Шаг 32: Медицинская согласованность (Medical Coherence Check) [ПРИОРИТЕТ 2]
-           (см. детали в Шаге 21)
-           Реализовать ПОСЛЕ Шага 29 — аналогично нужны baseline метрики
+✅ Шаг 32: = Шаг 21 (реализован 2026-06-10, см. выше)
 
-   Шаг 33: Бенчмаркинг суммы по диагнозу [после 3 месяцев данных]
-           (см. детали в Шаге 24)
+   Шаг 33: Бенчмаркинг суммы по диагнозу [каркас готов; активация после 3 месяцев данных]
+           ✅ update_amount_benchmarks в tasks_analytics.py (Celery Beat: вс 03:00 UTC)
+           ✅ Таблица db/migrations/010_amount_benchmarks.sql
            Условие старта: ≥30 одобренных заявок на каждый icd10_prefix
-           Файл: services/worker/tasks_analytics.py — добавить update_amount_benchmarks
-           Celery Beat: еженедельно
            Активация: fraud_amount_benchmark_enabled = True в .env
+           ⏳ При активации: добавить amount_benchmark_exceeded в check_fraud()
 
    Шаг 34: ML-классификатор типов документов [после 600 примеров]
            (см. детали в Шаге 20)
@@ -2686,58 +2784,53 @@ pytest-httpx==0.30.0
    Сейчас работает regex (`classifier.py`). После ~600 подтверждённых документов  
    запустить `training_exporter --stats` и начать Шаг 20.
 
-### Enterprise TODO (качество решений, Шаги 21–28)
+### Enterprise: качество решений (Шаги 21–28) — реализовано 2026-06-10
 
-8. **Медицинская согласованность не проверяется** (Шаг 21)  
-   Claude не верифицирует что line_items соответствуют диагнозу.  
-   `DECISION_TOOL` не содержит поле `coherence_flags`.
+8. ✅ **Медицинская согласованность** (Шаг 21) — `coherence_flags` в DECISION_TOOL,
+   несогласованность → штраф confidence + manual_review (НЕ fraud-роутинг — см. Шаг 21).
 
-9. **Проверка исключений не использует ICD10-дерево** (Шаг 22)  
-   Exclusions-чанки сортируются первыми в промпте, но Claude не получает  
-   явную инструкцию проверить каждого предка диагноза против списка исключений.
+9. ✅ **Исключения через ICD10-дерево** (Шаг 22) — отдельная секция исключений в промпте,
+   полный список предков каждого диагноза, инструкция проверять предков.
 
-10. **Суб-лимиты и периоды ожидания не реализованы** (Шаг 23)  
-    `check_waiting_period()` и `check_sublimits()` отсутствуют в `decision/service.py`.
+10. ✅ **Суб-лимиты и периоды ожидания** (Шаг 23) — АКТИВНЫ с 2026-06-11:
+    getpolicylist передаёт StartDate/EndDate (→ period + проверка активности
+    полиса на дату события) и LimitAmount/LimitAmountLeft по рискам (→ суб-лимиты).
+    ObjectData "არ ეკუთვნის მოცდის პერიოდი" → освобождение от периода ожидания
+    (waiting_period_check="exempt_by_policy").
 
-11. **Бенчмаркинг суммы по диагнозу** (Шаг 24)  
-    Таблица `diagnosis_amount_benchmarks` не создана, job не написан.  
-    Активировать только после 3+ месяцев накопленных данных.
+11. **Бенчмаркинг суммы по диагнозу** (Шаг 24) — каркас готов: таблица (миграция 010)
+    + еженедельный job. Активировать (`fraud_amount_benchmark_enabled=True`) только
+    после 3+ месяцев данных; при активации добавить проверку в `check_fraud()`.
 
-12. **Кросс-документная согласованность неполная** (Шаг 25)  
-    В `extraction/service.py` проверяется ФИО + дата рождения, но не диагноз / дата события /  
-    название учреждения между документами.
+12. ✅ **Кросс-документная согласованность** (Шаг 25) — `cross_document` в EXTRACTION_TOOL,
+    проверки ФИО/даты рождения/диагнозов/дат/учреждения в `cross_validate()`.
 
-13. **Chain-of-Thought и Extended Thinking не реализованы** (Шаг 26)  
-    Сейчас один вызов Claude с `tool_choice="required"`.  
-    Reasoning не сохраняется в audit_log. Extended thinking не включается для сложных заявок.
+13. ✅ **Chain-of-Thought и Extended Thinking** (Шаг 26) — adaptive thinking для сложных
+    случаев, CoT-fallback, reasoning в audit_log, второй проход для неуверенных диагнозов.
 
-14. **Confidence не откалиброван** (Шаг 27)  
-    `manual_review_outcomes` заполняется, но нет job-а который сравнивает  
-    AI-confidence с реальной точностью и обновляет `confidence_calibration_factor`.
+14. ✅ **Калибровка confidence** (Шаг 27/29) — ежедневный job + применение фактора
+    в `make_decision()`.
 
-### Петля обучения (Шаги 29–35) — не реализована
+### Петля обучения (Шаги 29–35)
 
-15. **Feedback Loop разомкнут** (Шаг 29) — КРИТИЧНО  
-    Данные копятся (`audit_log`, `manual_review_outcomes`, QA-выборки), но ни один  
-    job не читает их и не обновляет пороги. Пороги `0.85` / `0.80` — числа без  
-    доказанного смысла. Нужен `tasks_analytics.py` с ежедневным  
-    `calibrate_confidence` job-ом.
+15. ✅ **Feedback Loop замкнут** (Шаг 29) — `tasks_analytics.py` + Celery Beat +
+    очередь analytics. Минимум 30 проверенных заявок до первого обновления фактора.
+    Проверка накопления: `SELECT count(*) FROM manual_review_outcomes
+    WHERE reviewed_at > NOW() - INTERVAL '30 days';`
 
-16. **Аналитика расхождений не детализирована** (Шаг 30)  
-    `manual_review_outcomes` не содержит `correction_type` и `claude_error_reason`.  
-    Оператор не фиксирует почему Claude ошибся. Без этого нельзя целенаправленно  
-    улучшать промпты, RAG или quality gate.  
-    Нужна миграция `008_review_correction_types.sql` + UI в Portal.
+16. ✅ **Аналитика расхождений** (Шаг 30) — миграция 008 + POST /v1/reviews/{id}/outcome.
+    ОСТАЁТСЯ: UI в Portal (Шаг 17); пока операторы работают через Swagger (/docs).
 
 17. **Amount Benchmarks не активированы** (Шаг 33)  
-    Ждут 3+ месяцев данных. Проверить условие:  
+    Job и таблица готовы, ждут 3+ месяцев данных. Проверить условие:  
     ```sql
     SELECT icd10_prefix, count(*) FROM audit_log al
     JOIN claims c ON c.id = al.claim_id
     WHERE c.status = 'AUTO_APPROVED' AND al.step = 'decision'
     GROUP BY icd10_prefix HAVING count(*) >= 30;
     ```  
-    Когда хотя бы 5 prefix-ов удовлетворяют условию — запускать Шаг 33.
+    Когда хотя бы 5 prefix-ов удовлетворяют условию — активировать
+    `fraud_amount_benchmark_enabled=True` и добавить проверку в `check_fraud()`.
 
 18. **ML-классификатор не обучен** (Шаг 34)  
     Ждёт 600 подтверждённых примеров. Проверить:  
@@ -2747,6 +2840,21 @@ pytest-httpx==0.30.0
     Ждёт 2000 подтверждённых extraction примеров. Принципиально важно:  
     решение о переключении принимает человек после A/B теста, не автоматически.
 
+### Миграции схемы — Alembic (с 2026-06-10)
+
+Схемой управляет Alembic; применяется автоматически в entrypoint.sh api-контейнера
+(`alembic upgrade head` перед загрузкой справочников). Вручную: `make migrate`.
+
+- **Свежая БД**: ревизия 0001 применяет legacy SQL 001-007, ревизия 0002 — 008-010.
+- **Существующая БД** (создана docker-entrypoint-initdb.d): 0001 видит таблицу
+  claims и пропускается; 0002 идемпотентна (IF NOT EXISTS) — безопасна, даже
+  если 008-010 уже накатывали вручную. Ручной `alembic stamp` не нужен.
+- **Новые изменения схемы — ТОЛЬКО Alembic-ревизии**
+  (`docker compose exec api alembic revision -m "..."`, можно `--autogenerate`).
+  Каталог db/migrations/ заморожен как legacy-бутстрап для initdb — новые
+  .sql туда не добавлять (тест test_migration_utils проверяет соответствие).
+- Команды: `make migrate` (upgrade head), `make migrate-status` (current).
+
 ---
 
 ## Антипаттерны (никогда не делай так)
@@ -2755,7 +2863,7 @@ pytest-httpx==0.30.0
 # ❌ Никогда так:
 if confidence > 0.85:
 if amount > 500:
-model = "claude-sonnet-4-20250514"
+model = "claude-sonnet-4-6"
 url = "http://192.168.0.249:8077"
 
 # ✅ Всегда так:

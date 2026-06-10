@@ -91,6 +91,10 @@ class ClaimDocument(Base):
     extracted_data     = Column(JSONB)
     quality_score      = Column(Numeric(4, 3))
     quality_flags      = Column(ARRAY(Text))
+    # per-page метрики качества: [{page, resolution_dpi, blur_score, brightness, skew_angle, score, flags}]
+    quality_metrics    = Column(JSONB)
+    # OCR-блоки: {strategy, low_confidence_blocks, blocks: [{text, confidence, bbox}]}
+    ocr_blocks         = Column(JSONB)
     created_at         = Column(DateTime(timezone=True), server_default=func.now())
 
     claim = relationship("Claim", back_populates="documents")

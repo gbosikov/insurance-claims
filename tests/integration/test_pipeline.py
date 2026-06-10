@@ -87,7 +87,8 @@ async def test_extraction_to_decision_to_auto_approved():
     mock_client = _mock_anthropic(claude_decision_resp)
 
     with patch("anthropic.AsyncAnthropic", return_value=mock_client), \
-         patch("layers.decision.service.enrich_all", AsyncMock(return_value=enriched)):
+         patch("layers.decision.service.enrich_all", AsyncMock(return_value=enriched)), \
+         patch("layers.decision.service.random.random", return_value=0.99):  # QA-выборка не срабатывает
 
         from layers.decision.service import make_decision
         from layers.routing.service import route_claim
@@ -95,6 +96,7 @@ async def test_extraction_to_decision_to_auto_approved():
         decision = await make_decision(
             claim_id=CLAIM_ID,
             tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
             extraction=extraction,
             risks_limits=risks_limits,
             icd10_list=icd10_list,
@@ -159,6 +161,7 @@ async def test_decision_low_confidence_routes_to_manual_review():
         decision = await make_decision(
             claim_id=CLAIM_ID,
             tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
             extraction=extraction,
             risks_limits=make_risks_and_limits(),
             icd10_list=make_icd10_list(),
@@ -217,6 +220,7 @@ async def test_decision_not_covered_routes_to_rejected():
         decision = await make_decision(
             claim_id=CLAIM_ID,
             tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
             extraction=extraction,
             risks_limits=make_risks_and_limits(),
             icd10_list=make_icd10_list(),
