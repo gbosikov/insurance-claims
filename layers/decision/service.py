@@ -34,6 +34,11 @@ from core.schemas.contract import ContractChunkSchema
 from core.schemas.core_api import ICD10Item, ProviderInfo, RisksAndLimits
 from core.schemas.decision import ClaimDecision, DiagnosisDecisionSchema, LineItemDecisionSchema
 from core.tenant_config import get_tenant_config_float
+from layers.decision.exclusion_checker import (
+    ExclusionResult,
+    apply_wording_carveout,
+    check_exclusions,
+)
 from layers.decision.icd10_enricher import EnrichedDiagnosis, enrich_all
 
 log = structlog.get_logger()
@@ -1051,6 +1056,40 @@ async def make_decision(
                 violations=sublimit_violations,
             )
 
+        # ── Уровень 1: исключения по вордингу страховых условий ──────
+        # Детерминированная проверка из таблицы exclusion_rules (Excel → DB).
+        # Выполняется ДО Claude. Скоуп: 'all' для всех; 'family' — доп. для
+        # членов семьи (CardNumber /2, /3, /4 → insured_type='family').
+        wording_exclusions: dict[str, tuple[str, ExclusionResult]] = {}
+        # {icd10_code → (rejection_reason, excl_result)}
+        wording_manual_review: dict[str, ExclusionResult] = {}
+        # {icd10_code → excl_result} — для случаев неизвестной срочности при CARVEOUT
+
+        for diag in extraction.event.diagnoses:
+            excl = await check_exclusions(
+                diag.icd10_code,
+                risks_limits.insured_type,
+                tenant_id,
+                db,
+            )
+            if excl is None:
+                continue
+            is_excluded, reason = apply_wording_carveout(
+                excl, extraction.event.service_urgency
+            )
+            if is_excluded and reason:
+                wording_exclusions[diag.icd10_code] = (reason, excl)
+                log.info(
+                    "wording_exclusion_applied",
+                    claim_id=str(claim_id),
+                    icd10_code=diag.icd10_code,
+                    scope=excl.scope,
+                    carveout_conditions=excl.carveout_conditions,
+                )
+            elif not is_excluded and excl.carveout_conditions:
+                # CARVEOUT есть, но service_urgency неизвестна → manual_review
+                wording_manual_review[diag.icd10_code] = excl
+
         # ── Антифрод (параллельно с обогащением и Уровнем 2) ────────
         import asyncio
         personal_id = extraction.insured.personal_id
@@ -1277,7 +1316,16 @@ async def make_decision(
                 diag.rejection_reason = carveout_rejections[diag.icd10_code]
                 # Не обновляем contract_reference — CARVEOUT-причина в rejection_reason
 
-        # ── Применить POSITIVE LIST результаты ─────────────────────────────
+        # ── Применить исключения по вордингу (переопределить решение Claude) ─
+        # Жёсткие исключения из wording (Уровень 1) → Claude не может разрешить.
+        for diag in diagnoses:
+            if diag.icd10_code in wording_exclusions:
+                reason, excl = wording_exclusions[diag.icd10_code]
+                diag.is_covered = False
+                diag.approved_amount = 0.0
+                diag.rejection_reason = reason
+
+        # ── POSITIVE LIST результаты ─────────────────────────────
         # Если услуга в POSITIVE LIST → 100% покрыта, переопределяем решение Claude
         for line_item in line_items:
             desc = line_item.description or ""
@@ -1297,6 +1345,15 @@ async def make_decision(
 
         all_covered = all(d.is_covered for d in diagnoses) if diagnoses else False
         any_covered = any(d.is_covered for d in diagnoses) if diagnoses else False
+
+        # wording_manual_review: CARVEOUT-условие есть, но service_urgency неизвестна
+        if wording_manual_review:
+            manual_review_codes = ", ".join(wording_manual_review)
+            raw["requires_manual_review"] = True
+            if not raw.get("manual_review_reason"):
+                raw["manual_review_reason"] = (
+                    f"wording_carveout_unknown_urgency: {manual_review_codes}"
+                )
 
         if raw.get("requires_manual_review") or fraud_flags or coherence_flags or sublimit_violations:
             status = "manual_review"

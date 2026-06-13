@@ -478,6 +478,7 @@ async def test_make_decision_applies_positive_list_coverage():
 
     with patch("layers.decision.service.check_fraud", mock_check_fraud), \
          patch("layers.decision.service.check_positive_list", mock_positive_list), \
+         patch("layers.decision.service.check_exclusions", AsyncMock(return_value=None)), \
          patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client), \
          patch("layers.decision.service.write_audit_entry", AsyncMock()), \
          patch("layers.decision.service.enrich_all", AsyncMock(return_value={})), \
@@ -552,6 +553,7 @@ async def test_make_decision_applies_calibration_factor():
 
     with patch("layers.decision.service.check_fraud", AsyncMock(return_value=[])), \
          patch("layers.decision.service.check_positive_list", AsyncMock(return_value={})), \
+         patch("layers.decision.service.check_exclusions", AsyncMock(return_value=None)), \
          patch("layers.decision.service.get_tenant_config_float", AsyncMock(return_value=0.8)), \
          patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client), \
          patch("layers.decision.service.write_audit_entry", mock_audit), \

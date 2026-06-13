@@ -343,6 +343,25 @@ async def test_policy_dates_and_object_data_extracted():
 
 
 @pytest.mark.asyncio
+async def test_insured_type_from_card_number_suffix():
+    """CardNumber /1 → employee; /2-/4 → family (для exclusion_checker)."""
+    import copy
+
+    # /1 → сотрудник
+    adapter = make_adapter()
+    rl = await adapter.get_risks_and_limits("UNI 900001/1", PERSONAL_NUMBER)
+    assert rl.insured_type == "employee"
+    assert rl.card_number == "UNI 900001/1"
+
+    # /2 → член семьи
+    response = copy.deepcopy(POLICY_RESPONSE)
+    response["PolicyList"]["Policy"][0]["CardNumber"] = "UNI 900001/2"
+    adapter2 = make_adapter(response)
+    rl2 = await adapter2.get_risks_and_limits("UNI 900001/2", PERSONAL_NUMBER)
+    assert rl2.insured_type == "family"
+
+
+@pytest.mark.asyncio
 async def test_exhausted_sublimits_give_zero_remaining():
     """Все денежные суб-лимиты исчерпаны → remaining=0 → manual_review в decision."""
     import copy

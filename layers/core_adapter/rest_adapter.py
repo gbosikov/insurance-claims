@@ -52,6 +52,7 @@ from core.schemas.core_api import (
     SubmitClaimResult,
 )
 from layers.core_adapter.interface import CoreSystemAdapter
+from layers.decision.exclusion_checker import get_insured_type
 
 log = structlog.get_logger()
 settings = get_settings()
@@ -463,6 +464,7 @@ class LiteGroupAdapter(CoreSystemAdapter):
             default=annual_limit,
         )
 
+        card_number = str(policy.get("CardNumber") or "").strip()
         return RisksAndLimits(
             policy_number=policy_number,
             risks=risks,
@@ -476,6 +478,9 @@ class LiteGroupAdapter(CoreSystemAdapter):
                 insured.get("EndDate") or policy.get("EndDate")
             ),
             object_data=str(insured.get("ObjectData") or "").strip() or None,
+            # CardNumber суффикс /1=сотрудник, /2-/4=член семьи
+            insured_type=get_insured_type(card_number),
+            card_number=card_number,
         )
 
     # ── Метод 3: Справочник ICD10 ──────────────────────────────────

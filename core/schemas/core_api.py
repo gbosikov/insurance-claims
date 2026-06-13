@@ -42,6 +42,13 @@ class RisksAndLimits(BaseModel):
     # ObjectList.Objects.ObjectData — свободный текст кор-системы; может содержать
     # маркер освобождения от периода ожидания ("არ ეკუთვნის მოცდის პერიოდი")
     object_data: str | None = None
+    # Тип застрахованного из суффикса CardNumber:
+    # '/1' или нет суффикса → 'employee'
+    # '/2', '/3', '/4'       → 'family'
+    # Используется exclusion_checker для выбора скоупа правил вординга.
+    insured_type: str = "employee"
+    # Исходный CardNumber для отладки (не используется в бизнес-логике)
+    card_number: str = ""
 
 
 class ContractData(BaseModel):

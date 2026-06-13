@@ -99,6 +99,7 @@ def decision_patches(mock_client, audit_mock=None):
     return [
         patch("layers.decision.service.check_fraud", AsyncMock(return_value=[])),
         patch("layers.decision.service.check_positive_list", AsyncMock(return_value={})),
+        patch("layers.decision.service.check_exclusions", AsyncMock(return_value=None)),
         patch("layers.decision.service.get_tenant_config_float", AsyncMock(return_value=1.0)),
         patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client),
         patch("layers.decision.service.write_audit_entry", audit_mock or AsyncMock()),
