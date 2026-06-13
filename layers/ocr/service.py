@@ -28,11 +28,14 @@ from core.storage import StorageClient
 log = structlog.get_logger()
 settings = get_settings()
 
-# OCR-стратегии по типу документа
+# OCR-стратегии по типу документа.
+# Используем Vision API DOCUMENT_TEXT_DETECTION для всех типов:
+# Document AI Form Parser требует отдельного processor в GCP Console,
+# Vision API работает сразу после включения API.
 OCR_STRATEGIES: dict[DocType, str] = {
-    DocType.FORM_100:    "document_ai_form_parser",
+    DocType.FORM_100:    "vision_text_detection",
     DocType.ID_DOCUMENT: "vision_text_detection",
-    DocType.RECEIPT:     "document_ai_form_parser",
+    DocType.RECEIPT:     "vision_text_detection",
 }
 
 RETRY_BACKOFF = [1, 3, 10]  # секунды между попытками
