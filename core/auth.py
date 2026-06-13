@@ -104,6 +104,8 @@ def required_scope(method: str, path: str) -> str:
         return "analytics:read"
     if path.startswith("/v1/reviews"):
         return "reviews:write" if is_write else "reviews:read"
+    if path.startswith("/devtools"):
+        return "claims:write"  # dev-инструмент: достаточно стандартного ключа
 
     return "admin"
 
