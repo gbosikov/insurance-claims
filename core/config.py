@@ -36,12 +36,27 @@ class Settings(BaseSettings):
     # Отдельный auth-сервер (прод: 10.0.204.10:1010; dev: пусто = core_api_base_url)
     core_api_auth_url: str = ""
 
-    # URL сервера для ClaimParsing_UNI (может отличаться от LiteMed API).
-    # Пусто = использовать core_api_base_url.
-    # Формат вызова: POST {core_api_claims_base_url}/LiteApi/LiteServiceJSON
-    # Тело: {"METHODNAME": "ClaimParsing_UNI", "XML_DATA": {...}}
-    # Уточнить реальный URL у владельца кор-системы.
+    # Claims API (отдельный сервис Lite GROUP, другой порт, HTTPS):
+    #   ТЕСТ: https://192.168.0.249:4443
+    #   ПРОД: https://192.168.0.250:7777
+    # Auth: POST {core_api_claims_base_url}/LiteApi/LiteAuthJSON  (своя аутентификация)
+    # Data: POST {core_api_claims_base_url}/LiteApi/LiteServiceJSON  (ClaimParsing_UNI)
+    # Пусто → fallback на core_api_base_url (для dev/mock окружений).
     core_api_claims_base_url: str = ""
+
+    # Claims API может иметь отдельные учётные данные (отличные от LiteMed).
+    # Пусто → использовать core_api_username / core_api_password (те же что для LiteMed).
+    core_api_claims_username: str = ""
+    core_api_claims_password: str = ""
+
+    # Claims API использует самоподписанный SSL-сертификат (внутренняя сеть).
+    # False — отключить проверку SSL (нужно для корпоративных серверов без CA).
+    core_api_claims_verify_ssl: bool = False
+
+    # Если True — пропускать ClaimParsing_UNI и записывать успешный mock-результат.
+    # Использовать только в dev пока Claims API не настроен.
+    # При True claim получает AUTO_APPROVED/MANUAL_REVIEW по AI-решению, Innum="SKIPPED".
+    core_api_skip_claims_submit: bool = False
 
     # Схема Authorization-заголовка: "Bearer" или "" (сырой токен).
     # Документация getpolicylist показывает сырой GUID без префикса;
@@ -110,7 +125,7 @@ class Settings(BaseSettings):
     claude_model: str = "claude-sonnet-4-6"
     claude_extraction_temperature: float = 0.0   # детерминированность
     claude_decision_temperature: float = 0.1     # небольшая вариативность
-    claude_extraction_max_tokens: int = 1000
+    claude_extraction_max_tokens: int = 2000
     claude_decision_max_tokens: int = 4000
     claude_chunking_max_tokens: int = 4096
 

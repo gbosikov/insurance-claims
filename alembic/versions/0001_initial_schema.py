@@ -33,7 +33,7 @@ def upgrade() -> None:
 
     for filename in LEGACY_BASELINE_FILES:
         for statement in read_migration_statements(filename):
-            op.execute(sa.text(statement))
+            bind.exec_driver_sql(statement)
 
 
 def downgrade() -> None:

@@ -1,17 +1,21 @@
 """
 Слой 6 — Реализация Core System Adapter для Lite GROUP.
 
-Два API:
-1. LiteMed API (данные полисов):
+Два НЕЗАВИСИМЫХ API:
+
+1. LiteMed API (данные полисов, HTTP):
      Auth:  POST {core_api_auth_url}/api/User/authenticate → {"token": "..."}
      Data:  POST {core_api_base_url}/api/Client/getpolicylist
-            Body: {"personalnumber": "...", "STATE": "0", "schedule": "1"}
-            Header: Authorization: {core_api_auth_scheme} <token>
+     ТЕСТ:  http://192.168.0.249:8077
+     ПРОД:  http://192.168.0.250:1010  (Auth: http://10.0.204.10:1010)
 
-2. Claims API (создание убытка):
-     POST {core_api_claims_base_url}/LiteApi/LiteServiceJSON
-     Body: {"METHODNAME": "ClaimParsing_UNI", "XML_DATA": {...}}
-     URL уточнить у владельца кор-системы (core_api_claims_base_url в .env).
+2. Claims API (создание убытка, HTTPS, отдельный сервис):
+     Auth:  POST {core_api_claims_base_url}/LiteApi/LiteAuthJSON → {"token": "..."}
+     Data:  POST {core_api_claims_base_url}/LiteApi/LiteServiceJSON
+     Body:  {"METHODNAME": "ClaimParsing_UNI", "XML_DATA": {...}}
+     ТЕСТ:  https://192.168.0.249:4443  (самоподписанный SSL)
+     ПРОД:  https://192.168.0.250:7777  (самоподписанный SSL)
+     verify_ssl: core_api_claims_verify_ssl (по умолчанию False для внутренней сети)
 
 Реальная структура ответа getpolicylist (верифицирована 2026-06-11):
   {"PolicyList": {"Policy": [{
@@ -59,6 +63,7 @@ settings = get_settings()
 
 RETRY_BACKOFF = [1, 3, 10]
 REDIS_TOKEN_KEY = "lite_group:jwt_token"
+REDIS_CLAIMS_TOKEN_KEY = "lite_group:claims_jwt_token"
 REDIS_ICD10_KEY = "lite_group:icd10_list"
 REDIS_PROVIDERS_KEY = "lite_group:providers"
 TOKEN_TTL = 3600        # 1 час
@@ -125,20 +130,26 @@ class LiteGroupAdapter(CoreSystemAdapter):
         base = settings.core_api_base_url.rstrip("/")
         self._data_base = base
 
-        # Auth-сервер: отдельный (прод) или тот же (дев/тест)
+        # Auth-сервер LiteMed: отдельный (прод) или тот же (дев/тест)
         auth_base = settings.core_api_auth_url.rstrip("/") if settings.core_api_auth_url else base
         self._auth_url = f"{auth_base}/api/User/authenticate"
 
-        # Сервер для ClaimParsing_UNI (может быть другим)
+        # Claims API — ОТДЕЛЬНЫЙ сервис (другой порт, HTTPS, своя аутентификация)
+        # ТЕСТ: https://192.168.0.249:4443  ПРОД: https://192.168.0.250:7777
         claims_base = settings.core_api_claims_base_url.rstrip("/") if settings.core_api_claims_base_url else base
+        self._claims_auth_url = f"{claims_base}/LiteApi/LiteAuthJSON"
         self._claims_url = f"{claims_base}/LiteApi/LiteServiceJSON"
+        self._claims_verify_ssl = settings.core_api_claims_verify_ssl
 
         self._timeout = settings.core_api_timeout
         self._max_retries = settings.core_api_retry
 
-        # In-memory fallback для токена (если Redis недоступен)
+        # In-memory fallback для LiteMed-токена (если Redis недоступен)
         self._token_cache: str | None = None
         self._token_ts: float = 0.0
+        # In-memory fallback для Claims API токена
+        self._claims_token_cache: str | None = None
+        self._claims_token_ts: float = 0.0
         self._redis = None  # lazy init
 
     # ── Управление токеном ─────────────────────────────────────────
@@ -198,6 +209,107 @@ class LiteGroupAdapter(CoreSystemAdapter):
         self._token_ts = time.time()
         log.info("core_token_refreshed")
         return token
+
+    # ── Токен для Claims API (отдельный сервис, своя аутентификация) ──
+
+    async def _get_claims_token(self) -> str:
+        redis = await self._get_redis()
+        if redis:
+            try:
+                cached = await redis.get(REDIS_CLAIMS_TOKEN_KEY)
+                if cached:
+                    return cached
+            except Exception:
+                pass
+
+        if self._claims_token_cache and (time.time() - self._claims_token_ts) < TOKEN_TTL:
+            return self._claims_token_cache
+
+        return await self._refresh_claims_token()
+
+    async def _refresh_claims_token(self) -> str:
+        """POST /LiteApi/LiteAuthJSON → Bearer-токен для Claims API."""
+        # Claims API может использовать отдельные учётные данные (core_api_claims_username/password).
+        # Если не заданы — использовать те же что для LiteMed.
+        username = settings.core_api_claims_username or settings.core_api_username
+        password = settings.core_api_claims_password or settings.core_api_password
+        async with httpx.AsyncClient(timeout=self._timeout, verify=self._claims_verify_ssl) as client:
+            resp = await client.post(
+                self._claims_auth_url,
+                json={
+                    "userName": username,
+                    "passWord": password,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            token = data.get("token") or data.get("TOKEN") or data.get("Token", "")
+
+        if not token:
+            raise CoreAPIUnavailableError(message=f"Empty token from {self._claims_auth_url}")
+
+        redis = await self._get_redis()
+        if redis:
+            try:
+                await redis.setex(REDIS_CLAIMS_TOKEN_KEY, TOKEN_TTL, token)
+            except Exception:
+                pass
+
+        self._claims_token_cache = token
+        self._claims_token_ts = time.time()
+        log.info("claims_token_refreshed", url=self._claims_auth_url)
+        return token
+
+    async def _call_claims_rest(self, body: dict) -> dict:
+        """
+        POST {claims_url} с Claims API токеном (LiteAuthJSON).
+        Retry: max_retries попыток, backoff [1, 3, 10] сек.
+        При 401 → однократный refresh + повтор.
+        verify_ssl=False для самоподписанных сертификатов корпоративной сети.
+        """
+        token = await self._get_claims_token()
+        last_error: Exception | None = None
+
+        for attempt in range(self._max_retries):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self._timeout, verify=self._claims_verify_ssl
+                ) as client:
+                    headers = {
+                        "Authorization": self._auth_header_value(token),
+                        "Content-Type": "application/json",
+                    }
+                    resp = await client.post(self._claims_url, json=body, headers=headers)
+
+                    if resp.status_code == 401:
+                        log.info("claims_token_expired_refreshing", attempt=attempt)
+                        token = await self._refresh_claims_token()
+                        headers["Authorization"] = self._auth_header_value(token)
+                        resp = await client.post(self._claims_url, json=body, headers=headers)
+                        if resp.status_code == 401:
+                            raise CoreAPIUnavailableError(
+                                message=f"401 after claims token refresh"
+                            )
+
+                    if resp.status_code == 404:
+                        raise CoreAPIUnavailableError(
+                            message=f"Claims API 404: {self._claims_url} — проверить URL"
+                        )
+
+                    resp.raise_for_status()
+                    return resp.json()
+
+            except CoreAPIUnavailableError:
+                raise
+            except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
+                last_error = e
+                log.warning("claims_api_retry", attempt=attempt + 1, error=str(e))
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
+
+        raise CoreAPIUnavailableError(
+            message=f"Claims API failed after {self._max_retries} attempts: {last_error}"
+        )
 
     # ── Общий REST-вызов с retry и 401-refresh ─────────────────────
 
@@ -452,11 +564,31 @@ class LiteGroupAdapter(CoreSystemAdapter):
                         currency=type_currency,
                         sublimit=limit_amount if limit_amount > 0 else None,
                         parent_risk_id=parent_id if parent_id else None,  # "0" = корневой
+                        has_child=_to_int_or_none(r.get("hasChild")) or 0,
                         limit_count=_to_int_or_none(r.get("LimitCount")),
                         limit_count_left=_to_int_or_none(r.get("LimitCountLeft")),
                     ))
                 except Exception as exc:
                     log.warning("risk_parse_error", error=str(exc), risk_id=r.get("RiskId"))
+
+        # Правило Lite GROUP (верифицировано 2026-06-14):
+        # если у риска LimitAmount=0, его фактический остаток берётся у родителя (RiskParentId).
+        # Пример: 102109 (LimitAmount=0, parent=102065) → remaining = 102065.LimitAmountLeft.
+        risk_by_id: dict[int, RiskInfo] = {r.risk_id: r for r in risks}
+        resolved_risks: list[RiskInfo] = []
+        for r in risks:
+            if r.total_limit == 0 and r.parent_risk_id is not None:
+                parent = risk_by_id.get(r.parent_risk_id)
+                if parent and parent.remaining_limit > 0:
+                    r = r.model_copy(update={"remaining_limit": parent.remaining_limit})
+                    log.info(
+                        "risk_limit_inherited_from_parent",
+                        risk_id=r.risk_id,
+                        parent_risk_id=r.parent_risk_id,
+                        inherited_remaining=r.remaining_limit,
+                    )
+            resolved_risks.append(r)
+        risks = resolved_risks
 
         limited_risks = [r for r in risks if (r.sublimit or 0) > 0]
         remaining = max(
@@ -465,6 +597,7 @@ class LiteGroupAdapter(CoreSystemAdapter):
         )
 
         card_number = str(policy.get("CardNumber") or "").strip()
+        insured_pn = str(insured.get("PersonalNumber") or "").strip() or None
         return RisksAndLimits(
             policy_number=policy_number,
             risks=risks,
@@ -481,6 +614,7 @@ class LiteGroupAdapter(CoreSystemAdapter):
             # CardNumber суффикс /1=сотрудник, /2-/4=член семьи
             insured_type=get_insured_type(card_number),
             card_number=card_number,
+            insured_personal_number=insured_pn,
         )
 
     # ── Метод 3: Справочник ICD10 ──────────────────────────────────
@@ -488,11 +622,47 @@ class LiteGroupAdapter(CoreSystemAdapter):
     async def get_icd10_list(self) -> list[ICD10Item]:
         """
         LiteMed API не предоставляет справочник ICD10.
-        DiagnosID берётся из локальной таблицы icd10_diagnoses (icd10_enricher).
-        Возвращаем пустой список — decision layer использует локальный справочник.
+        Загружаем из локальной таблицы icd10_diagnoses: id → diagnosid, extcod → code.
+        Кэшируется в Redis на 24 часа (справочник меняется редко).
         """
-        log.debug("icd10_list_from_local_db_used")
-        return []
+        redis = await self._get_redis()
+        _CACHE_KEY = "lite_group:icd10_list"
+
+        if redis:
+            try:
+                cached = await redis.get(_CACHE_KEY)
+                if cached:
+                    import json
+                    return [ICD10Item(**item) for item in json.loads(cached)]
+            except Exception:
+                pass
+
+        from sqlalchemy import text
+        from core.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                text("SELECT id, extcod, name_r FROM icd10_diagnoses WHERE is_available = TRUE AND extcod IS NOT NULL")
+            )).fetchall()
+
+        items = [
+            ICD10Item(diagnosid=r.id, code=r.extcod, name=r.name_r or "")
+            for r in rows
+        ]
+
+        if redis and items:
+            try:
+                import json
+                await redis.setex(
+                    _CACHE_KEY,
+                    86400,
+                    json.dumps([{"diagnosid": i.diagnosid, "code": i.code, "name": i.name} for i in items]),
+                )
+            except Exception:
+                pass
+
+        log.info("icd10_list_loaded_from_local_db", count=len(items))
+        return items
 
     # ── Метод 4: Справочник провайдеров ────────────────────────────
 
@@ -557,7 +727,7 @@ class LiteGroupAdapter(CoreSystemAdapter):
     async def submit_claim(
         self,
         policy_number: str,
-        diagnosid: int,
+        diagnosid: str,
         event_start_date: str,
         event_end_date: str,
         pers_id: int,
@@ -573,30 +743,39 @@ class LiteGroupAdapter(CoreSystemAdapter):
              core_api_claims_base_url задаётся в .env.
              Уточнить у владельца кор-системы Lite GROUP.
         """
-        if not settings.core_api_claims_base_url:
+        if settings.core_api_skip_claims_submit:
             log.warning(
-                "claims_url_not_configured",
-                msg="core_api_claims_base_url не задан в .env. "
-                    "ClaimParsing_UNI вызывается на core_api_base_url.",
+                "claims_submit_skipped",
+                msg="CORE_API_SKIP_CLAIMS_SUBMIT=True — ClaimParsing_UNI пропущен (dev-режим).",
+                policy_number=policy_number,
             )
+            return SubmitClaimResult(innum="SKIPPED", status=0, status_text="skipped_in_dev")
 
-        result = await self._call_rest(
-            self._claims_url,
-            {
-                "METHODNAME": "ClaimParsing_UNI",
-                "XML_DATA": {
-                    "PolicyNumber":   policy_number,
-                    "DiagnosID":      diagnosid,
-                    "EventStartDate": event_start_date,
-                    "EventEndDate":   event_end_date,
-                    "PersID":         pers_id,
-                    "ConfigKind":     config_kind,
-                    "Comment":        comment,
-                    "RisksList":      risks_list,
-                    "file_fields":    file_fields,
-                },
+        payload = {
+            "METHODNAME": "ClaimParsing_UNI",
+            "XML_DATA": {
+                "PolicyNumber":   policy_number,
+                "DiagnosID":      diagnosid,
+                "EventStartDate": event_start_date,
+                "EventEndDate":   event_end_date,
+                "PersID":         pers_id,
+                "ConfigKind":     config_kind,
+                "Comment":        comment,
+                "RisksList":      risks_list,
+                "file_fields":    file_fields,
             },
-        )
+        }
+        # Логируем payload без base64 документов (слишком большие)
+        payload_for_log = {
+            **payload,
+            "XML_DATA": {
+                k: (f"[{len(v)} files]" if k == "file_fields" else v)
+                for k, v in payload["XML_DATA"].items()
+            },
+        }
+        log.info("claim_parsing_uni_payload", payload=payload_for_log)
+
+        result = await self._call_claims_rest(payload)
 
         data = result.get("responseData", [{}])
         if isinstance(data, list):
@@ -650,21 +829,22 @@ class MockCoreAdapter(CoreSystemAdapter):
             risks=[
                 RiskInfo(
                     risk_id=1,
-                    name="Амбулаторное лечение",
-                    coverage_pct=80.0,
-                    total_limit=2000.0,
-                    remaining_limit=1500.0,
+                    name="ამბულატორიული მომსახურება / Outpatient services",
+                    coverage_pct=90.0,
+                    total_limit=4000.0,
+                    remaining_limit=3500.0,
                     currency="GEL",
-                    services=[{"serviceid": "AMB-001", "name": "Приём врача", "config_kind": 1}],
+                    has_child=1,  # родительский — не использовать в RisksList
                 ),
                 RiskInfo(
                     risk_id=2,
-                    name="Диагностика",
-                    coverage_pct=100.0,
-                    total_limit=1000.0,
-                    remaining_limit=1000.0,
+                    name="გეგმიური ამბულატორია (მიმართვის გარეშე, თავისუფალი არჩევანი)",
+                    coverage_pct=70.0,
+                    total_limit=0.0,
+                    remaining_limit=0.0,
                     currency="GEL",
-                    services=[{"serviceid": "DIAG-001", "name": "Анализы/УЗИ", "config_kind": 2}],
+                    parent_risk_id=1,
+                    has_child=0,  # листовой — использовать
                 ),
             ],
             annual_limit=5000.0,
@@ -712,7 +892,7 @@ class MockCoreAdapter(CoreSystemAdapter):
     async def submit_claim(
         self,
         policy_number: str,
-        diagnosid: int,
+        diagnosid: str,
         event_start_date: str,
         event_end_date: str,
         pers_id: int,

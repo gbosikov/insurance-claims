@@ -46,6 +46,7 @@ from layers.ocr.service import ocr_all_documents
 from layers.preprocessing.service import preprocess_all_documents
 from layers.rag.searcher import build_rag_query, get_contract_chunks_with_freshness_check
 from layers.routing.service import route_claim
+from core.audit import write_audit_entry
 from services.worker.celery_app import celery_app
 
 log = structlog.get_logger()
@@ -206,6 +207,60 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                 await db.commit()
                 raise self.retry(countdown=300)
 
+            # ── Верификация личного номера из документов vs getpolicylist ──
+            # Сравниваем personal_id из OCR с PersonalNumber из matched Object полиса.
+            # Несовпадение → предупреждение в extraction.flags, не отказ.
+            policy_personal_number = risks_limits.insured_personal_number
+            personal_id_verified = False
+            personal_id_mismatch = False
+            if personal_number and policy_personal_number:
+                personal_id_verified = personal_number.strip() == policy_personal_number.strip()
+                personal_id_mismatch = not personal_id_verified
+            if personal_id_mismatch:
+                log.warning(
+                    "personal_id_mismatch_vs_policy",
+                    claim_id=str(claim_uuid),
+                    from_docs=personal_number,
+                    from_policy=policy_personal_number,
+                )
+                extraction.flags.append("personal_id_mismatch")
+                extraction.extraction_confidence = max(
+                    0.0, extraction.extraction_confidence - 0.20
+                )
+
+            # Аудит: что получили из кор-системы
+            await write_audit_entry(
+                db,
+                claim_id=claim_uuid,
+                tenant_id=tenant_uuid,
+                step="core_fetch",
+                input_data={
+                    "policy_number": policy_number,
+                    "personal_number_from_docs": personal_number,
+                    "personal_number_from_policy": policy_personal_number,
+                    "personal_id_verified": personal_id_verified,
+                },
+                output_data={
+                    "contract_has_content": bool(contract_data.content),
+                    "annual_limit": risks_limits.annual_limit,
+                    "remaining": risks_limits.remaining,
+                    "currency": risks_limits.currency,
+                    "icd10_list_count": len(icd10_list),
+                    "providers_count": len(providers),
+                    "risks": [
+                        {
+                            "risk_id": r.risk_id,
+                            "name": r.name,
+                            "total_limit": r.total_limit,
+                            "remaining_limit": r.remaining_limit,
+                            "coverage_pct": r.coverage_pct,
+                            "sublimit": r.sublimit,
+                        }
+                        for r in risks_limits.risks
+                    ],
+                },
+            )
+
             # ── Слой 5: RAG search (с авто-индексацией) ───────────
             claim.status = ClaimStatus.RAG_SEARCH
             await db.flush()
@@ -230,6 +285,14 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
             claim.status = ClaimStatus.DECISION_PENDING
             await db.flush()
 
+            # Извлекаем OCR-текст формы 100 для risk_matcher
+            # (определение категории: ამბულატ / სტაციონ → подбор риска)
+            from core.models.claim import DocType as DocTypeModel
+            form_100_ocr_text = next(
+                (r.full_text for r in ocr_results if r.doc_type == DocTypeModel.FORM_100),
+                "",
+            )
+
             decision = await make_decision(
                 claim_id=claim_uuid,
                 tenant_id=tenant_uuid,
@@ -241,6 +304,7 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                 contract_chunks=contract_chunks,
                 submission_date=submission_date,
                 db=db,
+                form_100_ocr_text=form_100_ocr_text,
             )
 
             # ── Шаг 8: ClaimParsing_UNI — ВСЕГДА ─────────────────
@@ -270,6 +334,30 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                     innum=core_result.innum,
                     status=core_result.status,
                     status_text=core_result.status_text,
+                )
+
+                # Аудит: что отправили в ClaimParsing_UNI и что вернулось
+                await write_audit_entry(
+                    db,
+                    claim_id=claim_uuid,
+                    tenant_id=tenant_uuid,
+                    step="core_submit",
+                    input_data={
+                        "PolicyNumber":   policy_number,
+                        "DiagnosID":      decision.diagnosid or 0,
+                        "EventStartDate": extraction.event.date,
+                        "EventEndDate":   extraction.event.date,
+                        "PersID":         decision.pers_id or 0,
+                        "ConfigKind":     decision.config_kind or 0,
+                        "Comment":        (decision.summary or "")[:500],
+                        "RisksList":      decision.risks_list,
+                        "files_count":    len(file_fields),
+                    },
+                    output_data={
+                        "innum":       core_result.innum,
+                        "status":      core_result.status,
+                        "status_text": core_result.status_text,
+                    },
                 )
 
                 # Коды ошибок ClaimParsing_UNI (0 = успех):

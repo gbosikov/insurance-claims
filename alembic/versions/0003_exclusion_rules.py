@@ -36,7 +36,10 @@ CREATE INDEX IF NOT EXISTS idx_exclusion_rules_tenant_scope
 
 
 def upgrade() -> None:
-    op.execute(sa.text(_SQL))
+    from db.migration_utils import split_sql_statements
+    conn = op.get_bind()
+    for statement in split_sql_statements(_SQL):
+        conn.exec_driver_sql(statement)
 
 
 def downgrade() -> None:

@@ -20,6 +20,11 @@ class RiskInfo(BaseModel):
     sublimit:        float | None = None
     # Иерархия рисков: RiskParentId (дочерние делят лимит родителя). None = корневой.
     parent_risk_id:  int | None = None
+    # hasChild из getpolicylist.
+    # Правило ClaimParsing_UNI (верифицировано 2026-06-14):
+    #   Передавать: RiskParentId=0 (корневой) ИЛИ (RiskParentId≠0 AND hasChild=1).
+    #   НЕ передавать: RiskParentId≠0 AND hasChild=0 (чистые листовые).
+    has_child:        int = 0
     # Количественные лимиты (например, 2 профилактических осмотра в год)
     limit_count:      int | None = None   # LimitCount ("" = нет)
     limit_count_left: int | None = None   # LimitCountLeft
@@ -49,6 +54,8 @@ class RisksAndLimits(BaseModel):
     insured_type: str = "employee"
     # Исходный CardNumber для отладки (не используется в бизнес-логике)
     card_number: str = ""
+    # PersonalNumber из matched Object в getpolicylist — для верификации с OCR-документами
+    insured_personal_number: str | None = None
 
 
 class ContractData(BaseModel):

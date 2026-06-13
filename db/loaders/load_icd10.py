@@ -293,6 +293,20 @@ async def _stats() -> None:
     print(f"Корневых узлов:      {row.root_nodes}")
 
 
+async def _main_async(args: argparse.Namespace) -> None:
+    """Единый async entry point — один event loop для всех операций с БД."""
+    if args.stats:
+        await _stats()
+    elif args.file:
+        if not args.file.exists():
+            print(f"Файл не найден: {args.file}")
+            sys.exit(1)
+        if args.skip_if_loaded and await _is_loaded():
+            print("Справочник МКБ-10 уже загружен, пропускаем.")
+            return
+        await _load(args.file, args.only_available, args.encoding)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Загрузка справочника МКБ-10 в локальную БД"
@@ -322,18 +336,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.stats:
-        asyncio.run(_stats())
-    elif args.file:
-        if not args.file.exists():
-            print(f"Файл не найден: {args.file}")
-            sys.exit(1)
-        if args.skip_if_loaded and asyncio.run(_is_loaded()):
-            print("Справочник МКБ-10 уже загружен, пропускаем.")
-            return
-        asyncio.run(_load(args.file, args.only_available, args.encoding))
-    else:
+    if not args.stats and not args.file:
         parser.print_help()
+        return
+
+    asyncio.run(_main_async(args))
 
 
 if __name__ == "__main__":

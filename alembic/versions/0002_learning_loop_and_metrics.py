@@ -26,9 +26,10 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    conn = op.get_bind()
     for filename in LEARNING_LOOP_FILES:
         for statement in read_migration_statements(filename):
-            op.execute(sa.text(statement))
+            conn.exec_driver_sql(statement)
 
 
 def downgrade() -> None:

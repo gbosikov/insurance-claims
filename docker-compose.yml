@@ -50,6 +50,11 @@ services:
       - STORAGE_BUCKET=${STORAGE_BUCKET:-claims-documents-dev}
       - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
       - CORE_API_BASE_URL=${CORE_API_BASE_URL:-http://mock-core}
+      - CORE_API_CLAIMS_BASE_URL=${CORE_API_CLAIMS_BASE_URL:-}
+      - CORE_API_CLAIMS_USERNAME=${CORE_API_CLAIMS_USERNAME:-}
+      - CORE_API_CLAIMS_PASSWORD=${CORE_API_CLAIMS_PASSWORD:-}
+      - CORE_API_CLAIMS_VERIFY_SSL=${CORE_API_CLAIMS_VERIFY_SSL:-false}
+      - CORE_API_SKIP_CLAIMS_SUBMIT=${CORE_API_SKIP_CLAIMS_SUBMIT:-false}
       - CORE_API_KEY=${CORE_API_KEY:-dev-key}
       - SECRET_KEY=${SECRET_KEY}
       - ENVIRONMENT=development
@@ -64,7 +69,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: uvicorn services.api.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn services.api.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/services --reload-dir /app/layers --reload-dir /app/core
 
   # ── Celery Worker ────────────────────────────────────────────────
   worker:
@@ -80,11 +85,17 @@ services:
       - STORAGE_BUCKET=${STORAGE_BUCKET:-claims-documents-dev}
       - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
       - CORE_API_BASE_URL=${CORE_API_BASE_URL:-http://mock-core}
+      - CORE_API_CLAIMS_BASE_URL=${CORE_API_CLAIMS_BASE_URL:-}
+      - CORE_API_CLAIMS_USERNAME=${CORE_API_CLAIMS_USERNAME:-}
+      - CORE_API_CLAIMS_PASSWORD=${CORE_API_CLAIMS_PASSWORD:-}
+      - CORE_API_CLAIMS_VERIFY_SSL=${CORE_API_CLAIMS_VERIFY_SSL:-false}
+      - CORE_API_SKIP_CLAIMS_SUBMIT=${CORE_API_SKIP_CLAIMS_SUBMIT:-false}
       - CORE_API_KEY=${CORE_API_KEY:-dev-key}
       - SECRET_KEY=${SECRET_KEY}
       - ENVIRONMENT=development
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
       - TRANSFORMERS_CACHE=/app/.cache/huggingface
+      - CELERY_WORKER=1
     volumes:
       - ${APPDATA}/gcloud:/root/.config/gcloud:ro
       - .:/app
@@ -107,6 +118,7 @@ services:
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-claims_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-claims}
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
       - SECRET_KEY=${SECRET_KEY}
+      - CELERY_WORKER=1
     volumes:
       - .:/app
     depends_on:

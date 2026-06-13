@@ -44,7 +44,7 @@ class ClaimDecision(BaseModel):
 
     # ── Поля для ClaimParsing_UNI ─────────────────────────────────
     # Заполняются в Decision Engine после маппинга на справочники кор-системы
-    diagnosid:   int | None = None   # DiagnosID из справочника ICD10
+    diagnosid:   str | None = None   # ICD10 код для DiagnosID в ClaimParsing_UNI (например "I10")
     pers_id:     int | None = None   # код провайдера (TODO: нужен справочник провайдеров)
     config_kind: int | None = None   # вид направления из рисков
     # [{RiskID, FinalAmount, ServDate, serviceid, ServName}]

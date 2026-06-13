@@ -61,7 +61,7 @@ class CoreSystemAdapter(ABC):
     async def submit_claim(
         self,
         policy_number: str,
-        diagnosid: int,
+        diagnosid: str,
         event_start_date: str,   # "YYYY-MM-DD"
         event_end_date: str,     # "YYYY-MM-DD"
         pers_id: int,

@@ -22,8 +22,7 @@ CREATE INDEX IF NOT EXISTS idx_providers_cstname_trgm
 -- Полнотекстовый поиск по названию
 CREATE INDEX IF NOT EXISTS idx_providers_fts
     ON providers USING GIN (
-        to_tsvector('english', COALESCE(cstname, '')) ||
-        to_tsvector('simple',  COALESCE(cstname, ''))  -- simple покрывает грузинский
+        (to_tsvector('english', COALESCE(cstname, '')) || to_tsvector('simple', COALESCE(cstname, '')))
     );
 
 -- Только активные провайдеры

@@ -2,6 +2,7 @@
 core/database.py — подключение к PostgreSQL через SQLAlchemy async.
 """
 
+import os
 from collections.abc import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -10,13 +11,29 @@ from core.config import get_settings
 
 settings = get_settings()
 
-engine = create_async_engine(
-    settings.database_url,
-    echo=settings.environment == "development",
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,  # проверяем соединение перед использованием
-)
+# Celery worker вызывает asyncio.run() по одному разу на задачу.
+# Стандартный пул хранит futures, привязанные к первому event loop;
+# при следующем asyncio.run() новый loop их не узнаёт →
+# RuntimeError "Future attached to a different loop".
+# NullPool отключает пулинг: каждый asyncio.run() получает свежее
+# соединение и закрывает его по выходу — никаких межлупных утечек.
+_is_celery = bool(os.environ.get("CELERY_WORKER"))
+
+if _is_celery:
+    from sqlalchemy.pool import NullPool
+    engine = create_async_engine(
+        settings.database_url,
+        echo=settings.environment == "development",
+        poolclass=NullPool,
+    )
+else:
+    engine = create_async_engine(
+        settings.database_url,
+        echo=settings.environment == "development",
+        pool_size=10,
+        max_overflow=20,
+        pool_pre_ping=True,
+    )
 
 AsyncSessionLocal = async_sessionmaker(
     engine,

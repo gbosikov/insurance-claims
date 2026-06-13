@@ -183,24 +183,12 @@ async def _ocr_single_attempt(image_bytes: bytes, doc_type: DocType) -> list[Tex
         )
 
 
-async def ocr_document(
-    doc: ClaimDocument,
-    storage: StorageClient,
-    db: AsyncSession,
-    tenant_id: UUID,
-) -> OCRResult:
+async def _recognize_document(doc: ClaimDocument, storage: StorageClient) -> "_OCRRawData":
     """
-    OCR одного документа с retry-логикой.
-
-    1. Скачать обработанное изображение
-    2. Вызвать Google API согласно стратегии
-    3. Retry: MAX_RETRIES=3, backoff=[1,3,10] сек
-    4. Пометить блоки с confidence < threshold
-    5. Сохранить результат в ClaimDocument
-    6. Запись в audit_log
+    Только вызов Google Vision API (без записи в БД).
+    Безопасно запускать параллельно через asyncio.gather.
     """
     with AuditTimer() as timer:
-        # Скачиваем обработанное изображение (preprocessed_path приоритетнее)
         path = doc.preprocessed_path or doc.storage_path
         image_bytes = await storage.download(path)
 
@@ -226,76 +214,109 @@ async def ocr_document(
         if last_error is not None:
             raise OCRFailedError(doc_id=str(doc.id), reason=str(last_error))
 
-        # Вычисляем средний confidence
-        if blocks:
-            avg_confidence = sum(b.confidence for b in blocks) / len(blocks)
-            min_confidence = min(b.confidence for b in blocks)
-        else:
-            avg_confidence = 0.0
-            min_confidence = 0.0
+    avg_confidence = sum(b.confidence for b in blocks) / len(blocks) if blocks else 0.0
+    min_confidence = min(b.confidence for b in blocks) if blocks else 0.0
+    low_conf_indices = [i for i, b in enumerate(blocks) if b.confidence < settings.ocr_min_confidence]
+    full_text = "\n".join(b.text for b in blocks if b.text.strip())
+    strategy = OCR_STRATEGIES.get(doc.doc_type, "vision_text_detection")
 
-        # Блоки с низким confidence: количество + индексы (для локализации проблем)
-        low_conf_indices = [
-            i for i, b in enumerate(blocks) if b.confidence < settings.ocr_min_confidence
-        ]
-        low_conf_blocks = len(low_conf_indices)
+    return _OCRRawData(
+        doc=doc,
+        blocks=blocks,
+        full_text=full_text,
+        avg_confidence=avg_confidence,
+        min_confidence=min_confidence,
+        low_conf_indices=low_conf_indices,
+        strategy=strategy,
+        duration_ms=timer.duration_ms,
+    )
 
-        # Полный текст — конкатенация блоков
-        full_text = "\n".join(b.text for b in blocks if b.text.strip())
 
-        strategy = OCR_STRATEGIES.get(doc.doc_type, "vision_text_detection")
+class _OCRRawData:
+    """Промежуточный результат OCR до записи в БД."""
+    __slots__ = ("doc", "blocks", "full_text", "avg_confidence", "min_confidence",
+                 "low_conf_indices", "strategy", "duration_ms")
 
-        # Сохраняем в БД: текст + агрегат + per-block данные (миграция 009)
-        doc.ocr_text = full_text
-        doc.ocr_confidence = avg_confidence
-        doc.ocr_blocks = {
-            "strategy": strategy,
-            "low_confidence_blocks": low_conf_blocks,
-            "blocks": [
-                {
-                    "text": b.text[:settings.ocr_block_text_max_chars],
-                    "confidence": round(b.confidence, 3),
-                    "bbox": b.bounding_box,
-                }
-                for b in blocks
-            ],
-        }
-        await db.flush()
+    def __init__(self, doc, blocks, full_text, avg_confidence, min_confidence,
+                 low_conf_indices, strategy, duration_ms):
+        self.doc = doc
+        self.blocks = blocks
+        self.full_text = full_text
+        self.avg_confidence = avg_confidence
+        self.min_confidence = min_confidence
+        self.low_conf_indices = low_conf_indices
+        self.strategy = strategy
+        self.duration_ms = duration_ms
+
+
+async def _save_ocr_result(raw: "_OCRRawData", db: AsyncSession, tenant_id: UUID) -> OCRResult:
+    """
+    Запись результата OCR в БД (последовательно — не вызывать из gather).
+    """
+    doc = raw.doc
+    low_conf_blocks = len(raw.low_conf_indices)
+
+    doc.ocr_text = raw.full_text
+    doc.ocr_confidence = raw.avg_confidence
+    doc.ocr_blocks = {
+        "strategy": raw.strategy,
+        "low_confidence_blocks": low_conf_blocks,
+        "blocks": [
+            {
+                "text": b.text[:settings.ocr_block_text_max_chars],
+                "confidence": round(b.confidence, 3),
+                "bbox": b.bounding_box,
+            }
+            for b in raw.blocks
+        ],
+    }
+    await db.flush()
 
     await write_audit_entry(
         db,
         claim_id=doc.claim_id,
         tenant_id=tenant_id,
         step="ocr",
-        input_data={"doc_id": str(doc.id), "doc_type": doc.doc_type.value, "strategy": strategy},
+        input_data={"doc_id": str(doc.id), "doc_type": doc.doc_type.value, "strategy": raw.strategy},
         output_data={
-            "avg_confidence": round(avg_confidence, 3),
-            "min_confidence": round(min_confidence, 3),
-            "blocks_count": len(blocks),
+            "avg_confidence": round(raw.avg_confidence, 3),
+            "min_confidence": round(raw.min_confidence, 3),
+            "blocks_count": len(raw.blocks),
             "low_confidence_blocks": low_conf_blocks,
-            "low_confidence_block_indices": low_conf_indices,
-            "text_length": len(full_text),
+            "low_confidence_block_indices": raw.low_conf_indices,
+            "text_length": len(raw.full_text),
         },
-        confidence={"avg": round(avg_confidence, 3), "min": round(min_confidence, 3)},
-        duration_ms=timer.duration_ms,
+        confidence={"avg": round(raw.avg_confidence, 3), "min": round(raw.min_confidence, 3)},
+        duration_ms=raw.duration_ms,
     )
 
     log.info(
         "ocr_completed",
         doc_id=str(doc.id),
-        avg_confidence=round(avg_confidence, 3),
-        blocks=len(blocks),
+        avg_confidence=round(raw.avg_confidence, 3),
+        blocks=len(raw.blocks),
     )
 
     return OCRResult(
         doc_id=doc.id,
         doc_type=doc.doc_type,
-        full_text=full_text,
-        blocks=blocks,
-        avg_confidence=avg_confidence,
+        full_text=raw.full_text,
+        blocks=raw.blocks,
+        avg_confidence=raw.avg_confidence,
         low_confidence_blocks=low_conf_blocks,
-        strategy_used=strategy,
+        strategy_used=raw.strategy,
     )
+
+
+async def ocr_document(
+    doc: ClaimDocument,
+    storage: StorageClient,
+    db: AsyncSession,
+    tenant_id: UUID,
+) -> OCRResult:
+    """OCR одного документа (Vision API + запись в БД)."""
+    raw = await _recognize_document(doc, storage)
+    return await _save_ocr_result(raw, db, tenant_id)
 
 
 async def ocr_all_documents(
@@ -305,11 +326,16 @@ async def ocr_all_documents(
     tenant_id: UUID,
 ) -> list[OCRResult]:
     """
-    Параллельный OCR всех документов заявки через asyncio.gather.
-    При ошибке одного документа — OCRFailedError пропагируется выше.
+    OCR всех документов заявки.
+    Google Vision вызывается параллельно (медленные внешние запросы).
+    Запись в БД выполняется последовательно (asyncpg не поддерживает
+    конкурентные операции на одном соединении).
     """
-    tasks = [
-        ocr_document(doc, storage, db, tenant_id)
-        for doc in documents
-    ]
-    return await asyncio.gather(*tasks)
+    raw_results = await asyncio.gather(*[
+        _recognize_document(doc, storage) for doc in documents
+    ])
+    results = []
+    for raw in raw_results:
+        result = await _save_ocr_result(raw, db, tenant_id)
+        results.append(result)
+    return results

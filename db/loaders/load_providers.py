@@ -27,7 +27,7 @@ BATCH_SIZE = 500  # строк за один INSERT
 # Маппинг ожидаемых колонок → возможные варианты написания в файле
 COLUMN_ALIASES: dict[str, list[str]] = {
     "customer_id": ["customer_id", "CUSTOMER_ID", "customer", "CUSTOMER", "persid", "PERSID", "provider_id", "PROVIDER_ID"],
-    "cstname":     ["cstname", "CSTNAME", "CstName", "name", "NAME", "clinic_name", "CLINIC_NAME"],
+    "cstname":     ["cstname", "CSTNAME", "CstName", "fullname", "FULLNAME", "FullName", "name", "NAME", "clinic_name", "CLINIC_NAME"],
     "taxpayer":    ["taxpayer", "TAXPAYER", "TaxPayer", "inn", "INN", "tin", "TIN"],
 }
 
@@ -255,6 +255,20 @@ async def _stats() -> None:
     print(f"С ИНН:                 {row.with_taxpayer}")
 
 
+async def _main_async(args: argparse.Namespace) -> None:
+    """Единый async entry point — один event loop для всех операций с БД."""
+    if args.stats:
+        await _stats()
+    elif args.file:
+        if not args.file.exists():
+            print(f"Файл не найден: {args.file}")
+            sys.exit(1)
+        if args.skip_if_loaded and await _is_loaded():
+            print("Справочник провайдеров уже загружен, пропускаем.")
+            return
+        await _load(args.file, args.encoding)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Загрузка справочника провайдеров в локальную БД"
@@ -279,18 +293,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.stats:
-        asyncio.run(_stats())
-    elif args.file:
-        if not args.file.exists():
-            print(f"Файл не найден: {args.file}")
-            sys.exit(1)
-        if args.skip_if_loaded and asyncio.run(_is_loaded()):
-            print("Справочник провайдеров уже загружен, пропускаем.")
-            return
-        asyncio.run(_load(args.file, args.encoding))
-    else:
+    if not args.stats and not args.file:
         parser.print_help()
+        return
+
+    asyncio.run(_main_async(args))
 
 
 if __name__ == "__main__":

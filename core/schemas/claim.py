@@ -27,6 +27,10 @@ class DiagnoisItem(BaseModel):
 class LineItem(BaseModel):
     description: str
     amount:      float
+    # Источник строки: 'receipt_1', 'receipt_2', ..., 'form_100'.
+    # Используется для аудита и ServName в ClaimParsing_UNI.
+    # НЕ добавляется в description — ServName должен быть чистым.
+    doc_source:  str | None = None
 
 
 class EventData(BaseModel):
@@ -53,6 +57,9 @@ class CrossDocForm100(BaseModel):
     date:        str | None = None          # дата события, YYYY-MM-DD
     institution: str | None = None
     diagnoses:   list[str] = Field(default_factory=list)  # коды МКБ-10
+    # Услуги/процедуры, явно перечисленные в форме 100 (без сумм).
+    # Используются для кросс-проверки с чеками.
+    services:    list[str] = Field(default_factory=list)
     total:       float | None = None
 
 
@@ -62,10 +69,20 @@ class CrossDocIdDocument(BaseModel):
     personal_id: str | None = None
 
 
+class CrossDocReceiptLineItem(BaseModel):
+    """Строка услуги из одного конкретного чека."""
+    description:    str
+    amount:         float
+    receipt_number: int | None = None  # номер чека в пакете (1, 2, 3…)
+
+
 class CrossDocReceipt(BaseModel):
     date:        str | None = None
     institution: str | None = None
     diagnoses:   list[str] = Field(default_factory=list)
+    # Детализированный список услуг из всех чеков с номером чека.
+    # Используется для сверки с form_100.services.
+    line_items:  list[CrossDocReceiptLineItem] = Field(default_factory=list)
     total:       float | None = None
 
 
@@ -109,7 +126,9 @@ class ClaimResponse(BaseModel):
 
 
 class ClaimStatusResponse(BaseModel):
-    claim_id:           UUID
+    # validation_alias="id" — читает obj.id из SQLAlchemy-модели,
+    # но сериализует как "claim_id" в JSON-ответе.
+    claim_id:           UUID = Field(validation_alias="id")
     status:             str
     submission_date:    datetime
     event_date:         date | None = None
@@ -121,4 +140,4 @@ class ClaimStatusResponse(BaseModel):
     routing_reason:     str | None = None
     processed_at:       datetime | None = None
 
-    model_config = {"from_attributes": True}
+    model_config = {"from_attributes": True, "populate_by_name": True}

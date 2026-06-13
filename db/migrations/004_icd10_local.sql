@@ -26,9 +26,7 @@ CREATE INDEX IF NOT EXISTS idx_icd10_pid
 -- Полнотекстовый поиск по трём языкам
 CREATE INDEX IF NOT EXISTS idx_icd10_fts
     ON icd10_diagnoses USING gin (
-        to_tsvector('russian', COALESCE(name_r, '')) ||
-        to_tsvector('simple',  COALESCE(name_g, '')) ||
-        to_tsvector('english', COALESCE(name_e, ''))
+        (to_tsvector('russian', COALESCE(name_r, '')) || to_tsvector('simple', COALESCE(name_g, '')) || to_tsvector('english', COALESCE(name_e, '')))
     );
 
 -- Только активные

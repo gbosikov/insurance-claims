@@ -34,6 +34,11 @@ db/data/*.xls
 # Claude Code local settings (personal, not for sharing)
 .claude/
 
+# Celery Beat runtime schedule
+celerybeat-schedule
+celerybeat-schedule.db
+celerybeat.pid
+
 # Docker
 *.log
 

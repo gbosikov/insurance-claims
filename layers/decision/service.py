@@ -34,6 +34,7 @@ from core.schemas.contract import ContractChunkSchema
 from core.schemas.core_api import ICD10Item, ProviderInfo, RisksAndLimits
 from core.schemas.decision import ClaimDecision, DiagnosisDecisionSchema, LineItemDecisionSchema
 from core.tenant_config import get_tenant_config_float
+from layers.core_adapter.risk_matcher import match_risks
 from layers.decision.exclusion_checker import (
     ExclusionResult,
     apply_wording_carveout,
@@ -580,18 +581,23 @@ def apply_carveout_exclusion_logic(
 
 # ── Маппинг на справочники кор-системы ───────────────────────────────
 
-def find_diagnosid(icd10_code: str, icd10_list: list[ICD10Item]) -> int | None:
-    """Найти DiagnosID по коду ICD10 (точное совпадение, без учёта регистра)."""
+def find_diagnosid(icd10_code: str, icd10_list: list[ICD10Item]) -> str | None:
+    """
+    DiagnosID для ClaimParsing_UNI = ICD10 код строкой (например "I10").
+    Проверяем наличие кода в справочнике; точное совпадение → возвращаем код,
+    prefix-fallback → возвращаем код из справочника (например J06 для J06.9).
+    """
     code_upper = icd10_code.upper().strip()
     for item in icd10_list:
         if item.code.upper().strip() == code_upper:
-            return item.diagnosid
+            return item.code
     # Fallback: совпадение по префиксу (J06 совпадёт с J06.9)
     prefix = code_upper.split(".")[0]
     for item in icd10_list:
         if item.code.upper().startswith(prefix):
-            return item.diagnosid
-    return None
+            return item.code
+    # Код не найден в справочнике — возвращаем as-is (кор-система проверит)
+    return icd10_code if icd10_code.strip() else None
 
 
 def build_risks_list(
@@ -828,6 +834,8 @@ async def _second_pass_diagnosis(
 Вызови инструмент make_claim_decision: в diagnoses верни решение ТОЛЬКО по этому диагнозу,
 с цитатой из договора в contract_reference. Остальные поля заполни нулями/пустыми."""
 
+    sp_input_tokens = 0
+    sp_output_tokens = 0
     try:
         response = await client.messages.create(
             model=settings.claude_model,
@@ -838,6 +846,8 @@ async def _second_pass_diagnosis(
             tool_choice={"type": "tool", "name": "make_claim_decision"},
             messages=[{"role": "user", "content": prompt}],
         )
+        sp_input_tokens = response.usage.input_tokens
+        sp_output_tokens = response.usage.output_tokens
     except anthropic.APIError as exc:
         log.warning("second_pass_failed", claim_id=str(claim_id), error=str(exc))
         return False
@@ -866,8 +876,18 @@ async def _second_pass_diagnosis(
         claim_id=claim_id,
         tenant_id=tenant_id,
         step="decision_second_pass",
-        input_data={"icd10_code": target.icd10_code, "before": before},
-        output_data={"after": target.model_dump()},
+        input_data={
+            "icd10_code": target.icd10_code,
+            "before": before,
+            "prompt_chars": len(prompt),
+            "user_prompt": prompt,
+        },
+        output_data={
+            "after": target.model_dump(),
+            "claude_raw_response": tool_block.input,
+            "input_tokens": sp_input_tokens,
+            "output_tokens": sp_output_tokens,
+        },
         prompt_version=PROMPT_VERSION,
         model_version=settings.claude_model,
     )
@@ -895,6 +915,7 @@ async def make_decision(
     contract_chunks: list[ContractChunkSchema],
     submission_date: date,
     db: AsyncSession,
+    form_100_ocr_text: str = "",
 ) -> ClaimDecision:
     """
     Принимает решение по заявке.
@@ -1209,7 +1230,11 @@ async def make_decision(
                 create_kwargs["tool_choice"] = {"type": "tool", "name": "make_claim_decision"}
 
             response = await client.messages.create(**create_kwargs)
+            claude_input_tokens = response.usage.input_tokens
+            claude_output_tokens = response.usage.output_tokens
         except anthropic.APIError as e:
+            claude_input_tokens = 0
+            claude_output_tokens = 0
             log.error("decision_claude_error", claim_id=str(claim_id), error=str(e))
             return ClaimDecision(
                 claim_id=claim_id,
@@ -1228,6 +1253,28 @@ async def make_decision(
             )
 
         tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+        if tool_block is None and use_thinking:
+            # thinking + tool_choice=auto → Claude может вернуть только текст.
+            # Повторный вызов без thinking с принудительным tool_choice.
+            log.warning("decision_thinking_no_tool_block_retry", claim_id=str(claim_id))
+            try:
+                retry_response = await client.messages.create(
+                    model=settings.claude_model,
+                    max_tokens=settings.claude_decision_max_tokens,
+                    temperature=settings.claude_decision_temperature,
+                    system=DECISION_SYSTEM_PROMPT,
+                    tools=[DECISION_TOOL],
+                    tool_choice={"type": "tool", "name": "make_claim_decision"},
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+                claude_input_tokens += retry_response.usage.input_tokens
+                claude_output_tokens += retry_response.usage.output_tokens
+                tool_block = next(
+                    (b for b in retry_response.content if b.type == "tool_use"), None
+                )
+            except anthropic.APIError as e:
+                log.error("decision_retry_claude_error", claim_id=str(claim_id), error=str(e))
+
         if tool_block is None:
             return ClaimDecision(
                 claim_id=claim_id,
@@ -1366,7 +1413,7 @@ async def make_decision(
 
         # ── Маппинг на справочники кор-системы ───────────────────
         # DiagnosID: берём из первого диагноза с покрытием
-        diagnosid: int | None = None
+        diagnosid: str | None = None
         for diag in diagnoses:
             found = find_diagnosid(diag.icd10_code, icd10_list)
             if found is not None:
@@ -1376,8 +1423,16 @@ async def make_decision(
         if diagnosid is None and extraction.event.diagnoses:
             diagnosid = find_diagnosid(extraction.event.diagnoses[0].icd10_code, icd10_list)
 
-        # risks_list и config_kind из одобренных позиций
-        risks_list, config_kind = build_risks_list(line_items, risks_limits, extraction.event.date)
+        # risks_list: детерминированный матчер рисков (risk_matcher.py)
+        # FinalAmount = claimed amount (не approved), config_kind=2 (акт возмещения)
+        risks_list, risk_match_fallback = match_risks(
+            line_items=extraction.event.line_items,
+            risks=risks_limits.risks,
+            event_date=extraction.event.date,
+            form_100_text=form_100_ocr_text,
+            config_kind=2,
+        )
+        config_kind = 2
 
         # PersID: ищем по названию учреждения из документов
         pers_id = find_pers_id(extraction.event.institution, providers)
@@ -1394,12 +1449,14 @@ async def make_decision(
         if qa_sample:
             log.info("stochastic_qa_sample_triggered", claim_id=str(claim_id))
 
-        # Причина ручной проверки: QA-выборка > ответ Claude > coherence > суб-лимиты
+        # Причина ручной проверки: QA-выборка > ответ Claude > coherence > суб-лимиты > risk fallback
         manual_review_reason = raw.get("manual_review_reason")
         if coherence_flags and not manual_review_reason:
             manual_review_reason = "medical_coherence: " + "; ".join(coherence_flags[:3])
         if sublimit_violations and not manual_review_reason:
             manual_review_reason = "sublimit_exceeded: " + "; ".join(sublimit_violations[:3])
+        if risk_match_fallback and not manual_review_reason:
+            manual_review_reason = "risk_match_fallback: подобран риск без маркера свободного выбора"
         if qa_sample:
             manual_review_reason = "stochastic_qa_sample"
 
@@ -1416,6 +1473,7 @@ async def make_decision(
                 or bool(fraud_flags)
                 or bool(coherence_flags)
                 or bool(sublimit_violations)
+                or risk_match_fallback
                 or qa_sample
             ),
             manual_review_reason=manual_review_reason,
@@ -1443,6 +1501,15 @@ async def make_decision(
             "rag_chunks_count": len(contract_chunks),
             "risks_count":     len(risks_limits.risks),
             "service_urgency": extraction.event.service_urgency,
+            "model": settings.claude_model,
+            "max_tokens": settings.claude_decision_max_tokens,
+            "temperature": settings.claude_decision_temperature,
+            "use_thinking": use_thinking,
+            "use_cot": use_cot,
+            "system_prompt_chars": len(DECISION_SYSTEM_PROMPT),
+            "user_prompt_chars": len(user_prompt),
+            # Полный промпт (данные заявки + договор + риски) для отладки
+            "user_prompt": user_prompt,
         },
         output_data={
             "status":          decision.status,
@@ -1456,6 +1523,10 @@ async def make_decision(
             "config_kind":     decision.config_kind,
             "summary":         decision.summary[:300],
             "qa_sample":       qa_sample,
+            "input_tokens":    claude_input_tokens,
+            "output_tokens":   claude_output_tokens,
+            # Сырой ответ Claude (tool_use input) — до применения CARVEOUT / POSITIVE LIST / суб-лимитов
+            "claude_raw_response": raw,
             # Шаги 21/23/26
             "coherence_flags": coherence_flags,
             "sublimit_violations": sublimit_violations,

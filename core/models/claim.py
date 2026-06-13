@@ -78,7 +78,7 @@ class ClaimDocument(Base):
     id                 = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     claim_id           = Column(UUID(as_uuid=True), ForeignKey("claims.id", ondelete="CASCADE"), nullable=False)
     tenant_id          = Column(UUID(as_uuid=True), nullable=False)
-    doc_type           = Column(Enum(DocType, name="doc_type"), nullable=False)
+    doc_type           = Column(Enum(DocType, name="doc_type", values_callable=lambda x: [e.value for e in x]), nullable=False)
     # filename_hint | ocr_rules | operator
     doc_type_source    = Column(String(30), nullable=False, default="filename_hint")
     # TRUE когда тип верифицирован (auto_approved или оператором) → годится для обучения

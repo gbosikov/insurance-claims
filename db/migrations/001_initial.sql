@@ -120,9 +120,7 @@ CREATE INDEX idx_contract_chunks_lookup
 -- simple:  без стемминга (покрывает грузинский)
 CREATE INDEX idx_contract_chunks_fts
     ON contract_chunks USING gin (
-        to_tsvector('russian', content) ||
-        to_tsvector('english', content) ||
-        to_tsvector('simple',  content)
+        (to_tsvector('russian', content) || to_tsvector('english', content) || to_tsvector('simple', content))
     );
 
 -- ── ЗАЯВКИ ────────────────────────────────────────────────────────

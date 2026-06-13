@@ -85,6 +85,9 @@ insurance-claims/
 │   │   └── training_exporter.py ← экспорт подтверждённых примеров для обучения ML
 │   ├── rag/                     ← слой 5 (indexer.py + searcher.py + embedder.py)
 │   ├── core_adapter/            ← слой 6
+│   │   ├── rest_adapter.py      ← LiteMed REST API + ClaimParsing_UNI + MockCoreAdapter
+│   │   ├── risk_matcher.py      ← детерминированный выбор RiskID для ClaimParsing_UNI
+│   │   └── file_helpers.py      ← base64-кодирование документов, fkind-маппинг
 │   ├── decision/                ← слой 7
 │   │   ├── service.py           ← принятие решения (детерминированные правила + Claude)
 │   │   └── icd10_enricher.py   ← обогащение диагнозов иерархией из локального справочника
@@ -107,12 +110,12 @@ insurance-claims/
 │   │   ├── load_icd10.py        ← загрузчик справочника МКБ-10 из CSV/Excel
 │   │   └── load_providers.py    ← загрузчик справочника провайдеров из CSV/Excel
 │   └── data/
-│       ├── ICD10.csv            ← справочник МКБ-10 (UTF-8, ~12 000 записей)
+│       ├── ICD10.csv            ← справочник МКБ-10 (UTF-8, 12 435 записей, 3.6 МБ)
 │       │                           Колонки: ID, NAME_A (KA), NAME_E, NAME_R, AVAILABLE, PID, EXTCOD
-│       │                           Не в git (.gitignore). Загружается автоматически при старте API.
+│       │                           В репозитории. Загружается entrypoint.sh при старте API (--skip-if-loaded).
 │       └── providers.csv        ← справочник провайдеров (клиник)
 │                                   Колонки: CUSTOMER (PersID), CSTNAME (имя), TAXPAYER (ИНН)
-│                                   Не в git. Загружается автоматически при старте API.
+│                                   НЕ в git. Положить файл в db/data/ перед развёртыванием.
 │
 └── tests/
     ├── unit/
@@ -328,13 +331,20 @@ STORAGE_BUCKET=claims-documents-dev
 STORAGE_PROVIDER=gcs          # gcs | s3 | local (local только для dev)
 
 # ── Кор-система Lite GROUP ────────────────────────────────────────
-# Аутентификация: POST /api/User/authenticate → JWT токен (кэшируется)
-CORE_API_BASE_URL=http://192.168.0.249:8077
+# LiteMed API (данные полисов)
+CORE_API_BASE_URL=http://192.168.0.249:8077          # ТЕСТ; ПРОД: http://192.168.0.250:1010
+CORE_API_AUTH_URL=                                    # пусто = CORE_API_BASE_URL; ПРОД: http://10.0.204.10:1010
 CORE_API_USERNAME=webplatform
 CORE_API_PASSWORD=core_api_password
 CORE_API_TIMEOUT=10
 CORE_API_RETRY=3
-# Токен кэшируется в Redis, обновляется автоматически при истечении
+# Схема Authorization: "Bearer" (дефолт) или "" (сырой токен — если 401 на проде)
+CORE_API_AUTH_SCHEME=Bearer
+# Claims API (отдельный сервис, другой порт, HTTPS, самоподписанный сертификат)
+CORE_API_CLAIMS_BASE_URL=                            # пусто = CORE_API_BASE_URL; ПРОД: https://192.168.0.250:7777
+CORE_API_CLAIMS_USERNAME=                            # пусто = CORE_API_USERNAME
+CORE_API_CLAIMS_PASSWORD=                            # пусто = CORE_API_PASSWORD
+# Токены кэшируются в Redis, обновляются автоматически при истечении
 
 # ── Конфигурация системы ──────────────────────────────────────────
 CONFIDENCE_AUTO_APPROVE=0.85
@@ -1391,17 +1401,19 @@ Lite GROUP состоит из **двух независимых API**:
 1. LiteMed API — данные полисов (клиентский портал)
    ТЕСТ Auth:  POST http://192.168.0.249:8077/api/User/authenticate
    ТЕСТ Data:  POST http://192.168.0.249:8077/api/Client/getpolicylist
-   ПРОД Auth:  POST http://10.0.204.10:1010/api/User/authenticate
-   ПРОД Data:  POST http://192.168.0.250:1010/api/Client/getpolicylist
+   ПРОД Auth:  POST http://10.0.204.10:1010/api/User/authenticate   (CORE_API_AUTH_URL)
+   ПРОД Data:  POST http://192.168.0.250:1010/api/Client/getpolicylist   (CORE_API_BASE_URL)
    Header: Authorization: Bearer <token>
    Body:   {"personalnumber": "...", "STATE": "0", "schedule": "1"}
-   Ответ:  {"PolicyList": "" | "[{...}]"}  ← строка (пустая или JSON)
+   Ответ:  {"PolicyList": {"Policy": [...]}}  ← ОБЪЕКТ (верифицировано 2026-06-11)
+            пустой список = PolicyList.Policy отсутствует или []
 
-2. Claims API — создание убытка
-   ТЕСТ:  POST http://192.168.0.249:8077/LiteApi/LiteServiceJSON
-   ПРОД:  POST http://192.168.0.250:1010/LiteApi/LiteServiceJSON
+2. Claims API — создание убытка (ОТДЕЛЬНЫЙ СЕРВИС, другой порт, HTTPS)
+   ТЕСТ:  POST https://192.168.0.249:4443/LiteApi/LiteServiceJSON  (CORE_API_CLAIMS_BASE_URL)
+   ПРОД:  POST https://192.168.0.250:7777/LiteApi/LiteServiceJSON
+   Auth:  POST {CORE_API_CLAIMS_BASE_URL}/LiteApi/LiteAuthJSON  (своя аутентификация)
    Body:  {"METHODNAME": "ClaimParsing_UNI", "XML_DATA": {...}}
-   Header: Authorization: Bearer <token>  (тот же токен)
+   SSL:   самоподписанный сертификат → verify_ssl=False (core_api_claims_verify_ssl)
 ```
 
 **Ключевые особенности:**
@@ -1409,20 +1421,22 @@ Lite GROUP состоит из **двух независимых API**:
 - Токен кэшируется в Redis (TTL=1ч), in-memory fallback при недоступности Redis
 - При 401 — однократный refresh + повтор (не считается как отдельная попытка retry)
 - **personalNumber** (из OCR-документов) — ключ для `getpolicylist`, не `policyNumber`
-- `PolicyList` приходит как строка — может быть пустой `""` или JSON-массивом `"[{...}]"`
+- `PolicyList` приходит как **объект** `{"Policy": [...]}` — НЕ строка (верифицировано 2026-06-11)
+- Claims API — отдельный HTTPS-сервис (другой порт, своя аутентификация через `/LiteApi/LiteAuthJSON`)
 
 ### Настройка URL (config.py / .env)
 
 ```python
 # ТЕСТ (дефолты):
-core_api_base_url      = "http://192.168.0.249:8077"  # LiteMed data
-core_api_auth_url      = ""    # пусто = использовать core_api_base_url
-core_api_claims_base_url = ""  # пусто = использовать core_api_base_url
+core_api_base_url        = "http://192.168.0.249:8077"   # LiteMed data + auth
+core_api_auth_url        = ""     # пусто = core_api_base_url
+core_api_claims_base_url = ""     # пусто = core_api_base_url (для тест/mock)
+                                  # ПРОД: https://192.168.0.250:7777 (отдельный HTTPS)
 
 # ПРОД (.env):
-# CORE_API_BASE_URL=http://192.168.0.250:1010
-# CORE_API_AUTH_URL=http://10.0.204.10:1010
-# CORE_API_CLAIMS_BASE_URL=  # пусто (= CORE_API_BASE_URL — тот же сервер)
+# CORE_API_BASE_URL=http://192.168.0.250:1010          # LiteMed data
+# CORE_API_AUTH_URL=http://10.0.204.10:1010            # LiteMed auth (другой сервер)
+# CORE_API_CLAIMS_BASE_URL=https://192.168.0.250:7777  # Claims API (HTTPS, другой порт)
 ```
 
 ### Методы кор-системы (реализованы в rest_adapter.py)
@@ -1504,7 +1518,7 @@ FKIND_MAP = {
     освобождён от периода ожидания → bypass Шага 23)
   → InsuranceTypeList.InsuranceType (медицинский TypeID=23, настройка
     core_api_medical_type_ids; Amount = страховая сумма/annual_limit)
-  → RiskList.Risk: RiskId / RiskParentId (иерархия) / RiskName /
+  → RiskList.Risk: RiskId / RiskParentId / hasChild / RiskName /
     LimitAmount (= суб-лимит) / LimitAmountLeft (остаток) /
     LinitPercent (% покрытия — ОПЕЧАТКА В САМОМ API) /
     LimitCount / LimitCountLeft (количественные лимиты)
@@ -1519,6 +1533,30 @@ FKIND_MAP = {
     схема настраивается (core_api_auth_scheme, дефолт "Bearer";
     при 401 на проде выставить CORE_API_AUTH_SCHEME="")
   - текст договора в ответе ОТСУТСТВУЕТ (ClauseList="" в примере)
+
+ПРАВИЛА ВЫБОРА РИСКА ДЛЯ ClaimParsing_UNI (верифицированы 2026-06-14):
+
+1. Допустимые RiskId для передачи в RisksList:
+   ДОПУСТИМО:   RiskParentId=0 (корневой риск)
+   ДОПУСТИМО:   RiskParentId≠0 AND hasChild=1 (промежуточный — есть дочерние)
+   ЗАПРЕЩЕНО:   RiskParentId≠0 AND hasChild=0 (чистый листовой — кор отвергает)
+   Реализовано: layers/core_adapter/risk_matcher.py → _select_best_risk()
+     valid_risks = [r for r in risks if r.parent_risk_id is None or r.has_child == 1]
+
+2. Если у выбранного риска LimitAmount=0 — его фактический остаток берётся
+   у родителя (RiskParentId → тот же список рисков → LimitAmountLeft родителя).
+   Реализовано: rest_adapter.py → после парсинга всех рисков, до возврата RisksAndLimits.
+   Пример (полис OMM 200084/1):
+     102065 (ამბულატ. მომს., root, LimitAmount=4000, LimitAmountLeft=3341.5)
+       └── 102109 (გეგმ. ამბ. თავ. არჩ., hasChild=1, LimitAmount=0)
+             → remaining_limit = 3341.5 (от родителя 102065)
+       └── 114637 (გეგმ. ამბ. ოჯ. ექ., hasChild=1, LimitAmount=4000, остаток=3341.5)
+
+3. Приоритет выбора риска для ConfigKind=2 (акт возмещения, амбулатория):
+   a) Категория (ამბულატ) + маркер свободного выбора (თავისუფალი არჩევანი /
+      მიმართვის გარეშე) + remaining > 0 → is_exact=True
+   b) Категория без маркера → is_exact=False → needs_manual_review
+   c) Любой допустимый с остатком → fallback → needs_manual_review
 ```
 
 ### Открытые вопросы по кор-системе
@@ -2579,15 +2617,30 @@ pytest-httpx==0.30.0
            - Данные: POST /api/Client/getpolicylist (personalNumber из OCR → PolicyList)
              PolicyList приходит как строка: "" или "[{...}]" — safe JSON parsing
            - ClaimParsing_UNI: POST {CORE_API_CLAIMS_BASE_URL}/LiteApi/LiteServiceJSON
-             ТЕСТ: http://192.168.0.249:8077  ПРОД: http://192.168.0.250:1010
-           - Auth-сервер ПРОД: http://10.0.204.10:1010 → CORE_API_AUTH_URL в .env
-           - CORE_API_AUTH_URL / CORE_API_CLAIMS_BASE_URL добавлены в config.py и .env.example
+             ТЕСТ: https://192.168.0.249:4443  ПРОД: https://192.168.0.250:7777  (HTTPS, отдельный порт)
+             Claims API имеет собственную аутентификацию: POST /LiteApi/LiteAuthJSON
+           - Auth-сервер LiteMed ПРОД: http://10.0.204.10:1010 → CORE_API_AUTH_URL в .env
+           - CORE_API_AUTH_URL / CORE_API_CLAIMS_BASE_URL / CORE_API_CLAIMS_USERNAME/PASSWORD добавлены
            - fkind подтверждены: form_100=11, doctor_prescription=12, receipt=14 (id→11 fallback)
            - ConfigKind: 2=акт возмещения (дефолт); 1=направление, 3=гарантийное письмо
            - get_icd10_list() → [] (LiteMed не предоставляет; DiagnosID из icd10_enricher)
            - get_providers() → [] (LiteMed не предоставляет; PersID=0 fallback)
            - personalNumber из extraction.insured.personal_id передаётся через tasks.py
            - 109 тестов зелёных; conftest.py mock_db исправлен (scalars().all() chain)
+
+✅ Шаг 16а: Правила выбора риска ClaimParsing_UNI (верифицировано 2026-06-14 на реальном API):
+           1. ДОПУСТИМЫЕ риски для RisksList:
+              RiskParentId=0 (корневой) ИЛИ (RiskParentId≠0 AND hasChild=1) (промежуточный).
+              Чистые листовые (RiskParentId≠0 AND hasChild=0) кор-система отвергает.
+              Файл: layers/core_adapter/risk_matcher.py → valid_risks вместо leaf_risks.
+           2. PARENT LIMIT RULE: если LimitAmount=0 у выбранного риска →
+              remaining_limit берётся у родителя (RiskParentId → его LimitAmountLeft).
+              Реализовано в rest_adapter.py после парсинга всех рисков (model_copy).
+              Лог: risk_limit_inherited_from_parent (risk_id, parent_risk_id, inherited_remaining).
+           3. ServName в RisksList = чистое название услуги БЕЗ суффиксов типа "— чек 1".
+              doc_source в LineItem отслеживает источник внутри системы (не попадает в кор).
+           4. Верифицированный результат: RiskID=102109 (გეგმ. ამბ. თავ. არჩ., hasChild=1)
+              с inherited_remaining=3341.5 → status=0, innum=4245314/4245315.
 
    Шаг 17: Слой 11 (Portal) — создать React приложение
            При реализации формы загрузки — добавить подтверждение типа документа оператором
@@ -2748,9 +2801,10 @@ pytest-httpx==0.30.0
 
 ### Ожидают информации от владельца кор-системы
 
-1. **Формат PolicyList не верифицирован на реальных данных**  
-   Нет тестового `personalNumber` с активным ДМС-полисом для проверки имён полей  
-   (RiskList, AnnualLimit, ContractText и т.д.) в реальном ответе `getpolicylist`.
+1. ✅ **Формат PolicyList верифицирован на реальных данных** (2026-06-11, полис OMM 200084/1)  
+   Структура подтверждена: `{"PolicyList": {"Policy": [...]}}` (объект, не строка).  
+   RiskList, ObjectList, InsuranceTypeList — все поля задокументированы в разделе  
+   «Формат getpolicylist» выше. Правила выбора риска верифицированы 2026-06-14.
 
 2. **Способ доставки справочника провайдеров**  
    ✅ Структура известна: CUSTOMER (PersID), CSTNAME (имя), TAXPAYER (ИНН)  
