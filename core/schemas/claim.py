@@ -30,16 +30,30 @@ class LineItem(BaseModel):
     # Источник строки: 'receipt_1', 'receipt_2', ..., 'form_100'.
     # Используется для аудита и ServName в ClaimParsing_UNI.
     # НЕ добавляется в description — ServName должен быть чистым.
-    doc_source:  str | None = None
+    doc_source:      str | None = None
+    # Валюта/единица суммы: 'GEL'/'₾' если платёж; 'IU'/'mg'/'ml'/etc. если дозировка.
+    # Только GEL-строки включаются в total_claimed.
+    amount_currency: str | None = None
+
+
+class ReceiptSummary(BaseModel):
+    """Итог одного чека — авторитетный источник суммы (используется для total_claimed)."""
+    doc_source:           str                  # 'receipt_1', 'receipt_2'...
+    total_stated:         float | None = None  # итоговая строка чека: სულ / Итого / Total
+    items_sum:            float | None = None  # сумма GEL-строк этого чека
+    receipt_date:         str | None = None    # YYYY-MM-DD
+    receipt_institution:  str | None = None    # учреждение на чеке (для склейки страниц)
+    discrepancy:          bool = False         # |total_stated - items_sum| > 10%
 
 
 class EventData(BaseModel):
-    date:             str          # ISO 8601: YYYY-MM-DD
-    institution:      str | None = None
-    diagnoses:        list[DiagnoisItem] = Field(default_factory=list)
-    line_items:       list[LineItem] = Field(default_factory=list)
-    total_claimed:    float
-    service_urgency:  str | None = None  # "urgent" | "diagnostic" | "planned" | None
+    date:              str          # ISO 8601: YYYY-MM-DD
+    institution:       str | None = None
+    diagnoses:         list[DiagnoisItem] = Field(default_factory=list)
+    line_items:        list[LineItem] = Field(default_factory=list)
+    total_claimed:     float
+    service_urgency:   str | None = None  # "urgent" | "diagnostic" | "planned" | None
+    receipt_summaries: list[ReceiptSummary] = Field(default_factory=list)
     # urgent = სასწრაფო/გადაუდებელი (ЧС, неотложное)
     # diagnostic = პირველადი დიაგნოსტიკა (первичная диагностика, скрининг)
     # planned = გეგმიური (плановое лечение, профилактика)

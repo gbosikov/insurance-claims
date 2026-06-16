@@ -24,6 +24,11 @@ class LLMNoToolBlockError(LLMAPIError):
     """LLM не вернул function-call / tool_use блок."""
 
 
+class LLMMalformedCallError(LLMAPIError):
+    """Gemini вернул MALFORMED_FUNCTION_CALL — ответ не является валидным JSON.
+    Ретраится автоматически (обычно транзиентная ошибка)."""
+
+
 @dataclass
 class LLMResult:
     tool_input: dict[str, Any] | None = None   # None если text-only вызов
@@ -94,15 +99,30 @@ class BaseLLMClient(ABC):
         accumulated_tokens = LLMResult()
 
         for attempt in range(_TOOL_CALL_RETRIES + 1):
-            result = await self._do_call_tool(
-                system=system,
-                messages=current_messages,
-                tool=tool,
-                tool_name=tool_name,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                use_thinking=use_thinking,
-            )
+            try:
+                result = await self._do_call_tool(
+                    system=system,
+                    messages=current_messages,
+                    tool=tool,
+                    tool_name=tool_name,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    use_thinking=use_thinking,
+                )
+            except LLMMalformedCallError as e:
+                # MALFORMED_FUNCTION_CALL — Gemini сгенерировал невалидный JSON.
+                # Ретраим с теми же аргументами (обычно на 2-й попытке проходит).
+                if attempt == _TOOL_CALL_RETRIES:
+                    raise LLMNoToolBlockError(
+                        f"{tool_name}: MALFORMED_FUNCTION_CALL after {_TOOL_CALL_RETRIES} retries"
+                    ) from e
+                log.warning(
+                    "llm_malformed_function_call_retry",
+                    tool=tool_name,
+                    attempt=attempt + 1,
+                )
+                continue
+
             accumulated_tokens.input_tokens += result.input_tokens
             accumulated_tokens.output_tokens += result.output_tokens
             if result.reasoning:
@@ -358,13 +378,31 @@ class GeminiLLMClient(BaseLLMClient):
             elif k == "required" and isinstance(v, list):
                 result[k] = [str(r) for r in v]
             elif k == "enum" and isinstance(v, list):
-                result[k] = [str(e) for e in v]
+                # Убираем Python None из enum — null обрабатывается nullable=True.
+                # str(None)="None" путает Gemini: он видит строку "None" как допустимое значение.
+                non_none = [str(e) for e in v if e is not None]
+                if non_none:
+                    result[k] = non_none
             else:
                 result[k] = v
 
         if nullable:
             result["nullable"] = True
         return result
+
+    @staticmethod
+    def _simplify_schema_for_gemini(input_schema: dict[str, Any]) -> dict[str, Any]:
+        """Убирает поля, вызывающие MALFORMED_FUNCTION_CALL у Gemini.
+
+        Gemini не справляется со схемами глубже 3 уровней вложенности.
+        cross_document содержит 4 уровня (object > receipt > line_items[] > field)
+        плюс nullable objects с nested arrays — систематически вызывает сбой.
+        Anthropic получает полную схему; Gemini — упрощённую без cross_document.
+        """
+        import copy
+        schema = copy.deepcopy(input_schema)
+        schema.get("properties", {}).pop("cross_document", None)
+        return schema
 
     def _to_gemini_contents(self, messages: list[dict[str, Any]]) -> list:
         """Claude message format → google-genai Content list."""
@@ -399,10 +437,12 @@ class GeminiLLMClient(BaseLLMClient):
     ) -> LLMResult:
         types = self._gtypes
 
+        # Упрощаем схему для Gemini: убираем поля >3 уровней вложенности
+        gemini_input_schema = self._simplify_schema_for_gemini(tool["input_schema"])
         fn_decl = types.FunctionDeclaration(
             name=tool["name"],
             description=tool.get("description", ""),
-            parameters=self._normalize_schema(tool["input_schema"]),
+            parameters=self._normalize_schema(gemini_input_schema),
         )
 
         config_kwargs: dict[str, Any] = dict(
@@ -423,6 +463,21 @@ class GeminiLLMClient(BaseLLMClient):
         except (AttributeError, TypeError):
             pass
 
+        # Safety settings BLOCK_NONE: система обрабатывает медицинские документы —
+        # дозировки препаратов, диагнозы, медкарты не должны блокироваться safety filter.
+        try:
+            config_kwargs["safety_settings"] = [
+                types.SafetySetting(category=cat, threshold="BLOCK_NONE")
+                for cat in [
+                    "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "HARM_CATEGORY_HARASSMENT",
+                    "HARM_CATEGORY_HATE_SPEECH",
+                    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                ]
+            ]
+        except (AttributeError, TypeError, ValueError):
+            log.warning("gemini_safety_settings_not_supported")
+
         try:
             response = await self._client.aio.models.generate_content(
                 model=self._model_name,
@@ -434,6 +489,26 @@ class GeminiLLMClient(BaseLLMClient):
 
         tool_input: dict | None = None
         for candidate in response.candidates:
+            if candidate.content is None:
+                finish_reason = getattr(candidate, "finish_reason", None)
+                safety_ratings = getattr(candidate, "safety_ratings", None) or []
+                fr_str = str(finish_reason)
+                log.warning(
+                    "gemini_candidate_blocked",
+                    tool=tool_name,
+                    finish_reason=fr_str,
+                    safety_ratings=[
+                        f"{getattr(sr, 'category', '?')}={getattr(sr, 'probability', '?')}"
+                        for sr in safety_ratings
+                    ],
+                )
+                if "MALFORMED_FUNCTION_CALL" in fr_str:
+                    # Gemini сгенерировал невалидный JSON — транзиентная ошибка.
+                    # call_tool поймает и ретраит автоматически.
+                    raise LLMMalformedCallError(
+                        f"Gemini MALFORMED_FUNCTION_CALL for {tool_name!r}"
+                    )
+                continue
             for part in candidate.content.parts:
                 fc = getattr(part, "function_call", None)
                 if fc and getattr(fc, "name", None):
@@ -456,6 +531,26 @@ class GeminiLLMClient(BaseLLMClient):
                 break
 
         if tool_input is None:
+            # Логируем что именно вернул Gemini вместо function_call — помогает диагностике
+            for i, candidate in enumerate(response.candidates):
+                parts_summary: list[str] = []
+                if candidate.content:
+                    for part in candidate.content.parts:
+                        if getattr(part, "text", None):
+                            parts_summary.append(f"text:{part.text[:150]!r}")
+                        elif getattr(part, "function_call", None):
+                            parts_summary.append(f"fc:{part.function_call.name}")
+                log.error(
+                    "gemini_no_function_call",
+                    tool=tool_name,
+                    candidate_idx=i,
+                    finish_reason=str(getattr(candidate, "finish_reason", None)),
+                    parts=parts_summary,
+                    safety_ratings=[
+                        f"{getattr(sr, 'category', '?')}={getattr(sr, 'probability', '?')}"
+                        for sr in (getattr(candidate, "safety_ratings", None) or [])
+                    ],
+                )
             raise LLMNoToolBlockError(f"Gemini did not return function call for {tool_name!r}")
 
         meta = response.usage_metadata
@@ -476,15 +571,29 @@ class GeminiLLMClient(BaseLLMClient):
     ) -> LLMResult:
         types = self._gtypes
 
+        call_cfg: dict[str, Any] = dict(
+            system_instruction=system,
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        )
+        try:
+            call_cfg["safety_settings"] = [
+                types.SafetySetting(category=cat, threshold="BLOCK_NONE")
+                for cat in [
+                    "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "HARM_CATEGORY_HARASSMENT",
+                    "HARM_CATEGORY_HATE_SPEECH",
+                    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                ]
+            ]
+        except (AttributeError, TypeError, ValueError):
+            pass
+
         try:
             response = await self._client.aio.models.generate_content(
                 model=self._model_name,
                 contents=self._to_gemini_contents(messages),
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                ),
+                config=types.GenerateContentConfig(**call_cfg),
             )
         except Exception as e:
             raise LLMAPIError(f"Gemini API error: {e}") from e
