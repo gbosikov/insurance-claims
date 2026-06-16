@@ -755,10 +755,16 @@ async def _extract_with_claude(
             raw_line_items = [LineItem(**li) for li in event_raw.get("line_items", [])]
             deduped_line_items = _dedup_line_items(raw_line_items)
 
-            # total_claimed = сумма дедуплицированных строк (а не итог из формы 100,
-            # который включает услуги без чеков и может содержать дубли).
-            # Если строк нет — берём значение из extraction как есть.
-            if deduped_line_items:
+            # total_claimed = сумма ТОЛЬКО чековых строк (форма 100 содержит дозировки
+            # и рекомендации с числами, которые не являются ценами в GEL).
+            # Если чеков нет — сумма всех строк; если строк нет — берём из extraction.
+            _receipt_items_tc = [
+                li for li in deduped_line_items
+                if li.doc_source and li.doc_source.startswith("receipt")
+            ]
+            if _receipt_items_tc:
+                total_claimed = round(sum(li.amount for li in _receipt_items_tc), 2)
+            elif deduped_line_items:
                 total_claimed = round(sum(li.amount for li in deduped_line_items), 2)
             else:
                 total_claimed = float(event_raw["total_claimed"])

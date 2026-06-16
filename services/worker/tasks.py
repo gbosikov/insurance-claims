@@ -39,6 +39,7 @@ from core.models.claim import Claim, ClaimDocument, ClaimStatus
 from core.storage import get_storage_client
 from layers.core_adapter.factory import get_core_adapter
 from layers.core_adapter.file_helpers import documents_to_file_fields
+from layers.core_adapter.risk_matcher import match_risks as _build_fallback_risks
 from layers.decision.service import make_decision
 from layers.extraction.service import extract_claim_data
 from layers.intake.downloader import download_all_documents
@@ -51,6 +52,71 @@ from services.worker.celery_app import celery_app
 
 log = structlog.get_logger()
 settings = get_settings()
+
+
+def _build_structured_comment(decision, extraction) -> str:
+    """
+    Строит структурированный Comment для поля ClaimParsing_UNI:
+    Уверенность: 85% | Диагнозы: E55.9 Дефицит... ✓, F45.9 ... ✗ |
+    Сумма: 128 GEL (80% от 160) | Услуги: ... | <AI-вердикт>.
+    """
+    parts: list[str] = []
+
+    # 1. Уверенность
+    pct = round(decision.overall_confidence * 100)
+    parts.append(f"Уверенность: {pct}%")
+
+    # 2. Диагнозы с признаком покрытия
+    dec_map = {d.icd10_code: d for d in decision.diagnoses}
+    diag_labels = []
+    for d in extraction.event.diagnoses:
+        dec = dec_map.get(d.icd10_code)
+        mark = "✓" if (dec and dec.is_covered) else "✗"
+        name = (d.description or d.icd10_code)[:40]
+        diag_labels.append(f"{d.icd10_code} {name} {mark}")
+    if diag_labels:
+        parts.append("Диагнозы: " + ", ".join(diag_labels))
+
+    # 3. Сумма выплаты
+    total = extraction.event.total_claimed or 0.0
+    payout = decision.final_payout or 0.0
+    if total > 0:
+        cov_pct = round(payout / total * 100) if payout else 0
+        parts.append(f"Сумма: {payout:.0f} GEL ({cov_pct}% от {total:.0f})")
+
+    # 4. Услуги — только из чека, иначе все позиции
+    receipt_svc = [
+        li.description for li in extraction.event.line_items
+        if li.doc_source and li.doc_source.startswith("receipt") and li.description
+    ]
+    services = receipt_svc or [li.description for li in extraction.event.line_items if li.description]
+    if services:
+        parts.append("Услуги: " + ", ".join(services))
+
+    # 5. Краткое AI-описание (первые 200 символов из summary)
+    if decision.summary:
+        brief = decision.summary[:200].rstrip()
+        if len(decision.summary) > 200:
+            brief += "..."
+        parts.append(brief)
+
+    comment = " | ".join(parts)
+
+    # Флаги в конце если есть
+    flags: list[str] = []
+    if decision.fraud_flags:
+        flags.extend(decision.fraud_flags)
+    if decision.requires_manual_review and decision.manual_review_reason:
+        flags.append(decision.manual_review_reason)
+    if flags:
+        comment += " [" + "; ".join(flags) + "]"
+
+    # MEDNOTE в PHEPOBJRISK кор-системы ограничена по длине
+    max_len = settings.core_api_comment_max_length
+    if len(comment) > max_len:
+        comment = comment[: max_len - 1] + "…"
+
+    return comment
 
 
 def run_async(coro):
@@ -317,17 +383,42 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
             try:
                 file_fields = await documents_to_file_fields(documents, storage)
 
-                _comment = decision.summary or (
-                    f"Требуется ручная проверка. Причина: {decision.manual_review_reason or 'нет данных'}"
-                )
+                _comment = _build_structured_comment(decision, extraction)
+                # Fallback для полей ClaimParsing_UNI когда decision вернул early-exit
+                # (waiting_period_violation, policy_inactive и др. — без Claude).
+                _config_kind = decision.config_kind or 2  # 2 = акт возмещения (дефолт)
+                _risks_list = decision.risks_list
+                if not _risks_list and risks_limits and risks_limits.risks:
+                    # Предпочитаем строки из чеков — форма 100 содержит анамнез/медикаменты
+                    # с большими суммами которые не должны попасть в кор-систему.
+                    # Если чеков нет — используем все позиции (match_risks сам fallback-ит на total_claimed).
+                    _fallback_receipt_items = [
+                        li for li in extraction.event.line_items
+                        if li.doc_source and li.doc_source.startswith("receipt")
+                    ]
+                    _fallback_items = _fallback_receipt_items if _fallback_receipt_items else extraction.event.line_items
+                    _risks_list, _ = _build_fallback_risks(
+                        line_items=_fallback_items,
+                        risks=risks_limits.risks,
+                        event_date=extraction.event.date or "",
+                        form_100_text=form_100_ocr_text or "",
+                        config_kind=_config_kind,
+                        total_claimed=extraction.event.total_claimed or 0.0,
+                    )
+                    log.info(
+                        "risks_list_fallback_built",
+                        claim_id=claim_id,
+                        risks_count=len(_risks_list),
+                        reason=decision.manual_review_reason or "early_exit",
+                    )
                 core_result = await core_adapter.submit_claim(
                     policy_number=policy_number,
                     diagnosid=decision.diagnosid or settings.core_api_diagnosid_fallback,
                     event_start_date=extraction.event.date,
                     event_end_date=extraction.event.date,
                     pers_id=decision.pers_id or settings.core_api_pers_id_fallback,
-                    config_kind=decision.config_kind or 0,
-                    risks_list=decision.risks_list,
+                    config_kind=_config_kind,
+                    risks_list=_risks_list,
                     file_fields=file_fields,
                     comment=_comment,
                 )
@@ -352,9 +443,9 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                         "EventStartDate": extraction.event.date,
                         "EventEndDate":   extraction.event.date,
                         "PersID":         decision.pers_id or settings.core_api_pers_id_fallback,
-                        "ConfigKind":     decision.config_kind or 0,
+                        "ConfigKind":     _config_kind,
                         "Comment":        _comment[:500],
-                        "RisksList":      decision.risks_list,
+                        "RisksList":      _risks_list,
                         "files_count":    len(file_fields),
                     },
                     output_data={

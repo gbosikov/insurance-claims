@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import structlog
@@ -18,6 +19,16 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.models.icd10 import ICD10Diagnosis
+
+_ICD10_STD_PART_RE = re.compile(r'^([A-Z]\d{2,3}(?:\.[0-9]{1,2})?)')
+
+
+def _normalize_icd10_code(code: str) -> str:
+    """E55D → E55, I10-I15 → I10, E78.2A → E78.2"""
+    code = code.strip().upper()
+    code = code.split("-")[0]
+    m = _ICD10_STD_PART_RE.match(code)
+    return m.group(1) if m else code
 
 log = structlog.get_logger()
 
@@ -96,8 +107,41 @@ async def enrich_diagnosis(
     rows = result.fetchall()
 
     if not rows:
-        log.warning("icd10_code_not_found_in_local_db", code=icd10_code)
-        return EnrichedDiagnosis(code=icd10_code, name_r=None, name_g=None, name_e=None)
+        # Попробовать нормализованный код: E55D → E55, I10-I15 → I10
+        normalized = _normalize_icd10_code(icd10_code)
+        if normalized != icd10_code.upper().strip():
+            result2 = await db.execute(cte_sql, {"code": normalized})
+            rows = result2.fetchall()
+            if rows:
+                log.info("icd10_code_normalized_for_enrichment", original=icd10_code, normalized=normalized)
+            else:
+                # Prefix-поиск: E55 → первый E55.x
+                # ORDER BY + LIMIT нельзя в anchor RECURSIVE CTE — оборачиваем в подзапрос
+                prefix_sql = text("""
+                    WITH RECURSIVE ancestors AS (
+                        SELECT id, pid, extcod, name_r, name_g, name_e, 0 AS depth
+                        FROM (
+                            SELECT id, pid, extcod, name_r, name_g, name_e
+                            FROM icd10_diagnoses
+                            WHERE extcod LIKE :prefix AND is_available = TRUE
+                            ORDER BY extcod
+                            LIMIT 1
+                        ) AS base
+                        UNION ALL
+                        SELECT p.id, p.pid, p.extcod, p.name_r, p.name_g, p.name_e, a.depth + 1
+                        FROM icd10_diagnoses p
+                        JOIN ancestors a ON a.pid = p.id
+                        WHERE a.depth < 10
+                    )
+                    SELECT id, pid, extcod, name_r, name_g, name_e, depth FROM ancestors ORDER BY depth ASC
+                """)
+                result3 = await db.execute(prefix_sql, {"prefix": normalized[:3] + "%"})
+                rows = result3.fetchall()
+                if rows:
+                    log.info("icd10_code_prefix_match", original=icd10_code, prefix=normalized[:3])
+        if not rows:
+            log.warning("icd10_code_not_found_in_local_db", code=icd10_code)
+            return EnrichedDiagnosis(code=icd10_code, name_r=None, name_g=None, name_e=None)
 
     # Первая строка — сам диагноз (depth=0), остальные — предки
     base = rows[0]

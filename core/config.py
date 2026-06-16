@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     # Fallback-значения для ClaimParsing_UNI если данные не найдены в документах
     core_api_diagnosid_fallback: str = "N145"  # МКБ-10 "неклассифицированный" если не найден в документах
     core_api_pers_id_fallback: int = 914450    # PersID клиники по умолчанию (Cliniks.csv)
+    core_api_comment_max_length: int = 250     # MEDNOTE в PHEPOBJRISK ограничена (SQL Server NVARCHAR)
 
     # ── Пороги принятия решений ────────────────────────────────────
     confidence_auto_approve: float = 0.85
@@ -184,6 +185,7 @@ class Settings(BaseSettings):
     decision_reasoning_audit_max_chars: int = 4000
     decision_second_pass_confidence_threshold: float = 0.65
     decision_stochastic_qa_rate: float = 0.05   # 5% AUTO_APPROVED → случайная проверка
+    decision_waiting_period_enabled: bool = True   # False — отключить проверку периода ожидания
     decision_default_waiting_period_days: int = 30
     # Дефолт калибровочного фактора; рабочее значение живёт в
     # platform.tenant_configs['confidence_calibration_factor'] и читается в make_decision()

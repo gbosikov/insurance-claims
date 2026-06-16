@@ -139,13 +139,153 @@ def _detect_skew(gray: np.ndarray) -> float:
         return 0.0
 
 
-def deskew_image(image: np.ndarray, angle: float) -> np.ndarray:
-    """Выравнивает изображение по углу наклона."""
+def deskew_image(image: np.ndarray, angle: float, expand: bool = False) -> np.ndarray:
+    """
+    Выравнивает изображение по углу наклона.
+
+    expand=True: увеличивает холст так чтобы всё содержимое поместилось после поворота.
+    Используется для больших углов (>15°) — иначе текст обрезается по краям кадра.
+    """
     import cv2
     h, w = image.shape[:2]
-    center = (w // 2, h // 2)
+    center = (w / 2, h / 2)
     M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    return cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    if expand and abs(angle) > 10:
+        cos_a = abs(M[0, 0])
+        sin_a = abs(M[0, 1])
+        new_w = int(h * sin_a + w * cos_a)
+        new_h = int(h * cos_a + w * sin_a)
+        M[0, 2] += (new_w - w) / 2
+        M[1, 2] += (new_h - h) / 2
+        return cv2.warpAffine(
+            image, M, (new_w, new_h),
+            flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE,
+        )
+
+    return cv2.warpAffine(
+        image, M, (w, h),
+        flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def normalize_orientation(
+    image: np.ndarray,
+    raw_bytes: bytes | None = None,
+) -> tuple[np.ndarray, str]:
+    """
+    Нормализует ориентацию изображения перед quality gate.
+
+    Два метода применяются последовательно:
+    1. EXIF: читает тег Orientation (274) из JPEG/PNG метаданных.
+       Покрывает большинство случаев — Android и iOS всегда пишут EXIF.
+    2. Морфологический анализ: определяет 90°/270° поворот по соотношению
+       горизонтальных и вертикальных текстовых линий. Fallback когда EXIF
+       отсутствует или вырезан конвертером.
+
+    180° поворот морфологически не определяется (требует OCR) — пользователь
+    получит ошибку quality gate и переснимет документ.
+
+    Fail-safe: при любом сомнении изображение не изменяется.
+
+    Returns:
+        (corrected_image, label) где label:
+        "none" | "exif_cw90" | "exif_ccw90" | "exif_180" |
+        "morph_cw90" | "morph_ccw90"
+    """
+    import cv2
+
+    # ── 1. EXIF (только для JPEG/PNG, raw_bytes передаётся из preprocess_document) ──
+    if raw_bytes is not None:
+        cv2_rot, label = _exif_rotation(raw_bytes)
+        if cv2_rot is not None:
+            corrected = cv2.rotate(image, cv2_rot)
+            log.info("orientation_corrected", method="exif", label=label)
+            return corrected, label
+
+    # ── 2. Морфологический анализ ─────────────────────────────────────────────────
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    cv2_rot, label = _morph_rotation(gray)
+    if cv2_rot is not None:
+        corrected = cv2.rotate(image, cv2_rot)
+        log.info("orientation_corrected", method="morphology", label=label)
+        return corrected, label
+
+    return image, "none"
+
+
+def _exif_rotation(raw_bytes: bytes) -> tuple:
+    """
+    Возвращает (cv2_rotation_constant, label) или (None, "none").
+
+    EXIF Orientation tag 274:
+      3 = перевёрнут 180°
+      6 = сохранён CCW, нужен CW для исправления   (телефон повёрнут CCW при съёмке)
+      8 = сохранён CW,  нужен CCW для исправления  (телефон повёрнут CW при съёмке)
+    """
+    import cv2
+    try:
+        from PIL import Image as _PILImage
+        pil = _PILImage.open(io.BytesIO(raw_bytes))
+        exif = pil.getexif()
+        orientation = exif.get(274)
+        mapping = {
+            3: (cv2.ROTATE_180,                 "exif_180"),
+            6: (cv2.ROTATE_90_CLOCKWISE,         "exif_cw90"),
+            8: (cv2.ROTATE_90_COUNTERCLOCKWISE,  "exif_ccw90"),
+        }
+        result = mapping.get(orientation)
+        return result if result else (None, "none")
+    except Exception:
+        return None, "none"
+
+
+def _morph_rotation(gray: np.ndarray) -> tuple:
+    """
+    Определяет 90°/270° поворот по соотношению текстовых линий.
+
+    Алгоритм:
+    - Морфологические маски горизонтальных и вертикальных линий.
+    - Если вертикальные доминируют (ratio > 1.5 и > 500 px) → документ повёрнут.
+    - Направление: у медформ заголовок сверху → плотность выше у верхнего края.
+      Сравниваем левую/правую половину вертикальной маски:
+        правая > левой  → верх документа справа  → повёрнут CW  → fix: CCW
+        левая  > правой → верх документа слева   → повёрнут CCW → fix: CW
+    - Если разница < 20% — неопределённо, не трогаем.
+
+    Возвращает (cv2_rotation_constant, label) или (None, "none").
+    """
+    import cv2
+    h, w = gray.shape
+    if h < 100 or w < 100:
+        return None, "none"
+
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    kw = max(25, w // 8)
+    kh = max(25, h // 8)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh))
+
+    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+    v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+
+    h_score = cv2.countNonZero(h_lines)
+    v_score = cv2.countNonZero(v_lines)
+
+    if v_score < 500 or v_score <= h_score * 1.5:
+        return None, "none"
+
+    left_score  = cv2.countNonZero(v_lines[:, :w // 2])
+    right_score = cv2.countNonZero(v_lines[:, w // 2:])
+    total = left_score + right_score
+    if total == 0 or abs(left_score - right_score) / total < 0.20:
+        return None, "none"
+
+    if right_score > left_score:
+        return cv2.ROTATE_90_COUNTERCLOCKWISE, "morph_ccw90"
+    else:
+        return cv2.ROTATE_90_CLOCKWISE, "morph_cw90"
 
 
 def enhance_image(image: np.ndarray) -> np.ndarray:
@@ -220,10 +360,64 @@ async def preprocess_document(
             page = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
             pages = [page]
 
-        # Quality Gate для каждой страницы
+        # Нормализация ориентации + Quality Gate для каждой страницы
+        orientation_corrections: list[dict] = []
         all_reports: list[QualityReport] = []
-        for page_img in pages:
+        corrected_pages: list[np.ndarray] = []
+
+        for i, page_img in enumerate(pages):
+            # Нормализация ориентации — строго до quality gate.
+            # Для JPEG/PNG (i==0): пробуем EXIF из raw_data, затем морфологию.
+            # Для PDF-страниц (is_pdf): только морфология (нет EXIF в numpy array).
+            raw = raw_data if (not is_pdf and i == 0) else None
+            page_img, orient_label = normalize_orientation(page_img, raw_bytes=raw)
+            if orient_label != "none":
+                orientation_corrections.append({"page": i + 1, "correction": orient_label})
+            corrected_pages.append(page_img)  # добавляем; fallback-блок ниже обновит если нужно
+
             report = check_quality(page_img)
+
+            # Если единственный флаг — cropped (экстремальный skew), пробуем
+            # исправить поворотом с расширением холста и перепроверяем.
+            # Это ловит случаи когда EXIF стриплен и морфология не сработала.
+            if not report.passed and report.flags == ["cropped"] and abs(report.skew_angle) < 85:
+                import cv2
+                angle = report.skew_angle
+                # Для углов близких к ±90° — скорее всего 90° поворот без EXIF:
+                # пробуем оба варианта и берём тот где skew после коррекции меньше.
+                if abs(abs(angle) - 90) < 30:
+                    candidates = [
+                        cv2.rotate(page_img, cv2.ROTATE_90_CLOCKWISE),
+                        cv2.rotate(page_img, cv2.ROTATE_90_COUNTERCLOCKWISE),
+                    ]
+                    best_img, best_rep = page_img, report
+                    for cand in candidates:
+                        rep = check_quality(cand)
+                        if rep.passed or (
+                            len(rep.flags) < len(best_rep.flags)
+                            or abs(rep.skew_angle) < abs(best_rep.skew_angle)
+                        ):
+                            best_img, best_rep = cand, rep
+                    if best_rep.passed:
+                        page_img, report = best_img, best_rep
+                        orientation_corrections.append({
+                            "page": i + 1, "correction": "fallback_90_rotation",
+                        })
+                        log.info("orientation_corrected", method="fallback_90", page=i + 1)
+                else:
+                    # Произвольный большой угол — пробуем deskew с расширением холста
+                    deskewed = deskew_image(page_img, angle, expand=True)
+                    rep_after = check_quality(deskewed)
+                    if rep_after.passed:
+                        page_img, report = deskewed, rep_after
+                        orientation_corrections.append({
+                            "page": i + 1,
+                            "correction": f"deskew_{angle:.0f}deg_expanded",
+                        })
+                        log.info("orientation_corrected", method="deskew_expand",
+                                 angle=angle, page=i + 1)
+
+            corrected_pages[-1] = page_img  # обновляем уже добавленный элемент
             all_reports.append(report)
 
             if not report.passed:
@@ -251,15 +445,16 @@ async def preprocess_document(
                         "blur_score": report.blur_score,
                         "brightness": report.brightness,
                         "skew_angle": round(report.skew_angle, 2),
+                        "orientation_corrections": orientation_corrections,
                     }},
                     duration_ms=timer.duration_ms,
                 )
 
                 raise DocumentQualityError(reason=first_flag, detail=detail)
 
-        # Все страницы прошли — обрабатываем
+        # Все страницы прошли — обрабатываем уже откорректированные изображения
         page_paths: list[str] = []
-        for i, (page_img, report) in enumerate(zip(pages, all_reports)):
+        for i, (page_img, report) in enumerate(zip(corrected_pages, all_reports)):
             # Deskew
             if abs(report.skew_angle) > 2.0:
                 page_img = deskew_image(page_img, report.skew_angle)
@@ -302,6 +497,7 @@ async def preprocess_document(
             "pages_processed": len(page_paths),
             "quality_scores": [r.score for r in all_reports],
             "quality_metrics": _quality_metrics_payload(all_reports),
+            "orientation_corrections": orientation_corrections,
         },
         duration_ms=timer.duration_ms,
     )

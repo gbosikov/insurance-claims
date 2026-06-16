@@ -237,11 +237,15 @@ def test_waiting_period_exactly_n_days_passes():
 async def test_waiting_period_violation_returns_manual_review_without_claude():
     """Нарушение периода ожидания → manual_review до вызова LLM."""
     mock_llm = make_llm_mock()
-    decision = await run_make_decision(
-        mock_llm,
-        extraction=make_extraction(service_urgency="planned"),
-        risks=make_risks(policy_start_date=date(2026, 1, 5)),  # событие 2026-01-15, 10-й день
-    )
+    # Принудительно включить проверку периода ожидания —
+    # .env может иметь DECISION_WAITING_PERIOD_ENABLED=false (dev-режим).
+    import layers.decision.service as _svc
+    with patch.object(_svc.settings, "decision_waiting_period_enabled", True):
+        decision = await run_make_decision(
+            mock_llm,
+            extraction=make_extraction(service_urgency="planned"),
+            risks=make_risks(policy_start_date=date(2026, 1, 5)),  # событие 2026-01-15, 10-й день
+        )
 
     assert decision.requires_manual_review is True
     assert decision.manual_review_reason == "waiting_period_violation"

@@ -782,6 +782,13 @@ class LiteGroupAdapter(CoreSystemAdapter):
             data = data[0] if data else {}
 
         status_code = int(data.get("status", -1))
+        if status_code == -1:
+            log.warning(
+                "claims_api_status_missing",
+                raw_keys=list(result.keys()),
+                data_keys=list(data.keys()) if isinstance(data, dict) else repr(data)[:200],
+                raw_snippet=str(result)[:500],
+            )
         return SubmitClaimResult(
             innum=str(data.get("Innum") or data.get("innum") or ""),
             status=status_code,

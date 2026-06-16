@@ -33,15 +33,45 @@ class LLMResult:
     reasoning: str | None = None              # thinking/CoT (только Anthropic)
 
 
+_TOOL_CALL_RETRIES = 2   # сколько раз повторять при ошибке валидации
+
+
+def _check_required_fields(data: dict, schema: dict, path: str = "") -> list[str]:
+    """
+    Рекурсивно проверяет required-поля JSON Schema.
+    Возвращает список путей отсутствующих/null полей: ["insured.full_name", "event.date"].
+    """
+    errors: list[str] = []
+    required: list[str] = schema.get("required") or []
+    properties: dict = schema.get("properties") or {}
+
+    for field_name in required:
+        full_path = f"{path}.{field_name}" if path else field_name
+        value = data.get(field_name)
+        if value is None:
+            errors.append(full_path)
+            continue
+        # Рекурсия для вложенных объектов
+        prop_schema = properties.get(field_name, {})
+        if prop_schema.get("type") == "object" and isinstance(value, dict):
+            errors.extend(_check_required_fields(value, prop_schema, full_path))
+        elif prop_schema.get("type") == "array" and isinstance(value, list):
+            item_schema = prop_schema.get("items", {})
+            if item_schema.get("type") == "object":
+                for i, item in enumerate(value):
+                    if isinstance(item, dict):
+                        errors.extend(_check_required_fields(item, item_schema, f"{full_path}[{i}]"))
+
+    return errors
+
+
 class BaseLLMClient(ABC):
     """Единый интерфейс для всех LLM-провайдеров."""
 
     @property
     def supports_thinking(self) -> bool:
-        """True если провайдер поддерживает extended thinking."""
         return False
 
-    @abstractmethod
     async def call_tool(
         self,
         *,
@@ -54,9 +84,84 @@ class BaseLLMClient(ABC):
         use_thinking: bool = False,
     ) -> LLMResult:
         """
-        Вызов с принудительным tool/function-use.
-        Возвращает LLMResult.tool_input — распарсенный dict аргументов.
+        Template-метод: вызывает _do_call_tool с retry при ошибке валидации.
+
+        При первом ответе проверяет required-поля схемы.
+        Если поля отсутствуют — добавляет ошибку в контекст и повторяет вызов
+        (до _TOOL_CALL_RETRIES раз). Модель видит что именно не так и исправляет.
         """
+        current_messages = messages
+        accumulated_tokens = LLMResult()
+
+        for attempt in range(_TOOL_CALL_RETRIES + 1):
+            result = await self._do_call_tool(
+                system=system,
+                messages=current_messages,
+                tool=tool,
+                tool_name=tool_name,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                use_thinking=use_thinking,
+            )
+            accumulated_tokens.input_tokens += result.input_tokens
+            accumulated_tokens.output_tokens += result.output_tokens
+            if result.reasoning:
+                accumulated_tokens.reasoning = result.reasoning
+
+            # Проверяем required-поля
+            errors = _check_required_fields(
+                result.tool_input or {}, tool.get("input_schema", {}),
+            )
+            if not errors:
+                result.input_tokens = accumulated_tokens.input_tokens
+                result.output_tokens = accumulated_tokens.output_tokens
+                return result
+
+            # Есть ошибки — если retry исчерпаны, выбрасываем
+            if attempt == _TOOL_CALL_RETRIES:
+                raise LLMNoToolBlockError(
+                    f"{tool_name}: required fields missing after {_TOOL_CALL_RETRIES} retries: {errors}"
+                )
+
+            log.warning(
+                "llm_tool_validation_retry",
+                tool=tool_name,
+                attempt=attempt + 1,
+                missing_fields=errors,
+            )
+
+            # Добавляем предыдущий ответ + инструкцию в контекст
+            current_messages = current_messages + [
+                {
+                    "role": "assistant",
+                    "content": f"<previous_attempt>{result.tool_input}</previous_attempt>",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Ответ не прошёл валидацию. Отсутствуют обязательные поля: "
+                        f"{', '.join(errors)}. "
+                        f"Повтори вызов функции {tool_name!r} — все обязательные поля должны быть заполнены."
+                    ),
+                },
+            ]
+
+        # unreachable
+        raise LLMNoToolBlockError(f"{tool_name}: validation failed")
+
+    @abstractmethod
+    async def _do_call_tool(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        tool: dict[str, Any],
+        tool_name: str,
+        max_tokens: int,
+        temperature: float,
+        use_thinking: bool = False,
+    ) -> LLMResult:
+        """Провайдер-специфичный вызов. Реализуется в подклассах."""
 
     @abstractmethod
     async def call_text(
@@ -67,10 +172,7 @@ class BaseLLMClient(ABC):
         max_tokens: int,
         temperature: float,
     ) -> LLMResult:
-        """
-        Вызов для свободного текстового ответа (CoT, chunking, CARVEOUT-парсинг).
-        Возвращает LLMResult.text.
-        """
+        """Вызов для свободного текстового ответа (CoT, chunking)."""
 
 
 class AnthropicLLMClient(BaseLLMClient):
@@ -86,7 +188,7 @@ class AnthropicLLMClient(BaseLLMClient):
     def supports_thinking(self) -> bool:
         return True
 
-    async def call_tool(
+    async def _do_call_tool(
         self,
         *,
         system: str,
@@ -199,6 +301,15 @@ class AnthropicLLMClient(BaseLLMClient):
         )
 
 
+def _deep_dict(obj: Any) -> Any:
+    """Рекурсивно конвертирует MapComposite/RepeatedComposite в plain Python dict/list."""
+    if hasattr(obj, "items"):
+        return {k: _deep_dict(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_deep_dict(i) for i in obj]
+    return obj
+
+
 class GeminiLLMClient(BaseLLMClient):
     """Клиент Google Gemini API (через google-genai SDK v2+)."""
 
@@ -275,7 +386,7 @@ class GeminiLLMClient(BaseLLMClient):
             result.append(types.Content(role=role, parts=parts))
         return result
 
-    async def call_tool(
+    async def _do_call_tool(
         self,
         *,
         system: str,
@@ -326,7 +437,20 @@ class GeminiLLMClient(BaseLLMClient):
             for part in candidate.content.parts:
                 fc = getattr(part, "function_call", None)
                 if fc and getattr(fc, "name", None):
-                    tool_input = dict(fc.args)
+                    # fc.args — google.protobuf.Struct (MapComposite).
+                    # dict() делает только shallow copy; вложенные объекты остаются
+                    # MapComposite/RepeatedComposite и ломают Pydantic-валидацию.
+                    # json_format.MessageToDict() рекурсивно конвертирует весь граф в plain dict.
+                    try:
+                        from google.protobuf import json_format as _jf
+                        tool_input = _jf.MessageToDict(
+                            fc.args._pb,  # type: ignore[attr-defined]
+                            preserving_proto_field_name=True,
+                            including_default_value_fields=True,
+                        )
+                    except Exception:
+                        # fallback: рекурсивная конвертация вручную
+                        tool_input = _deep_dict(fc.args)
                     break
             if tool_input is not None:
                 break

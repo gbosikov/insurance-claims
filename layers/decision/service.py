@@ -582,19 +582,50 @@ def apply_carveout_exclusion_logic(
 
 # ── Маппинг на справочники кор-системы ───────────────────────────────
 
+_ICD10_STD_PART_RE = re.compile(r'^([A-Z]\d{2,3}(?:\.[0-9]{1,2})?)')
+
+
+def _normalize_icd10_code(code: str) -> str:
+    """
+    Нормализует нестандартные форматы кодов МКБ-10 из грузинских мед. форм:
+      E55D     → E55     (буква-суффикс после цифр)
+      I10-I15  → I10     (диапазон)
+      E78.2A   → E78.2   (буква после десятичной части)
+    """
+    code = code.strip().upper()
+    code = code.split("-")[0]          # диапазон: I10-I15 → I10
+    m = _ICD10_STD_PART_RE.match(code)
+    return m.group(1) if m else code
+
+
 def find_diagnosid(icd10_code: str, icd10_list: list[ICD10Item]) -> str | None:
     """
-    Запасной поиск DiagnosID по коду МКБ-10. Возвращает EXTCOD (строку вида "J06.9").
-    Используется только если find_diagnosid_in_ocr вернул None.
+    Поиск DiagnosID по коду МКБ-10. Возвращает EXTCOD (строку вида "J06.9").
+    Пробует: 1) точное совпадение, 2) prefix, 3) нормализованный код + его prefix.
     """
     code_upper = icd10_code.upper().strip()
-    for item in icd10_list:
-        if item.code.upper().strip() == code_upper:
-            return item.code
+    exact_map: dict[str, ICD10Item] = {item.code.upper().strip(): item for item in icd10_list}
+
+    # 1. Точное совпадение
+    if code_upper in exact_map:
+        return exact_map[code_upper].code
+
+    # 2. Prefix-совпадение: J06 ↔ J06.9 (пробуем для оригинального кода)
     prefix = code_upper.split(".")[0]
-    for item in icd10_list:
-        if item.code.upper().startswith(prefix):
+    for db_code, item in exact_map.items():
+        if db_code.split(".")[0] == prefix:
             return item.code
+
+    # 3. Нормализация + повтор (E55D → E55, I10-I15 → I10)
+    normalized = _normalize_icd10_code(code_upper)
+    if normalized != code_upper:
+        if normalized in exact_map:
+            return exact_map[normalized].code
+        norm_prefix = normalized.split(".")[0]
+        for db_code, item in exact_map.items():
+            if db_code.split(".")[0] == norm_prefix:
+                return item.code
+
     return None
 
 
@@ -1068,6 +1099,30 @@ async def make_decision(
 
         # ── Уровень 1: Детерминированные проверки ─────────────────
 
+        # PersID — вычисляется здесь, до всех early-return путей,
+        # чтобы ClaimParsing_UNI всегда получал реальный код клиники,
+        # а не fallback 914450 (дистанционный провайдер).
+        pers_id: int = find_pers_id_in_ocr(ocr_texts or [], providers)
+        if pers_id == 0 and extraction.event.institution:
+            _institution_candidates: list[str | None] = [extraction.event.institution]
+            if extraction.cross_document:
+                _institution_candidates.append(
+                    extraction.cross_document.receipt.institution
+                    if extraction.cross_document.receipt else None
+                )
+                _institution_candidates.append(
+                    extraction.cross_document.form_100.institution
+                    if extraction.cross_document.form_100 else None
+                )
+            for _inst in _institution_candidates:
+                if _inst:
+                    pers_id = find_pers_id(_inst, providers)
+                    if pers_id:
+                        break
+        if pers_id == 0:
+            log.warning("pers_id_not_found", claim_id=str(claim_id),
+                        institution=extraction.event.institution)
+
         # Парсинг даты события — отдельно, чтобы ValueError не попал в бизнес-ветки
         try:
             event_date = date.fromisoformat(extraction.event.date)
@@ -1089,6 +1144,7 @@ async def make_decision(
                 ),
                 prompt_version=PROMPT_VERSION,
                 model_version=settings.claude_model,
+                pers_id=pers_id,
             )
 
         # Лимит полиса — исчерпан → ручная проверка (не автоотказ).
@@ -1113,6 +1169,7 @@ async def make_decision(
                 ),
                 prompt_version=PROMPT_VERSION,
                 model_version=settings.claude_model,
+                pers_id=pers_id,
             )
 
         # Срок подачи — однозначный детерминированный отказ (> 90 дней после события).
@@ -1134,6 +1191,7 @@ async def make_decision(
                 ),
                 prompt_version=PROMPT_VERSION,
                 model_version=settings.claude_model,
+                pers_id=pers_id,
             )
 
         # ── Уровень 1: полис активен на дату события ───────────────
@@ -1162,57 +1220,70 @@ async def make_decision(
                 ),
                 prompt_version=PROMPT_VERSION,
                 model_version=settings.claude_model,
+                pers_id=pers_id,
             )
 
         # ── Шаг 23: период ожидания (детерминированно, уровень 1) ──
+        # Управляется флагом DECISION_WAITING_PERIOD_ENABLED (.env).
         # Только если кор-система предоставила policy_start_date;
         # нарушение → manual_review (данные кор-системы могут быть устаревшими).
         waiting_period_note = "passed"
-        exempt_marker = settings.core_api_waiting_period_exempt_marker
-        if risks_limits.policy_start_date is None:
-            waiting_period_note = "skipped_no_policy_start_date"
-        elif (
-            exempt_marker
-            and risks_limits.object_data
-            and exempt_marker in risks_limits.object_data
-        ):
-            # Кор-система явно освободила объект от периода ожидания
-            # (Objects.ObjectData: "არ ეკუთვნის მოცდის პერიოდი")
-            waiting_period_note = "exempt_by_policy"
+        if not settings.decision_waiting_period_enabled:
+            waiting_period_note = "disabled_by_config"
         else:
-            from layers.extraction.service import resolve_service_urgency
-            resolved_urgency = resolve_service_urgency(
-                extraction.event.service_urgency, extraction.event.diagnoses
-            )
-            service_type = "emergency" if resolved_urgency == "urgent" else "planned"
-            if not check_waiting_period(
-                risks_limits.policy_start_date, event_date, service_type,
-                settings.decision_default_waiting_period_days,
+            exempt_marker = settings.core_api_waiting_period_exempt_marker
+            if risks_limits.policy_start_date is None:
+                waiting_period_note = "skipped_no_policy_start_date"
+            elif (
+                exempt_marker
+                and risks_limits.object_data
+                and exempt_marker in risks_limits.object_data
             ):
-                days_since_start = (event_date - risks_limits.policy_start_date).days
-                return ClaimDecision(
-                    claim_id=claim_id,
-                    diagnoses=[],
-                    total_approved=0.0,
-                    deductible_applied=0.0,
-                    final_payout=0.0,
-                    status="manual_review",
-                    requires_manual_review=True,
-                    manual_review_reason="waiting_period_violation",
-                    fraud_flags=[],
-                    overall_confidence=1.0,
-                    summary=(
-                        f"Событие на {days_since_start}-й день полиса при периоде ожидания "
-                        f"{settings.decision_default_waiting_period_days} дней (услуга плановая). "
-                        "Требуется проверка оператором."
-                    ),
-                    prompt_version=PROMPT_VERSION,
-                    model_version=settings.claude_model,
+                # Кор-система явно освободила объект от периода ожидания
+                # (Objects.ObjectData: "არ ეკუთვნის მოცდის პერიოდი")
+                waiting_period_note = "exempt_by_policy"
+            else:
+                from layers.extraction.service import resolve_service_urgency
+                resolved_urgency = resolve_service_urgency(
+                    extraction.event.service_urgency, extraction.event.diagnoses
                 )
+                service_type = "emergency" if resolved_urgency == "urgent" else "planned"
+                if not check_waiting_period(
+                    risks_limits.policy_start_date, event_date, service_type,
+                    settings.decision_default_waiting_period_days,
+                ):
+                    days_since_start = (event_date - risks_limits.policy_start_date).days
+                    return ClaimDecision(
+                        claim_id=claim_id,
+                        diagnoses=[],
+                        total_approved=0.0,
+                        deductible_applied=0.0,
+                        final_payout=0.0,
+                        status="manual_review",
+                        requires_manual_review=True,
+                        manual_review_reason="waiting_period_violation",
+                        fraud_flags=[],
+                        overall_confidence=1.0,
+                        summary=(
+                            f"Событие на {days_since_start}-й день полиса при периоде ожидания "
+                            f"{settings.decision_default_waiting_period_days} дней (услуга плановая). "
+                            "Требуется проверка оператором."
+                        ),
+                        prompt_version=PROMPT_VERSION,
+                        model_version=settings.claude_model,
+                        pers_id=pers_id,
+                    )
 
         # ── Шаг 23: суб-лимиты (детерминированно, уровень 1) ───────
         # Превышение не останавливает решение — уходит в manual_review ниже.
-        sublimit_violations = check_sublimits(extraction.event.line_items, risks_limits)
+        # Используем только чековые строки: форма 100 содержит дозировки/количества,
+        # которые не являются ценами и не должны проверяться против лимитов.
+        _receipt_items_sl = [
+            li for li in extraction.event.line_items
+            if li.doc_source and li.doc_source.startswith("receipt")
+        ]
+        _items_for_sublimit = _receipt_items_sl if _receipt_items_sl else extraction.event.line_items
+        sublimit_violations = check_sublimits(_items_for_sublimit, risks_limits)
         if sublimit_violations:
             log.info(
                 "sublimit_violations_detected",
@@ -1432,7 +1503,32 @@ async def make_decision(
         # FRAUD_FLAG-роутинг с priority=urgent, что чрезмерно для «МРТ при ОРВИ».
         coherence_flags: list[str] = []
         if settings.decision_coherence_check_enabled:
-            coherence_flags = [str(f) for f in (raw.get("coherence_flags") or [])]
+            _raw_flags = [str(f) for f in (raw.get("coherence_flags") or [])]
+            # Штрафуем только конкретную несогласованность (например "МРТ позвоночника при ОРВИ").
+            # Общие фразы "невозможно определить" — неуверенность Claude, не реальный конфликт.
+            _GENERIC_PHRASES = (
+                "невозможно определить",
+                "невозможно рассчитать",
+                "не удалось",
+                "cannot determine",
+                "insufficient",
+                "без явного",
+                "нет информации",
+                "без информации",
+                "отсутствует информация",
+            )
+            coherence_flags = [
+                f for f in _raw_flags
+                if not any(p in f.lower() for p in _GENERIC_PHRASES)
+            ]
+            if len(_raw_flags) != len(coherence_flags):
+                log.info(
+                    "coherence_flags_generic_filtered",
+                    claim_id=str(claim_id),
+                    total=len(_raw_flags),
+                    specific=len(coherence_flags),
+                    filtered_out=len(_raw_flags) - len(coherence_flags),
+                )
         if coherence_flags:
             effective_confidence = max(
                 0.0, effective_confidence - settings.decision_coherence_confidence_penalty
@@ -1445,6 +1541,64 @@ async def make_decision(
 
         diagnoses = [DiagnosisDecisionSchema(**d) for d in raw.get("diagnoses", [])]
         line_items = [LineItemDecisionSchema(**li) for li in raw.get("line_items", [])]
+
+        # ── Post-process: вычислить суммы если Claude вернул 0 при покрытых диагнозах ──
+        # Причина: нет детализации чека → Claude не может распределить суммы, возвращает 0.
+        # Решение: deterministic fallback — total_claimed × coverage_pct / 100.
+        _covered_diagnoses = [d for d in diagnoses if d.is_covered]
+        if _covered_diagnoses and all(d.approved_amount == 0.0 for d in _covered_diagnoses):
+            _total_cl = extraction.event.total_claimed or 0.0
+            _coverage_pct = 100.0
+            if risks_limits and risks_limits.risks:
+                _pr = next(
+                    (r for r in risks_limits.risks if r.remaining_limit > 0),
+                    risks_limits.risks[0],
+                )
+                if _pr.coverage_pct:
+                    _coverage_pct = float(_pr.coverage_pct)
+            _approved_total = round(_total_cl * _coverage_pct / 100.0, 2)
+            # Обновляем итоговые суммы в raw-ответе (используются ниже в ClaimDecision)
+            if not raw.get("total_approved"):
+                raw["total_approved"] = _approved_total
+            if not raw.get("final_payout"):
+                raw["final_payout"] = _approved_total
+            # Распределяем поровну между покрытыми диагнозами
+            _per_diag = round(_approved_total / len(_covered_diagnoses), 2)
+            for _d in _covered_diagnoses:
+                _d.approved_amount = _per_diag
+            # Создаём line_items если Claude их не вернул — только позиции из чеков
+            if not line_items:
+                _rcpt = [
+                    li for li in extraction.event.line_items
+                    if li.doc_source and li.doc_source.startswith("receipt")
+                ]
+                if _rcpt:
+                    for _li in _rcpt:
+                        line_items.append(LineItemDecisionSchema(
+                            description=_li.description,
+                            claimed_amount=_li.amount,
+                            approved_amount=round(_li.amount * _coverage_pct / 100.0, 2),
+                            linked_icd10=(
+                                _covered_diagnoses[0].icd10_code if _covered_diagnoses else None
+                            ),
+                        ))
+                else:
+                    line_items.append(LineItemDecisionSchema(
+                        description="Медицинские услуги",
+                        claimed_amount=_total_cl,
+                        approved_amount=_approved_total,
+                        linked_icd10=(
+                            _covered_diagnoses[0].icd10_code if _covered_diagnoses else None
+                        ),
+                    ))
+            log.info(
+                "amounts_computed_deterministically",
+                claim_id=str(claim_id),
+                total_claimed=_total_cl,
+                coverage_pct=_coverage_pct,
+                approved_total=_approved_total,
+                num_covered=len(_covered_diagnoses),
+            )
 
         # ── Шаг 26: второй проход для неуверенных диагнозов ───────
         # Один дополнительный узконаправленный вызов по самому спорному диагнозу.
@@ -1522,9 +1676,33 @@ async def make_decision(
             status = "rejected"
 
         # ── Маппинг на справочники кор-системы ───────────────────
-        # DiagnosID: инвертированный поиск кодов МКБ-10 прямо в OCR-документах.
-        # Код всегда присутствует в форме 100 verbatim — это надёжнее чем Claude-экстракция.
-        diagnosid, found_icd10_code = find_diagnosid_in_ocr(ocr_texts or [], icd10_list)
+        # DiagnosID: приоритет 1 — коды Claude из extraction; приоритет 2 — OCR regex.
+        # OCR regex даёт ложные срабатывания (комнаты, номера счетов вида "B30"),
+        # поэтому Claude-коды проверяются первыми.
+        diagnosid: str | None = None
+        found_icd10_code: str | None = None
+        for _diag in extraction.event.diagnoses:
+            if _diag.icd10_code:
+                _d = find_diagnosid(_diag.icd10_code, icd10_list)
+                if _d:
+                    diagnosid = _d
+                    found_icd10_code = _diag.icd10_code
+                    log.info(
+                        "diagnosid_from_claude_extraction",
+                        claim_id=str(claim_id),
+                        diagnosid=diagnosid,
+                        icd10_code=found_icd10_code,
+                    )
+                    break
+        if diagnosid is None:
+            diagnosid, found_icd10_code = find_diagnosid_in_ocr(ocr_texts or [], icd10_list)
+            if diagnosid:
+                log.info(
+                    "diagnosid_from_ocr_regex",
+                    claim_id=str(claim_id),
+                    diagnosid=diagnosid,
+                    icd10_code=found_icd10_code,
+                )
         if diagnosid is None:
             log.warning(
                 "diagnosid_not_found_in_docs",
@@ -1544,10 +1722,18 @@ async def make_decision(
             )
 
         # risks_list: детерминированный матчер рисков (risk_matcher.py)
-        # FinalAmount = claimed amount (не approved), config_kind=2 (акт возмещения)
-        # total_claimed передаётся как fallback если нет детализированных line_items
+        # Если есть строки из чеков (doc_source='receipt_*') — используем только их.
+        # Позиции формы 100 (анамнез, диагнозы, медикаменты) не должны попасть
+        # в кор-систему с большими суммами.
+        # Если чеков нет (нет doc_source или все из формы 100) — используем все позиции;
+        # match_risks fallback сам вернёт total_claimed если сумм нет.
+        _receipt_items = [
+            li for li in extraction.event.line_items
+            if li.doc_source and li.doc_source.startswith("receipt")
+        ]
+        _items_for_risk = _receipt_items if _receipt_items else extraction.event.line_items
         risks_list, risk_match_fallback = match_risks(
-            line_items=extraction.event.line_items,
+            line_items=_items_for_risk,
             risks=risks_limits.risks,
             event_date=extraction.event.date,
             form_100_text=form_100_ocr_text,
@@ -1556,30 +1742,7 @@ async def make_decision(
         )
         config_kind = 2
 
-        # PersID: инвертированный поиск — берём справочник провайдеров и ищем
-        # каждого в полном OCR-тексте. Надёжнее, чем извлекать название клиники
-        # из усечённого/искажённого OCR и потом fuzzy-матчить.
-        pers_id = find_pers_id_in_ocr(ocr_texts or [], providers)
-        if pers_id == 0 and extraction.event.institution:
-            # Fallback: старый метод по извлечённому institution
-            _institution_candidates: list[str | None] = [extraction.event.institution]
-            if extraction.cross_document:
-                _institution_candidates.append(
-                    extraction.cross_document.receipt.institution
-                    if extraction.cross_document.receipt else None
-                )
-                _institution_candidates.append(
-                    extraction.cross_document.form_100.institution
-                    if extraction.cross_document.form_100 else None
-                )
-            for _inst in _institution_candidates:
-                if _inst:
-                    pers_id = find_pers_id(_inst, providers)
-                    if pers_id:
-                        break
-        if pers_id == 0:
-            log.warning("pers_id_not_found", claim_id=str(claim_id),
-                        institution=extraction.event.institution)
+        # PersID уже вычислен выше (до всех early-return путей).
 
         # ── Stochastic QA sampling (Шаг 28) ──────────────────────
         # 5% автоодобренных заявок → manual_review для контроля точности.
