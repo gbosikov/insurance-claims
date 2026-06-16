@@ -15,7 +15,13 @@ class Settings(BaseSettings):
     redis_url: str
 
     # ── AI APIs ────────────────────────────────────────────────────
-    anthropic_api_key: str
+    anthropic_api_key: str = ""  # обязателен при LLM_PROVIDER=anthropic (дефолт)
+
+    # LLM_PROVIDER=gemini → переключиться на Google Gemini вместо Claude
+    llm_provider: str = "anthropic"   # anthropic | gemini
+    gemini_api_key: str = ""          # обязателен при LLM_PROVIDER=gemini
+    gemini_model: str = "gemini-2.0-flash"  # extraction + decision + indexer
+
     # Google: аутентификация через ADC.
     # В docker-compose передаётся через GOOGLE_APPLICATION_CREDENTIALS.
     # В коде google-cloud библиотеки подхватывают ADC автоматически — не читать вручную.
@@ -73,6 +79,10 @@ class Settings(BaseSettings):
 
     # Маркер в Objects.ObjectData: объект освобождён от периода ожидания
     core_api_waiting_period_exempt_marker: str = "არ ეკუთვნის მოცდის პერიოდი"
+
+    # Fallback-значения для ClaimParsing_UNI если данные не найдены в документах
+    core_api_diagnosid_fallback: str = "N145"  # МКБ-10 "неклассифицированный" если не найден в документах
+    core_api_pers_id_fallback: int = 914450    # PersID клиники по умолчанию (Cliniks.csv)
 
     # ── Пороги принятия решений ────────────────────────────────────
     confidence_auto_approve: float = 0.85
@@ -188,6 +198,12 @@ class Settings(BaseSettings):
     # Кламп фактора — одна плохая неделя не должна обнулить автоодобрение
     learning_calibration_factor_min: float = 0.5
     learning_calibration_factor_max: float = 1.2
+
+    # ── Rule-based Extraction (альтернатива Claude в Слое 4) ───────
+    # Включить после тестирования на реальных документах.
+    # Цель: снизить стоимость и latency extraction без потери качества.
+    extraction_use_rules: bool = False
+    extraction_rules_min_confidence: float = 0.60  # ниже → manual_review
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -435,6 +435,7 @@ async def test_full_decision_routing_with_mock_adapter_data():
             contract_chunks=chunks,
             submission_date=date(2026, 1, 20),
             db=db,
+            ocr_texts=["J06.9 ОРВИ Консультация 150.00 GEL"],
         )
 
     # Decision сформирован корректно
@@ -458,17 +459,17 @@ def test_diagnosid_mapping_case_insensitive():
 
     icd10_list = make_icd10_list()
 
-    assert find_diagnosid("j06.9", icd10_list) == 101   # нижний регистр
-    assert find_diagnosid("J06.9", icd10_list) == 101   # верхний регистр
-    assert find_diagnosid("J06.9 ", icd10_list) == 101  # с пробелом
+    assert find_diagnosid("j06.9", icd10_list) == "J06.9"   # нижний регистр → EXTCOD из справочника
+    assert find_diagnosid("J06.9", icd10_list) == "J06.9"   # верхний регистр
+    assert find_diagnosid("J06.9 ", icd10_list) == "J06.9"  # с пробелом
 
 
 def test_diagnosid_z00_maps_correctly():
-    """Z00.0 → diagnosid=102."""
+    """Z00.0 → EXTCOD "Z00.0"."""
     from layers.decision.service import find_diagnosid
 
     icd10_list = make_icd10_list()
-    assert find_diagnosid("Z00.0", icd10_list) == 102
+    assert find_diagnosid("Z00.0", icd10_list) == "Z00.0"
 
 
 # ─────────────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@
 import pytest
 
 from db.migration_utils import (
+    EXCLUSION_RULES_FILES,
     LEARNING_LOOP_FILES,
     LEGACY_BASELINE_FILES,
     MIGRATIONS_DIR,
@@ -51,7 +52,7 @@ def test_split_drops_comment_only_chunks():
 # ── Реальные файлы миграций ───────────────────────────────────────
 
 
-ALL_FILES = LEGACY_BASELINE_FILES + LEARNING_LOOP_FILES
+ALL_FILES = LEGACY_BASELINE_FILES + LEARNING_LOOP_FILES + EXCLUSION_RULES_FILES
 
 
 def test_file_lists_cover_migrations_dir():

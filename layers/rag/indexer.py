@@ -16,12 +16,12 @@ import json
 from datetime import date
 from uuid import UUID
 
-import anthropic
 import structlog
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import get_settings
+from core.llm_client import LLMAPIError, get_llm_client
 from core.models.contract import ContractChunk, ContractVersion, PositiveListProcedure
 from core.schemas.contract import ContractVersionSchema
 from core.storage import StorageClient
@@ -106,23 +106,26 @@ def compute_hash(content: bytes) -> str:
 
 async def chunk_contract_with_claude(text: str) -> list[dict]:
     """
-    Семантический chunking контракта через Claude API.
+    Семантический chunking контракта через LLM API.
     Возвращает список секций: [{section_type, title, content, key_terms}, ...]
     """
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    llm_client = get_llm_client()
 
-    response = await client.messages.create(
-        model=settings.claude_model,
-        max_tokens=settings.claude_chunking_max_tokens,
-        temperature=settings.claude_extraction_temperature,  # 0.0 — детерминированность
-        system=CHUNKING_SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": f"Раздели следующий страховой договор на смысловые секции:\n\n{text}"
-        }],
-    )
+    try:
+        result = await llm_client.call_text(
+            system=CHUNKING_SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"Раздели следующий страховой договор на смысловые секции:\n\n{text}"
+            }],
+            max_tokens=settings.claude_chunking_max_tokens,
+            temperature=settings.claude_extraction_temperature,
+        )
+    except LLMAPIError as e:
+        log.error("chunking_llm_error", error=str(e))
+        return [{"section_type": "general", "title": "Полный текст договора", "content": text, "key_terms": []}]
 
-    raw_text = response.content[0].text.strip()
+    raw_text = (result.text or "").strip()
 
     # Убираем markdown-обёртку если Claude всё же добавил
     if raw_text.startswith("```"):
@@ -414,20 +417,23 @@ async def parse_carveout_exclusions_with_claude(text: str) -> list[dict]:
 
     Может вернуть пустой список если CARVEOUT-ов не найдено.
     """
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    llm_client = get_llm_client()
 
-    response = await client.messages.create(
-        model=settings.claude_model,
-        max_tokens=settings.claude_chunking_max_tokens,
-        temperature=settings.claude_extraction_temperature,
-        system=CARVEOUT_STRUCTURING_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": f"Найди CARVEOUT-исключения в этом контракте:\n\n{text}"
-        }],
-    )
+    try:
+        result = await llm_client.call_text(
+            system=CARVEOUT_STRUCTURING_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"Найди CARVEOUT-исключения в этом контракте:\n\n{text}"
+            }],
+            max_tokens=settings.claude_chunking_max_tokens,
+            temperature=settings.claude_extraction_temperature,
+        )
+    except LLMAPIError as e:
+        log.warning("carveout_llm_error", error=str(e))
+        return []
 
-    raw_text = response.content[0].text.strip()
+    raw_text = (result.text or "").strip()
 
     # Убираем markdown-обёртку если Claude добавил
     if raw_text.startswith("```"):
@@ -661,35 +667,20 @@ POSITIVE_LIST_PARSING_PROMPT = """
 
 
 async def parse_positive_list_with_claude(text: str) -> list[dict]:
-    """Парсим POSITIVE LIST процедур из контракта через Claude API."""
-    from anthropic import AsyncAnthropic
-    from core.config import get_settings
-
-    settings = get_settings()
-    client = AsyncAnthropic(api_key=settings.anthropic_api_key)
-
+    """Парсим POSITIVE LIST процедур из контракта через LLM API."""
     try:
-        response = await client.messages.create(
-            model=settings.claude_model,
+        result = await get_llm_client().call_text(
+            system=POSITIVE_LIST_PARSING_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"Распарси POSITIVE LIST из этого контракта:\n\n{text}"
+            }],
             max_tokens=4096,
             temperature=0.0,
-            system=POSITIVE_LIST_PARSING_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Распарси POSITIVE LIST из этого контракта:\n\n{text}"
-                }
-            ]
         )
-
-        raw_text = response.content[0].text
+        raw_text = result.text or ""
         procedures = json.loads(raw_text)
-
-        if not isinstance(procedures, list):
-            procedures = []
-
-        return procedures
-
+        return procedures if isinstance(procedures, list) else []
     except json.JSONDecodeError:
         log.warning("positive_list_parsing_failed", reason="invalid_json")
         return []

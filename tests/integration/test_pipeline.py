@@ -104,6 +104,7 @@ async def test_extraction_to_decision_to_auto_approved():
             contract_chunks=chunks,
             submission_date=date(2026, 1, 20),
             db=db,
+            ocr_texts=["J06.9 ОРВИ Консультация 150.00 GEL"],
         )
 
     # Проверяем решение
@@ -111,7 +112,7 @@ async def test_extraction_to_decision_to_auto_approved():
     assert decision.overall_confidence == 0.91
     assert not decision.requires_manual_review
     assert decision.diagnoses[0].is_covered is True
-    assert decision.diagnosid == 101  # J06.9 → diagnosid из mock списка
+    assert decision.diagnosid == "J06.9"  # EXTCOD из mock списка
 
     # Routing
     result = await route_claim(claim=claim, decision=decision, db=db)
@@ -228,6 +229,7 @@ async def test_decision_not_covered_routes_to_rejected():
             contract_chunks=make_contract_chunks(),
             submission_date=date(2026, 1, 20),
             db=db,
+            ocr_texts=["J06.9 ОРВИ Консультация 150.00 GEL"],
         )
 
     assert decision.diagnoses[0].is_covered is False
@@ -336,21 +338,21 @@ async def test_extraction_output_drives_decision_input():
 
 
 def test_diagnosid_mapping_exact_match():
-    """J06.9 → diagnosid=101 (точное совпадение из icd10_list)."""
+    """J06.9 → EXTCOD "J06.9" (точное совпадение из icd10_list)."""
     from layers.decision.service import find_diagnosid
     icd10_list = make_icd10_list()
 
     diagnosid = find_diagnosid("J06.9", icd10_list)
-    assert diagnosid == 101
+    assert diagnosid == "J06.9"
 
 
 def test_diagnosid_mapping_prefix_fallback():
-    """J06 → diagnosid=101 через prefix-совпадение."""
+    """J06 → EXTCOD "J06.9" через prefix-совпадение."""
     from layers.decision.service import find_diagnosid
     icd10_list = make_icd10_list()
 
     diagnosid = find_diagnosid("J06", icd10_list)
-    assert diagnosid == 101
+    assert diagnosid == "J06.9"
 
 
 def test_diagnosid_mapping_not_found():

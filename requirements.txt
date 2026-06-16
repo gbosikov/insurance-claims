@@ -16,6 +16,8 @@ redis==5.0.4
 anthropic==0.109.1
 google-cloud-vision==3.7.2
 google-cloud-documentai==2.25.0
+google-generativeai>=0.8.0   # Gemini API legacy (оставлен как зависимость google-genai)
+google-genai>=2.0.0         # Gemini API новый SDK (google-generativeai deprecated)
 
 # ── Embeddings (локальная модель — RU + KA + EN) ─────────────────
 # multilingual-e5-large: ~1.1 GB, скачивается при первом старте worker

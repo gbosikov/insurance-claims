@@ -183,7 +183,7 @@ def make_risks_and_limits(remaining: float = 5000.0) -> RisksAndLimits:
         risks=[
             RiskInfo(
                 risk_id=1,
-                name="Амбулаторное лечение",
+                name="Амбулаторное лечение without referral",
                 coverage_pct=80.0,
                 total_limit=1000.0,
                 remaining_limit=remaining,

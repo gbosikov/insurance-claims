@@ -202,31 +202,50 @@ def match_risks(
     event_date: str,
     form_100_text: str,
     config_kind: int = 2,
+    total_claimed: float = 0.0,
 ) -> tuple[list[dict], bool]:
     """
     Подобрать риск для каждой услуги и построить RisksList для ClaimParsing_UNI.
 
     Args:
-        line_items:     услуги из ExtractionResult (claimed amounts)
-        risks:          список рисков из getpolicylist
-        event_date:     дата события YYYY-MM-DD
-        form_100_text:  OCR-текст формы 100 (для определения категории)
-        config_kind:    2 = акт возмещения (предпочесть свободный выбор)
+        line_items:    услуги из ExtractionResult (claimed amounts)
+        risks:         список рисков из getpolicylist
+        event_date:    дата события YYYY-MM-DD
+        form_100_text: OCR-текст формы 100 (для определения категории)
+        config_kind:   2 = акт возмещения (предпочесть свободный выбор)
+        total_claimed: сумма из заявки — используется если нет детализированных line_items
 
     Returns:
         (risks_list, needs_manual_review)
-        risks_list — список словарей для XML_DATA.RisksList
+        risks_list — список словарей для XML_DATA.RisksList (никогда не пустой если есть риски)
         needs_manual_review — True если хотя бы один риск подобран по fallback
     """
-    items = [li for li in line_items if li.amount > 0]
-    if not items:
-        return [], False
-
     category = detect_service_category(form_100_text)
     prefer_free_choice = (config_kind == 2)
 
     selected_risk, is_exact = _select_best_risk(risks, category, prefer_free_choice)
     needs_manual_review = not is_exact
+
+    items = [li for li in line_items if li.amount > 0]
+
+    # RisksList не должен быть пустым в ClaimParsing_UNI.
+    # Если нет детализированных строк — одна запись с total_claimed.
+    if not items:
+        if selected_risk is None or total_claimed <= 0:
+            return [], needs_manual_review
+        log.info(
+            "risk_matcher_fallback_total_claimed",
+            risk_id=selected_risk.risk_id,
+            risk_name=selected_risk.name[:60],
+            total_claimed=total_claimed,
+        )
+        return [{
+            "RiskID":      selected_risk.risk_id,
+            "FinalAmount": total_claimed,
+            "ServDate":    event_date,
+            "serviceid":   "",
+            "ServName":    "Медицинские услуги",
+        }], True  # needs_manual_review=True — нет детализации
 
     risks_list: list[dict] = []
 

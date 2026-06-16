@@ -18,17 +18,18 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from datetime import date
 from typing import Any
 from uuid import UUID
 
-import anthropic
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.audit import AuditTimer, write_audit_entry
 from core.config import get_settings
 from core.exceptions import PolicyLimitExhaustedError
+from core.llm_client import BaseLLMClient, LLMAPIError, LLMNoToolBlockError, get_llm_client
 from core.schemas.claim import ExtractionResult
 from core.schemas.contract import ContractChunkSchema
 from core.schemas.core_api import ICD10Item, ProviderInfo, RisksAndLimits
@@ -583,21 +584,66 @@ def apply_carveout_exclusion_logic(
 
 def find_diagnosid(icd10_code: str, icd10_list: list[ICD10Item]) -> str | None:
     """
-    DiagnosID для ClaimParsing_UNI = ICD10 код строкой (например "I10").
-    Проверяем наличие кода в справочнике; точное совпадение → возвращаем код,
-    prefix-fallback → возвращаем код из справочника (например J06 для J06.9).
+    Запасной поиск DiagnosID по коду МКБ-10. Возвращает EXTCOD (строку вида "J06.9").
+    Используется только если find_diagnosid_in_ocr вернул None.
     """
     code_upper = icd10_code.upper().strip()
     for item in icd10_list:
         if item.code.upper().strip() == code_upper:
             return item.code
-    # Fallback: совпадение по префиксу (J06 совпадёт с J06.9)
     prefix = code_upper.split(".")[0]
     for item in icd10_list:
         if item.code.upper().startswith(prefix):
             return item.code
-    # Код не найден в справочнике — возвращаем as-is (кор-система проверит)
-    return icd10_code if icd10_code.strip() else None
+    return None
+
+
+# Regex для поиска кодов МКБ-10 в OCR-тексте (Latin letter + digits, например J06.9, M54)
+_ICD10_OCR_RE = re.compile(r"\b([A-Z]\d{1,2}(?:\.[0-9]{1,2})?)\b", re.UNICODE)
+
+
+def find_diagnosid_in_ocr(
+    ocr_texts: list[str],
+    icd10_list: list[ICD10Item],
+) -> tuple[str | None, str | None]:
+    """
+    Инвертированный поиск диагноза в OCR-документах.
+
+    Алгоритм:
+    1. Извлечь все ICD-10-подобные паттерны из OCR ([A-Z]\\d{1,2}(\\.\\d{1,2})?)
+    2. Каждый найденный код проверить против локального справочника icd10_diagnoses
+    3. Совпадение → вернуть (EXTCOD, EXTCOD); ничего → (None, None) → requires_manual_review
+
+    Returns:
+        (diagnosid, icd10_code) — оба значения EXTCOD-строка вида "J06.9".
+        diagnosid передаётся в ClaimParsing_UNI как DiagnosID.
+    """
+    if not ocr_texts or not icd10_list:
+        return None, None
+
+    combined = " ".join(ocr_texts)
+    found_codes: set[str] = {m.upper() for m in _ICD10_OCR_RE.findall(combined)}
+
+    if not found_codes:
+        return None, None
+
+    # Индекс: код (верхний регистр) → ICD10Item
+    exact_map: dict[str, ICD10Item] = {item.code.upper(): item for item in icd10_list}
+
+    # 1. Точное совпадение
+    for code in sorted(found_codes):
+        if code in exact_map:
+            item = exact_map[code]
+            return item.code, item.code
+
+    # 2. Prefix-совпадение: J06 ↔ J06.9
+    for code in sorted(found_codes):
+        prefix = code.split(".")[0]
+        for db_code, item in exact_map.items():
+            if db_code.split(".")[0] == prefix:
+                return item.code, item.code
+
+    return None, None
 
 
 def build_risks_list(
@@ -656,28 +702,144 @@ def build_risks_list(
 
 # ── Поиск провайдера ──────────────────────────────────────────────
 
+# Правовые формы в начале названия провайдера — отбрасываем для core-поиска.
+# Используется в find_pers_id_in_ocr() для стрипания начала строки провайдера.
+_LEGAL_PREFIX_RE = re.compile(
+    r"^(?:შ\.?პ\.?ს\.?\s*[\"„]?\s*|შπс\s*[\"„]?\s*|"
+    r"ип\s+|ооо\s+|зао\s+|оао\s+|тоо\s+)",
+    re.IGNORECASE | re.UNICODE,
+)
+# Правовые формы в любой позиции строки (и префикс и суффикс) —
+# используется в find_pers_id() для нормализации OCR-строки учреждения.
+#
+# Georgian "შ.პ.ს." встречается в трёх вариантах написания:
+#   • Чистый Georgian:   შ.პ.ს.  (U+10E8, U+10DE, U+10E1)
+#   • Mixed Geoгрузинский+кириллица: შпс   (U+10E8, U+043F, U+0441)  ← самый частый в документах
+#   • Mixed Georgian+греческий:      შπс   (U+10E8, U+03C0, U+0441)  ← встречается в legacy-источниках
+# Символьный класс [პпπ] и [სс] охватывает все три варианта.
+_LEGAL_FORM_RE = re.compile(
+    r"შ\.?[პпπ]\.?[სс]\.?"  # Georgian LP: შ.პ.ს. / შпс / შπс
+    r"|\b(?:ип|ооо|зао|оао|тоо|пао)\b"               # Russian: ИП, ООО, ЗАО ...
+    r"|\b(?:llc|ltd|l\.l\.c\.|l\.t\.d\.|cjsc|jsc|inc|corp)\b",  # English
+    re.IGNORECASE | re.UNICODE,
+)
+# Пунктуация и лишние пробелы — нормализуем для сравнения
+_PUNCT_NORM_RE = re.compile(r'[\s"\'„"«»{}()\[\].,;:!?\-]+', re.UNICODE)
+
+
+def _institution_core(name: str) -> str:
+    """Нормализованное ядро названия: убираем правовые формы и пунктуацию."""
+    s = _LEGAL_FORM_RE.sub("", name.lower())
+    s = _PUNCT_NORM_RE.sub(" ", s)
+    return s.strip()
+
+
+def find_pers_id_in_ocr(ocr_texts: list[str], providers: list[ProviderInfo]) -> int:
+    """
+    Инвертированный поиск провайдера: берём всех провайдеров из справочника
+    и ищем каждого в полном тексте OCR-документов.
+
+    Преимущество перед find_pers_id: OCR может усекать название клиники,
+    переносить на несколько строк, добавлять мусор — но хотя бы часть
+    полного имени всегда присутствует где-то в тексте.
+
+    Алгоритм:
+    1. Объединить все OCR-тексты, привести к нижнему регистру
+    2. Для каждого провайдера вычислить "ядро" (без правовой формы)
+    3. Проверить: есть ли ядро как подстрока в OCR-тексте
+    4. Среди всех совпавших — вернуть провайдера с САМЫМ ДЛИННЫМ ядром
+       (наиболее специфичное совпадение выигрывает)
+    """
+    if not ocr_texts or not providers:
+        return 0
+
+    combined_lower = "\n".join(ocr_texts).lower()
+    # Нормализованный OCR: пунктуация → пробел (Georgian OCR часто добавляет лишние знаки)
+    combined_norm = _PUNCT_NORM_RE.sub(" ", combined_lower)
+
+    best_core_len = 0
+    best_id = 0
+
+    for p in providers:
+        p_lower = p.name.lower()
+
+        # Ядро: без правовой формы, без кавычек/пунктуации
+        p_core = _LEGAL_PREFIX_RE.sub("", p_lower).strip()
+        p_core_norm = _PUNCT_NORM_RE.sub(" ", p_core).strip()
+
+        if len(p_core_norm) < 5:
+            continue
+
+        if p_core_norm in combined_norm and len(p_core_norm) > best_core_len:
+            best_core_len = len(p_core_norm)
+            best_id = p.pers_id
+
+    return best_id
+
+
 def find_pers_id(institution: str | None, providers: list[ProviderInfo]) -> int:
     """
-    Найти PersID провайдера по названию учреждения из документов.
-    Сначала точное совпадение (без учёта регистра), затем по ИНН если передан,
-    затем частичное совпадение по подстроке.
-    Возвращает 0 если провайдер не найден.
+    Резервный поиск провайдера по извлечённому названию учреждения.
+    Используется как fallback если find_pers_id_in_ocr не нашёл результата.
+
+    Порядок поиска:
+    1. Точное совпадение (регистронезависимо)
+    2. Подстрока (один включает другой)
+    3. Точное совпадение нормализованных ядер (без правовых форм и пунктуации)
+    4. Подстрока нормализованных ядер
+    5. Fuzzy по нормализованным ядрам с порогом 0.65
+
+    Нормализация (_institution_core) убирает: ООО, შпс, LLC, Ltd и т.п.;
+    очищает пунктуацию/кавычки — это ключевое улучшение по сравнению со старым
+    подходом где "შпс „Аврора"" не матчился с "Аврора".
     """
+    from difflib import SequenceMatcher
+
     if not institution or not providers:
         return 0
 
     inst_lower = institution.lower().strip()
 
-    # Точное совпадение
+    # Шаг 1: точное совпадение сырых строк
     for p in providers:
         if p.name.lower().strip() == inst_lower:
             return p.pers_id
 
-    # Частичное совпадение: название провайдера содержится в названии учреждения или наоборот
+    # Шаг 2: подстрока сырых строк
     for p in providers:
         p_lower = p.name.lower().strip()
         if p_lower in inst_lower or inst_lower in p_lower:
             return p.pers_id
+
+    # Шаг 3-5: нормализованные ядра (без правовых форм и пунктуации)
+    inst_core = _institution_core(institution)
+    if len(inst_core) < 4:
+        return 0
+
+    # Шаг 3: точное совпадение ядер
+    for p in providers:
+        if _institution_core(p.name) == inst_core:
+            return p.pers_id
+
+    # Шаг 4: подстрока ядер
+    for p in providers:
+        p_core = _institution_core(p.name)
+        if len(p_core) >= 4 and (p_core in inst_core or inst_core in p_core):
+            return p.pers_id
+
+    # Шаг 5: fuzzy по нормализованным ядрам, порог 0.65
+    best_score = 0.0
+    best_id = 0
+    for p in providers:
+        p_core = _institution_core(p.name)
+        if not p_core:
+            continue
+        score = SequenceMatcher(None, inst_core, p_core).ratio()
+        if score > best_score:
+            best_score = score
+            best_id = p.pers_id
+    if best_score >= 0.65:
+        return best_id
 
     return 0
 
@@ -768,25 +930,10 @@ def _is_complex_case(extraction: ExtractionResult) -> bool:
     )
 
 
-def _build_thinking_kwargs() -> dict[str, Any]:
-    """
-    Kwargs Claude-вызова с thinking (Шаг 26).
-
-    Sonnet 4.6: adaptive thinking (budget_tokens устарел) — при смене модели
-    правится только эта функция. Ограничения API: с thinking принудительный
-    tool_choice недоступен (auto + текстовая инструкция), temperature опускается,
-    reasoning-токены входят в max_tokens (отдельный, увеличенный лимит).
-    """
-    return {
-        "max_tokens": settings.claude_decision_max_tokens_thinking,
-        "thinking": {"type": "adaptive"},
-        "tool_choice": {"type": "auto"},
-    }
-
 
 async def _second_pass_diagnosis(
     *,
-    client: "anthropic.AsyncAnthropic",
+    client: "BaseLLMClient",
     target: DiagnosisDecisionSchema,
     enriched: dict[str, EnrichedDiagnosis],
     contract_chunks: list[ContractChunkSchema],
@@ -837,27 +984,22 @@ async def _second_pass_diagnosis(
     sp_input_tokens = 0
     sp_output_tokens = 0
     try:
-        response = await client.messages.create(
-            model=settings.claude_model,
+        sp_result = await client.call_tool(
+            system=DECISION_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+            tool=DECISION_TOOL,
+            tool_name="make_claim_decision",
             max_tokens=settings.claude_decision_max_tokens,
             temperature=settings.claude_decision_temperature,
-            system=DECISION_SYSTEM_PROMPT,
-            tools=[DECISION_TOOL],
-            tool_choice={"type": "tool", "name": "make_claim_decision"},
-            messages=[{"role": "user", "content": prompt}],
         )
-        sp_input_tokens = response.usage.input_tokens
-        sp_output_tokens = response.usage.output_tokens
-    except anthropic.APIError as exc:
+        sp_input_tokens = sp_result.input_tokens
+        sp_output_tokens = sp_result.output_tokens
+    except (LLMAPIError, LLMNoToolBlockError) as exc:
         log.warning("second_pass_failed", claim_id=str(claim_id), error=str(exc))
         return False
 
-    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
-    if tool_block is None:
-        return False
-
     refined = next(
-        (d for d in (tool_block.input.get("diagnoses") or [])
+        (d for d in (sp_result.tool_input or {}).get("diagnoses") or []
          if d.get("icd10_code") == target.icd10_code),
         None,
     )
@@ -884,7 +1026,7 @@ async def _second_pass_diagnosis(
         },
         output_data={
             "after": target.model_dump(),
-            "claude_raw_response": tool_block.input,
+            "llm_raw_response": sp_result.tool_input,
             "input_tokens": sp_input_tokens,
             "output_tokens": sp_output_tokens,
         },
@@ -916,6 +1058,7 @@ async def make_decision(
     submission_date: date,
     db: AsyncSession,
     form_100_ocr_text: str = "",
+    ocr_texts: list[str] | None = None,
 ) -> ClaimDecision:
     """
     Принимает решение по заявке.
@@ -1161,19 +1304,18 @@ async def make_decision(
             matched_count=sum(1 for v in positive_list_match.values() if v[0]),
         )
 
-        # ── Уровень 2: Claude API ─────────────────────────────────
-        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        # ── Уровень 2: LLM API (Anthropic или Gemini) ────────────────
+        llm_client = get_llm_client()
         user_prompt = build_decision_prompt(
             extraction, enriched, risks_limits, contract_chunks,
             positive_list_match=positive_list_match,
         )
 
         # ── Шаг 26: режим рассуждения для сложных случаев ─────────
-        # thinking (если включён) покрывает цель CoT дешевле; явный
-        # двухпроходный CoT — только когда thinking выключен.
-        # _is_complex_case вычисляется лениво (short-circuit по флагам).
+        # thinking поддерживается только Anthropic; CoT работает с обоими.
         use_thinking = (
             bool(settings.decision_extended_thinking_enabled)
+            and llm_client.supports_thinking
             and _is_complex_case(extraction)
         )
         use_cot = (
@@ -1183,14 +1325,12 @@ async def make_decision(
         )
         reasoning_parts: list[str] = []
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
+        claude_input_tokens = 0
+        claude_output_tokens = 0
 
         try:
             if use_cot:
-                # CoT проход 1: свободное рассуждение без tool_choice
-                cot_response = await client.messages.create(
-                    model=settings.claude_model,
-                    max_tokens=settings.claude_decision_max_tokens,
-                    temperature=settings.claude_decision_temperature,
+                cot_result = await llm_client.call_text(
                     system=DECISION_SYSTEM_PROMPT,
                     messages=[{
                         "role": "user",
@@ -1199,43 +1339,41 @@ async def make_decision(
                             "применимые разделы договора, исключения. Пока БЕЗ финального решения."
                         ),
                     }],
+                    max_tokens=settings.claude_decision_max_tokens,
+                    temperature=settings.claude_decision_temperature,
                 )
-                cot_text = "\n".join(
-                    b.text for b in cot_response.content if getattr(b, "type", None) == "text"
-                )
+                cot_text = cot_result.text or ""
                 if cot_text:
                     reasoning_parts.append(cot_text)
                     messages = [{
                         "role": "user",
                         "content": f"{user_prompt}\n\n## Предварительный анализ\n{cot_text}",
                     }]
+                claude_input_tokens += cot_result.input_tokens
+                claude_output_tokens += cot_result.output_tokens
 
-            create_kwargs: dict[str, Any] = {
-                "model": settings.claude_model,
-                "system": DECISION_SYSTEM_PROMPT,
-                "tools": [DECISION_TOOL],
-                "messages": messages,
-            }
-            if use_thinking:
-                # Ограничения API: с thinking принудительный tool_choice недоступен
-                # (tool_choice=auto + текстовая инструкция), temperature опускается.
-                create_kwargs.update(_build_thinking_kwargs())
-                create_kwargs["messages"] = [{
-                    "role": "user",
-                    "content": user_prompt + "\n\nВызови инструмент make_claim_decision с финальным решением.",
-                }]
-            else:
-                create_kwargs["max_tokens"] = settings.claude_decision_max_tokens
-                create_kwargs["temperature"] = settings.claude_decision_temperature
-                create_kwargs["tool_choice"] = {"type": "tool", "name": "make_claim_decision"}
+            # thinking-путь: добавляем явную инструкцию вызвать инструмент
+            tool_messages = (
+                [{"role": "user", "content": user_prompt + "\n\nВызови инструмент make_claim_decision с финальным решением."}]
+                if use_thinking else messages
+            )
 
-            response = await client.messages.create(**create_kwargs)
-            claude_input_tokens = response.usage.input_tokens
-            claude_output_tokens = response.usage.output_tokens
-        except anthropic.APIError as e:
-            claude_input_tokens = 0
-            claude_output_tokens = 0
-            log.error("decision_claude_error", claim_id=str(claim_id), error=str(e))
+            main_result = await llm_client.call_tool(
+                system=DECISION_SYSTEM_PROMPT,
+                messages=tool_messages,
+                tool=DECISION_TOOL,
+                tool_name="make_claim_decision",
+                max_tokens=settings.claude_decision_max_tokens,
+                temperature=settings.claude_decision_temperature,
+                use_thinking=use_thinking,
+            )
+            claude_input_tokens += main_result.input_tokens
+            claude_output_tokens += main_result.output_tokens
+            if main_result.reasoning:
+                reasoning_parts.append(main_result.reasoning)
+
+        except (LLMAPIError, LLMNoToolBlockError) as e:
+            log.error("decision_llm_error", claim_id=str(claim_id), error=str(e))
             return ClaimDecision(
                 claim_id=claim_id,
                 diagnoses=[],
@@ -1244,7 +1382,7 @@ async def make_decision(
                 final_payout=0.0,
                 status="manual_review",
                 requires_manual_review=True,
-                manual_review_reason=f"Claude API error: {e}",
+                manual_review_reason=f"LLM API error: {e}",
                 fraud_flags=[],
                 overall_confidence=0.0,
                 summary=f"Ошибка AI-анализа: {e}. Требуется ручная проверка оператором.",
@@ -1252,30 +1390,7 @@ async def make_decision(
                 model_version=settings.claude_model,
             )
 
-        tool_block = next((b for b in response.content if b.type == "tool_use"), None)
-        if tool_block is None and use_thinking:
-            # thinking + tool_choice=auto → Claude может вернуть только текст.
-            # Повторный вызов без thinking с принудительным tool_choice.
-            log.warning("decision_thinking_no_tool_block_retry", claim_id=str(claim_id))
-            try:
-                retry_response = await client.messages.create(
-                    model=settings.claude_model,
-                    max_tokens=settings.claude_decision_max_tokens,
-                    temperature=settings.claude_decision_temperature,
-                    system=DECISION_SYSTEM_PROMPT,
-                    tools=[DECISION_TOOL],
-                    tool_choice={"type": "tool", "name": "make_claim_decision"},
-                    messages=[{"role": "user", "content": user_prompt}],
-                )
-                claude_input_tokens += retry_response.usage.input_tokens
-                claude_output_tokens += retry_response.usage.output_tokens
-                tool_block = next(
-                    (b for b in retry_response.content if b.type == "tool_use"), None
-                )
-            except anthropic.APIError as e:
-                log.error("decision_retry_claude_error", claim_id=str(claim_id), error=str(e))
-
-        if tool_block is None:
+        if main_result.tool_input is None:
             return ClaimDecision(
                 claim_id=claim_id,
                 diagnoses=[],
@@ -1284,7 +1399,7 @@ async def make_decision(
                 final_payout=0.0,
                 status="manual_review",
                 requires_manual_review=True,
-                manual_review_reason="Claude did not return tool_use block",
+                manual_review_reason="LLM did not return tool call result",
                 fraud_flags=[],
                 overall_confidence=0.0,
                 summary="AI не вернул структурированный ответ. Требуется ручная проверка.",
@@ -1292,16 +1407,11 @@ async def make_decision(
                 model_version=settings.claude_model,
             )
 
-        raw: dict[str, Any] = tool_block.input
+        raw: dict[str, Any] = main_result.tool_input  # type: ignore[assignment]
         fraud_flags = await fraud_task
 
-        # ── Шаг 26: reasoning из thinking/text блоков → audit ─────
-        for block in response.content:
-            block_type = getattr(block, "type", None)
-            if block_type == "thinking":
-                reasoning_parts.append(getattr(block, "thinking", "") or "")
-            elif block_type == "text":
-                reasoning_parts.append(getattr(block, "text", "") or "")
+        # ── Шаг 26: reasoning (thinking/CoT) → audit ──────────────
+        # reasoning_parts собраны выше: CoT-текст и/или thinking из main_result
         reasoning = "\n".join(p for p in reasoning_parts if p)
         reasoning = reasoning[:settings.decision_reasoning_audit_max_chars]
 
@@ -1345,7 +1455,7 @@ async def make_decision(
         ]
         if uncertain and not raw.get("requires_manual_review"):
             second_pass_applied = await _second_pass_diagnosis(
-                client=client,
+                client=llm_client,
                 target=min(uncertain, key=lambda d: d.confidence),
                 enriched=enriched,
                 contract_chunks=contract_chunks,
@@ -1412,30 +1522,64 @@ async def make_decision(
             status = "rejected"
 
         # ── Маппинг на справочники кор-системы ───────────────────
-        # DiagnosID: берём из первого диагноза с покрытием
-        diagnosid: str | None = None
-        for diag in diagnoses:
-            found = find_diagnosid(diag.icd10_code, icd10_list)
-            if found is not None:
-                diagnosid = found
-                break
-        # Если ни один не нашли — берём первый диагноз
-        if diagnosid is None and extraction.event.diagnoses:
-            diagnosid = find_diagnosid(extraction.event.diagnoses[0].icd10_code, icd10_list)
+        # DiagnosID: инвертированный поиск кодов МКБ-10 прямо в OCR-документах.
+        # Код всегда присутствует в форме 100 verbatim — это надёжнее чем Claude-экстракция.
+        diagnosid, found_icd10_code = find_diagnosid_in_ocr(ocr_texts or [], icd10_list)
+        if diagnosid is None:
+            log.warning(
+                "diagnosid_not_found_in_docs",
+                claim_id=str(claim_id),
+                claude_codes=[d.icd10_code for d in extraction.event.diagnoses],
+            )
+            # Диагноз не найден ни в одном документе → ручная проверка обязательна
+            raw["requires_manual_review"] = True
+            if not raw.get("manual_review_reason"):
+                raw["manual_review_reason"] = "diagnosis_not_found_in_docs"
+        else:
+            log.info(
+                "diagnosid_found_in_ocr",
+                claim_id=str(claim_id),
+                diagnosid=diagnosid,
+                icd10_code=found_icd10_code,
+            )
 
         # risks_list: детерминированный матчер рисков (risk_matcher.py)
         # FinalAmount = claimed amount (не approved), config_kind=2 (акт возмещения)
+        # total_claimed передаётся как fallback если нет детализированных line_items
         risks_list, risk_match_fallback = match_risks(
             line_items=extraction.event.line_items,
             risks=risks_limits.risks,
             event_date=extraction.event.date,
             form_100_text=form_100_ocr_text,
             config_kind=2,
+            total_claimed=extraction.event.total_claimed or 0.0,
         )
         config_kind = 2
 
-        # PersID: ищем по названию учреждения из документов
-        pers_id = find_pers_id(extraction.event.institution, providers)
+        # PersID: инвертированный поиск — берём справочник провайдеров и ищем
+        # каждого в полном OCR-тексте. Надёжнее, чем извлекать название клиники
+        # из усечённого/искажённого OCR и потом fuzzy-матчить.
+        pers_id = find_pers_id_in_ocr(ocr_texts or [], providers)
+        if pers_id == 0 and extraction.event.institution:
+            # Fallback: старый метод по извлечённому institution
+            _institution_candidates: list[str | None] = [extraction.event.institution]
+            if extraction.cross_document:
+                _institution_candidates.append(
+                    extraction.cross_document.receipt.institution
+                    if extraction.cross_document.receipt else None
+                )
+                _institution_candidates.append(
+                    extraction.cross_document.form_100.institution
+                    if extraction.cross_document.form_100 else None
+                )
+            for _inst in _institution_candidates:
+                if _inst:
+                    pers_id = find_pers_id(_inst, providers)
+                    if pers_id:
+                        break
+        if pers_id == 0:
+            log.warning("pers_id_not_found", claim_id=str(claim_id),
+                        institution=extraction.event.institution)
 
         # ── Stochastic QA sampling (Шаг 28) ──────────────────────
         # 5% автоодобренных заявок → manual_review для контроля точности.

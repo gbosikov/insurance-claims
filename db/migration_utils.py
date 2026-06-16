@@ -34,6 +34,12 @@ LEARNING_LOOP_FILES = [
     "010_amount_benchmarks.sql",
 ]
 
+# 011: правила исключений по вордингу (exclusion_rules).
+# Применяется ревизией 0003 (инлайн SQL); файл используется для initdb-бутстрапа.
+EXCLUSION_RULES_FILES = [
+    "011_exclusion_rules.sql",
+]
+
 
 def split_sql_statements(sql: str) -> list[str]:
     """

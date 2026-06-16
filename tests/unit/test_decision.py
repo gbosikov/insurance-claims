@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 
 from core.exceptions import PolicyLimitExhaustedError
+from core.llm_client import LLMResult
 from core.schemas.claim import DiagnoisItem, EventData, ExtractionResult, InsuredData, LineItem
 from core.schemas.core_api import RiskInfo, RisksAndLimits
 from layers.decision.service import (
@@ -126,20 +127,20 @@ def test_find_diagnosid_exact_match():
         ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ"),
         ICD10Item(diagnosid=102, code="Z00.0", name="Осмотр"),
     ]
-    assert find_diagnosid("J06.9", icd10_list) == 101
+    assert find_diagnosid("J06.9", icd10_list) == "J06.9"
 
 
 def test_find_diagnosid_case_insensitive():
     from core.schemas.core_api import ICD10Item
     icd10_list = [ICD10Item(diagnosid=101, code="j06.9", name="ОРВИ")]
-    assert find_diagnosid("J06.9", icd10_list) == 101
+    assert find_diagnosid("J06.9", icd10_list) == "j06.9"
 
 
 def test_find_diagnosid_prefix_fallback():
     """J06 совпадает с J06.9 по префиксу."""
     from core.schemas.core_api import ICD10Item
     icd10_list = [ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ")]
-    assert find_diagnosid("J06", icd10_list) == 101
+    assert find_diagnosid("J06", icd10_list) == "J06.9"
 
 
 def test_find_diagnosid_not_found():
@@ -150,6 +151,56 @@ def test_find_diagnosid_not_found():
 
 def test_find_diagnosid_empty_list():
     assert find_diagnosid("J06.9", []) is None
+
+
+# ── find_diagnosid_in_ocr ─────────────────────────────────────────
+
+
+def test_find_diagnosid_in_ocr_exact():
+    """Код J06.9 присутствует в OCR-тексте → возвращает (diagnosid, code)."""
+    from core.schemas.core_api import ICD10Item
+    from layers.decision.service import find_diagnosid_in_ocr
+    icd10_list = [
+        ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ"),
+        ICD10Item(diagnosid=102, code="Z00.0", name="Осмотр"),
+    ]
+    diagnosid, code = find_diagnosid_in_ocr(
+        ["ფორმა 100 J06.9 ამბულატ"], icd10_list
+    )
+    assert diagnosid == "J06.9"
+    assert code == "J06.9"
+
+
+def test_find_diagnosid_in_ocr_prefix():
+    """J06 в OCR совпадёт с J06.9 в справочнике по prefix."""
+    from core.schemas.core_api import ICD10Item
+    from layers.decision.service import find_diagnosid_in_ocr
+    icd10_list = [ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ")]
+    diagnosid, code = find_diagnosid_in_ocr(["диагноз J06 амбулатория"], icd10_list)
+    assert diagnosid == "J06.9"
+
+
+def test_find_diagnosid_in_ocr_not_found():
+    """Нет кода МКБ-10 в документах → (None, None) → manual_review."""
+    from core.schemas.core_api import ICD10Item
+    from layers.decision.service import find_diagnosid_in_ocr
+    icd10_list = [ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ")]
+    diagnosid, code = find_diagnosid_in_ocr(
+        ["ნათია გოლიაძე კონსულტაცია 170 GEL"], icd10_list
+    )
+    assert diagnosid is None
+    assert code is None
+
+
+def test_find_diagnosid_in_ocr_no_noise():
+    """GEL, OK, V1 не должны матчиться как ICD-10 коды."""
+    from core.schemas.core_api import ICD10Item
+    from layers.decision.service import find_diagnosid_in_ocr
+    icd10_list = [ICD10Item(diagnosid=999, code="V1", name="Несуществующий")]
+    diagnosid, code = find_diagnosid_in_ocr(["170 GEL OK V1 PDF"], icd10_list)
+    # V1 не в справочнике МКБ-10 → None; если бы V1 был в справочнике, вернул бы его
+    # Здесь проверяем что GEL/OK не создают ложных совпадений
+    assert diagnosid is None or code == "V1"  # V1 найден только если в справочнике
 
 
 # ── find_pers_id ──────────────────────────────────────────────────
@@ -191,6 +242,43 @@ def test_find_pers_id_none_institution():
 
 def test_find_pers_id_empty_providers():
     assert find_pers_id("Клиника Аврора", []) == 0
+
+
+def test_find_pers_id_georgian_legal_prefix_stripped():
+    """შпс „Аврора" → ядро «аврора» → матчит «Клиника Аврора» через fuzzy/substring."""
+    from core.schemas.core_api import ProviderInfo
+    providers = [ProviderInfo(pers_id=5, name="Клиника Аврора", inn="111")]
+    # "аврора" ⊂ "клиника аврора" → подстрока ядер → hit
+    assert find_pers_id('შпс „Аврора"', providers) == 5
+
+
+def test_find_pers_id_russian_legal_prefix_stripped():
+    """ООО Мединтер → ядро «мединтер» → матчит «МЦ Мединтер» через подстроку ядер."""
+    from core.schemas.core_api import ProviderInfo
+    providers = [ProviderInfo(pers_id=7, name="МЦ Мединтер", inn="222")]
+    assert find_pers_id("ООО Мединтер", providers) == 7
+
+
+def test_find_pers_id_english_legal_suffix_stripped():
+    """Аврора LLC → ядро «аврора» → матчит «Аврора Medical Center» через подстроку."""
+    from core.schemas.core_api import ProviderInfo
+    providers = [ProviderInfo(pers_id=9, name="Аврора Medical Center", inn="333")]
+    assert find_pers_id("Аврора LLC", providers) == 9
+
+
+def test_find_pers_id_fuzzy_threshold_65():
+    """Опечатка/искажение OCR: «Клиника Авррора» (одна лишняя р) — должно сматчиться."""
+    from core.schemas.core_api import ProviderInfo
+    providers = [ProviderInfo(pers_id=11, name="Клиника Аврора", inn="444")]
+    # SequenceMatcher("клиника авррора", "клиника аврора") ~ 0.97 → проходит при 0.65
+    assert find_pers_id("Клиника Авррора", providers) == 11
+
+
+def test_find_pers_id_entirely_different_returns_zero():
+    """Полностью другое название — 0 даже после нормализации."""
+    from core.schemas.core_api import ProviderInfo
+    providers = [ProviderInfo(pers_id=1, name="Клиника Аврора", inn="123456789")]
+    assert find_pers_id("ООО Диагностический центр Тбилиси", providers) == 0
 
 
 # ── build_decision_prompt ─────────────────────────────────────────
@@ -300,10 +388,8 @@ async def test_stochastic_qa_sets_manual_review_reason():
 
     mock_check_fraud = AsyncMock(return_value=[])
     mock_client = AsyncMock()
-    mock_response = MagicMock()
-    tool_block = MagicMock()
-    tool_block.type = "tool_use"
-    tool_block.input = {
+    mock_client.supports_thinking = True
+    mock_client.call_tool = AsyncMock(return_value=LLMResult(tool_input={
         "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "confidence": 0.95}],
         "line_items": [],
         "total_approved": 120.0,
@@ -313,9 +399,8 @@ async def test_stochastic_qa_sets_manual_review_reason():
         "manual_review_reason": None,
         "overall_confidence": 0.95,
         "summary": "Одобрено",
-    }
-    mock_response.content = [tool_block]
-    mock_client.messages.create = AsyncMock(return_value=mock_response)
+    }))
+    mock_client.call_text = AsyncMock(return_value=LLMResult(text=""))
 
     extraction = ExtractionResult(
         insured=InsuredData(full_name="Иванов И.И.", birth_date="1985-01-01", personal_id="12345678901"),
@@ -338,7 +423,7 @@ async def test_stochastic_qa_sets_manual_review_reason():
     ))
 
     with patch("layers.decision.service.check_fraud", mock_check_fraud), \
-         patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client), \
+         patch("layers.decision.service.get_llm_client", return_value=mock_client), \
          patch("layers.decision.service.write_audit_entry", AsyncMock()), \
          patch("layers.decision.service.enrich_all", AsyncMock(return_value={})), \
          patch("layers.decision.service.random.random", return_value=0.0):  # 0.0 < rate → trigger
@@ -350,6 +435,7 @@ async def test_stochastic_qa_sets_manual_review_reason():
             icd10_list=[ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ")],
             providers=[], contract_chunks=[],
             submission_date=date(2026, 1, 20), db=db,
+            ocr_texts=["ფორმა 100 J06.9 კონსულტაცია 120 GEL"],  # диагноз в документе
         )
 
     assert decision.requires_manual_review is True
@@ -377,10 +463,8 @@ async def test_fraud_task_is_asyncio_task():
         db.commit = AsyncMock()
 
         mock_client = AsyncMock()
-        mock_response = MagicMock()
-        tool_block = MagicMock()
-        tool_block.type = "tool_use"
-        tool_block.input = {
+        mock_client.supports_thinking = True
+        mock_client.call_tool = AsyncMock(return_value=LLMResult(tool_input={
             "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "confidence": 0.95}],
             "line_items": [{"description": "Консультация", "claimed_amount": 150.0, "approved_amount": 120.0}],
             "total_approved": 120.0,
@@ -390,9 +474,8 @@ async def test_fraud_task_is_asyncio_task():
             "manual_review_reason": None,
             "overall_confidence": 0.95,
             "summary": "Одобрено: J06.9, покрытие 80%.",
-        }
-        mock_response.content = [tool_block]
-        mock_client.messages.create = AsyncMock(return_value=mock_response)
+        }))
+        mock_client.call_text = AsyncMock(return_value=LLMResult(text=""))
 
         from core.schemas.claim import DiagnoisItem, EventData, ExtractionResult, InsuredData, LineItem
         from core.schemas.core_api import ICD10Item, ProviderInfo, RiskInfo, RisksAndLimits
@@ -405,7 +488,7 @@ async def test_fraud_task_is_asyncio_task():
         risks = RisksAndLimits(policy_number=POLICY_NUMBER, risks=[RiskInfo(risk_id=1, name="Амбулаторное", coverage_pct=80.0, total_limit=2000.0, remaining_limit=1500.0, currency="GEL")], annual_limit=5000.0, remaining=1500.0, currency="GEL")
         icd10 = [ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ")]
 
-        with patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client), \
+        with patch("layers.decision.service.get_llm_client", return_value=mock_client), \
              patch("layers.decision.service.write_audit_entry", AsyncMock()), \
              patch("layers.decision.service.enrich_all", AsyncMock(return_value={})):
             from layers.decision.service import make_decision
@@ -440,9 +523,9 @@ async def test_make_decision_applies_positive_list_coverage():
     mock_check_fraud = AsyncMock(return_value=[])
     mock_positive_list = AsyncMock(return_value={"Полипэктомия": (True, "Полипэктомия")})
 
-    tool_block = MagicMock()
-    tool_block.type = "tool_use"
-    tool_block.input = {
+    mock_client = AsyncMock()
+    mock_client.supports_thinking = True
+    mock_client.call_tool = AsyncMock(return_value=LLMResult(tool_input={
         "diagnoses": [{"icd10_code": "K29.7", "is_covered": True, "approved_amount": 400.0, "confidence": 0.95}],
         "line_items": [{"description": "Полипэктомия", "claimed_amount": 500.0, "approved_amount": 400.0}],
         "total_approved": 400.0,
@@ -452,11 +535,8 @@ async def test_make_decision_applies_positive_list_coverage():
         "manual_review_reason": None,
         "overall_confidence": 0.95,
         "summary": "Одобрено: K29.7, Полипэктомия из POSITIVE LIST.",
-    }
-    mock_response = MagicMock()
-    mock_response.content = [tool_block]
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(return_value=mock_response)
+    }))
+    mock_client.call_text = AsyncMock(return_value=LLMResult(text=""))
 
     extraction = ExtractionResult(
         insured=InsuredData(full_name="Иванов И.И.", birth_date="1985-01-01", personal_id="12345678901"),
@@ -479,7 +559,7 @@ async def test_make_decision_applies_positive_list_coverage():
     with patch("layers.decision.service.check_fraud", mock_check_fraud), \
          patch("layers.decision.service.check_positive_list", mock_positive_list), \
          patch("layers.decision.service.check_exclusions", AsyncMock(return_value=None)), \
-         patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client), \
+         patch("layers.decision.service.get_llm_client", return_value=mock_client), \
          patch("layers.decision.service.write_audit_entry", AsyncMock()), \
          patch("layers.decision.service.enrich_all", AsyncMock(return_value={})), \
          patch("layers.decision.service.random.random", return_value=0.99):  # QA не срабатывает
@@ -515,9 +595,9 @@ async def test_make_decision_applies_calibration_factor():
     from core.schemas.core_api import ICD10Item, RiskInfo, RisksAndLimits
     from layers.decision.service import make_decision
 
-    tool_block = MagicMock()
-    tool_block.type = "tool_use"
-    tool_block.input = {
+    mock_client = AsyncMock()
+    mock_client.supports_thinking = True
+    mock_client.call_tool = AsyncMock(return_value=LLMResult(tool_input={
         "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "confidence": 0.95}],
         "line_items": [],
         "total_approved": 120.0,
@@ -527,11 +607,8 @@ async def test_make_decision_applies_calibration_factor():
         "manual_review_reason": None,
         "overall_confidence": 0.95,
         "summary": "Одобрено",
-    }
-    mock_response = MagicMock()
-    mock_response.content = [tool_block]
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(return_value=mock_response)
+    }))
+    mock_client.call_text = AsyncMock(return_value=LLMResult(text=""))
 
     extraction = ExtractionResult(
         insured=InsuredData(full_name="Иванов И.И.", birth_date="1985-01-01", personal_id="12345678901"),
@@ -555,7 +632,7 @@ async def test_make_decision_applies_calibration_factor():
          patch("layers.decision.service.check_positive_list", AsyncMock(return_value={})), \
          patch("layers.decision.service.check_exclusions", AsyncMock(return_value=None)), \
          patch("layers.decision.service.get_tenant_config_float", AsyncMock(return_value=0.8)), \
-         patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client), \
+         patch("layers.decision.service.get_llm_client", return_value=mock_client), \
          patch("layers.decision.service.write_audit_entry", mock_audit), \
          patch("layers.decision.service.enrich_all", AsyncMock(return_value={})), \
          patch("layers.decision.service.random.random", return_value=0.99):

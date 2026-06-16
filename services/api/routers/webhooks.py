@@ -257,7 +257,7 @@ async def webhook_contract_updated(
         log.error(
             "webhook_signature_verification_failed",
             webhook_id=webhook_id,
-            event="contract_updated",
+            event_type="contract_updated",
             signature_present=x_webhook_signature is not None,
         )
         raise HTTPException(
@@ -268,7 +268,7 @@ async def webhook_contract_updated(
     log.info(
         "webhook_signature_verified",
         webhook_id=webhook_id,
-        event="contract_updated",
+        event_type="contract_updated",
     )
 
     # ── Parse and validate payload ─────────────────────────────────
@@ -278,7 +278,7 @@ async def webhook_contract_updated(
         log.error(
             "webhook_payload_parse_error",
             webhook_id=webhook_id,
-            event="contract_updated",
+            event_type="contract_updated",
             error=str(e),
         )
         raise HTTPException(
@@ -290,7 +290,7 @@ async def webhook_contract_updated(
     log.info(
         "webhook_received",
         webhook_id=webhook_id,
-        event="contract_updated",
+        event_type="contract_updated",
         policy_number=payload.policy_number,
         version_id=payload.version_id,
         reason=payload.reason,
@@ -402,7 +402,7 @@ async def webhook_policy_status_changed(
         log.error(
             "webhook_signature_verification_failed",
             webhook_id=webhook_id,
-            event="policy_status_changed",
+            event_type="policy_status_changed",
             signature_present=x_webhook_signature is not None,
         )
         raise HTTPException(
@@ -413,7 +413,7 @@ async def webhook_policy_status_changed(
     log.info(
         "webhook_signature_verified",
         webhook_id=webhook_id,
-        event="policy_status_changed",
+        event_type="policy_status_changed",
     )
 
     # ── Parse and validate payload ─────────────────────────────────
@@ -423,7 +423,7 @@ async def webhook_policy_status_changed(
         log.error(
             "webhook_payload_parse_error",
             webhook_id=webhook_id,
-            event="policy_status_changed",
+            event_type="policy_status_changed",
             error=str(e),
         )
         raise HTTPException(
@@ -434,7 +434,7 @@ async def webhook_policy_status_changed(
     log.info(
         "webhook_received",
         webhook_id=webhook_id,
-        event="policy_status_changed",
+        event_type="policy_status_changed",
         policy_number=payload.policy_number,
         status=payload.status,
         timestamp=payload.timestamp,

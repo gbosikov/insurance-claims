@@ -148,16 +148,16 @@ def test_cross_validate_without_cross_document_backward_compatible():
 
 
 def test_cross_validate_name_mismatch():
-    """ФИО в form_100 и id_document расходятся → name_mismatch + снижение confidence."""
+    """ФИО не сравниваются (транслитерация RU/KA/EN): разные имена не дают флага."""
     extraction = make_extraction(cross_document=make_cross_document(
         form_name="Иванов Иван Иванович",
         id_name="Петросян Арам Гарикович",
     ))
     updated, warnings = cross_validate(extraction, [], date(2026, 1, 20))
 
-    assert "name_mismatch" in updated.flags
-    assert updated.extraction_confidence < 0.92
-    assert any("Name mismatch" in w for w in warnings)
+    # Имена намеренно не сравниваются: верификация личности по personal_id vs getpolicylist.
+    assert "name_mismatch" not in updated.flags
+    assert updated.extraction_confidence == pytest.approx(0.92)
 
 
 def test_cross_validate_birth_date_mismatch():

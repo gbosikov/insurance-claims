@@ -33,8 +33,8 @@ class TestCheckPositiveList:
         mock_db = AsyncMock(spec=AsyncSession)
 
         # Эмулируем пустой результат SELECT
-        mock_result = AsyncMock()
-        mock_result.scalars.return_value.all.return_value = []
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value =[]
         mock_db.execute.return_value = mock_result
 
         line_items = [
@@ -64,8 +64,8 @@ class TestCheckPositiveList:
         proc.section_reference = "1.7.3"
 
         mock_db = AsyncMock(spec=AsyncSession)
-        mock_result = AsyncMock()
-        mock_result.scalars.return_value.all.return_value = [proc]
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value =[proc]
         mock_db.execute.return_value = mock_result
 
         line_items = [
@@ -88,13 +88,13 @@ class TestCheckPositiveList:
         """Если совпадение ≥ 0.70 → в POSITIVE LIST."""
         proc = MagicMock(spec=PositiveListProcedure)
         proc.procedure_name_ka = "უჰ პოლიპექტომია"  # грузинское
-        proc.procedure_name_ru = "Полипэктомия толстой кишки"
+        proc.procedure_name_ru = "Полипэктомия кишки"
         proc.procedure_name_en = "Polypectomy"
         proc.section_reference = "1.7.3"
 
         mock_db = AsyncMock(spec=AsyncSession)
-        mock_result = AsyncMock()
-        mock_result.scalars.return_value.all.return_value = [proc]
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value =[proc]
         mock_db.execute.return_value = mock_result
 
         line_items = [
@@ -121,8 +121,8 @@ class TestCheckPositiveList:
         proc.procedure_name_en = "Cataract surgery"
 
         mock_db = AsyncMock(spec=AsyncSession)
-        mock_result = AsyncMock()
-        mock_result.scalars.return_value.all.return_value = [proc]
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value =[proc]
         mock_db.execute.return_value = mock_result
 
         line_items = [
@@ -153,8 +153,8 @@ class TestCheckPositiveList:
         proc2.procedure_name_en = "Adenoidectomy"
 
         mock_db = AsyncMock(spec=AsyncSession)
-        mock_result = AsyncMock()
-        mock_result.scalars.return_value.all.return_value = [proc1, proc2]
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value =[proc1, proc2]
         mock_db.execute.return_value = mock_result
 
         line_items = [
@@ -184,8 +184,8 @@ class TestCheckPositiveList:
         proc.procedure_name_en = None
 
         mock_db = AsyncMock(spec=AsyncSession)
-        mock_result = AsyncMock()
-        mock_result.scalars.return_value.all.return_value = [proc]
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value =[proc]
         mock_db.execute.return_value = mock_result
 
         line_items = [

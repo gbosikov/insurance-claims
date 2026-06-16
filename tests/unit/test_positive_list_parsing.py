@@ -6,14 +6,22 @@ from uuid import UUID
 
 import pytest
 
+from core.llm_client import LLMResult
 from layers.rag.indexer import (
     parse_positive_list_with_claude,
     create_positive_list_records,
 )
 
 
+def _mock_llm_text(text: str) -> MagicMock:
+    """Фабрика: мок get_llm_client() возвращающий заданный текст из call_text."""
+    mock_client = AsyncMock()
+    mock_client.call_text = AsyncMock(return_value=LLMResult(text=text))
+    return mock_client
+
+
 class TestPositiveListParsing:
-    """Тесты для парсинга POSITIVE LIST через Claude."""
+    """Тесты для парсинга POSITIVE LIST через LLM."""
 
     @pytest.mark.asyncio
     async def test_parse_positive_list_success(self):
@@ -24,8 +32,7 @@ class TestPositiveListParsing:
         - ადენოიდექტომია (adenoidectomy) - სრული ანესთეზია
         """
 
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text=json.dumps([
+        payload = json.dumps([
             {
                 "procedure_name_ka": "პოლიპექტომია",
                 "procedure_name_ru": "Полипэктомия",
@@ -44,13 +51,9 @@ class TestPositiveListParsing:
                 "sublimit": None,
                 "section_reference": "1.7.3"
             }
-        ]))]
+        ])
 
-        with patch("anthropic.AsyncAnthropic") as mock_anthropic:
-            mock_client = AsyncMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-
+        with patch("layers.rag.indexer.get_llm_client", return_value=_mock_llm_text(payload)):
             result = await parse_positive_list_with_claude(contract_text)
 
             assert len(result) == 2
@@ -61,49 +64,24 @@ class TestPositiveListParsing:
     @pytest.mark.asyncio
     async def test_parse_positive_list_empty(self):
         """Если в контракте нет POSITIVE LIST, возвращаем пустой список."""
-        contract_text = "Обычный текст контракта без POSITIVE LIST."
-
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="[]")]
-
-        with patch("anthropic.AsyncAnthropic") as mock_anthropic:
-            mock_client = AsyncMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-
-            result = await parse_positive_list_with_claude(contract_text)
-
+        with patch("layers.rag.indexer.get_llm_client", return_value=_mock_llm_text("[]")):
+            result = await parse_positive_list_with_claude("Обычный текст контракта без POSITIVE LIST.")
             assert result == []
 
     @pytest.mark.asyncio
     async def test_parse_positive_list_invalid_json(self):
-        """Если Claude вернул невалидный JSON, логируем ошибку и возвращаем []."""
-        contract_text = "Some contract text"
-
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="Not valid JSON {")]
-
-        with patch("anthropic.AsyncAnthropic") as mock_anthropic:
-            mock_client = AsyncMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-
-            result = await parse_positive_list_with_claude(contract_text)
-
+        """Если LLM вернул невалидный JSON, логируем ошибку и возвращаем []."""
+        with patch("layers.rag.indexer.get_llm_client", return_value=_mock_llm_text("Not valid JSON {")):
+            result = await parse_positive_list_with_claude("Some contract text")
             assert result == []
 
     @pytest.mark.asyncio
     async def test_parse_positive_list_api_error(self):
-        """При ошибке API логируем и возвращаем []."""
-        contract_text = "Contract text"
-
-        with patch("anthropic.AsyncAnthropic") as mock_anthropic:
-            mock_client = AsyncMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(side_effect=Exception("API Error"))
-
-            result = await parse_positive_list_with_claude(contract_text)
-
+        """При ошибке LLM логируем и возвращаем []."""
+        mock_client = AsyncMock()
+        mock_client.call_text = AsyncMock(side_effect=Exception("API Error"))
+        with patch("layers.rag.indexer.get_llm_client", return_value=mock_client):
+            result = await parse_positive_list_with_claude("Contract text")
             assert result == []
 
 
@@ -183,7 +161,6 @@ class TestCreatePositiveListRecords:
             db=mock_db,
         )
 
-        # Только одна процедура должна быть сохранена
         assert result == 1
 
     @pytest.mark.asyncio
@@ -197,7 +174,7 @@ class TestCreatePositiveListRecords:
             },
             {
                 "procedure_name_ka": "ადენოიდექტომია",
-                "procedure_name_ru": "Аденоидэктомия",
+                "procedure_name_ru": "Аденоидэктომია",
                 "section_reference": "1.7.3"
             },
             {
@@ -237,7 +214,6 @@ class TestPositiveListIntegration:
             "section_reference": "1.7.3"
         }
 
-        # Проверяем все обязательные поля
         assert procedure["procedure_name_ka"]
         assert procedure["coverage_percent"] == 100.0
         assert procedure["section_reference"]
@@ -247,10 +223,9 @@ class TestPositiveListIntegration:
         procedure = {
             "procedure_name_ka": "პოლიპექტომია",
             "procedure_name_ru": "Полипэктомия",
-            "coverage_percent": 100.0,  # ← ВСЕГДА 100%
+            "coverage_percent": 100.0,
         }
 
-        # Если in POSITIVE LIST → approved_amount = claimed_amount * coverage_percent
         claimed = 500.0
         approved = claimed * (procedure["coverage_percent"] / 100.0)
         assert approved == 500.0

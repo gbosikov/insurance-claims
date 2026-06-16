@@ -305,6 +305,7 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                 submission_date=submission_date,
                 db=db,
                 form_100_ocr_text=form_100_ocr_text,
+                ocr_texts=[r.full_text for r in ocr_results if r.full_text],
             )
 
             # ── Шаг 8: ClaimParsing_UNI — ВСЕГДА ─────────────────
@@ -316,16 +317,19 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
             try:
                 file_fields = await documents_to_file_fields(documents, storage)
 
+                _comment = decision.summary or (
+                    f"Требуется ручная проверка. Причина: {decision.manual_review_reason or 'нет данных'}"
+                )
                 core_result = await core_adapter.submit_claim(
                     policy_number=policy_number,
-                    diagnosid=decision.diagnosid or 0,
+                    diagnosid=decision.diagnosid or settings.core_api_diagnosid_fallback,
                     event_start_date=extraction.event.date,
                     event_end_date=extraction.event.date,
-                    pers_id=decision.pers_id or 0,
+                    pers_id=decision.pers_id or settings.core_api_pers_id_fallback,
                     config_kind=decision.config_kind or 0,
                     risks_list=decision.risks_list,
                     file_fields=file_fields,
-                    comment=decision.summary,
+                    comment=_comment,
                 )
 
                 log.info(
@@ -344,12 +348,12 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                     step="core_submit",
                     input_data={
                         "PolicyNumber":   policy_number,
-                        "DiagnosID":      decision.diagnosid or 0,
+                        "DiagnosID":      decision.diagnosid or settings.core_api_diagnosid_fallback,
                         "EventStartDate": extraction.event.date,
                         "EventEndDate":   extraction.event.date,
-                        "PersID":         decision.pers_id or 0,
+                        "PersID":         decision.pers_id or settings.core_api_pers_id_fallback,
                         "ConfigKind":     decision.config_kind or 0,
-                        "Comment":        (decision.summary or "")[:500],
+                        "Comment":        _comment[:500],
                         "RisksList":      decision.risks_list,
                         "files_count":    len(file_fields),
                     },

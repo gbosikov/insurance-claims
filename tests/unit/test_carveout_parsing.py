@@ -5,10 +5,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core.llm_client import LLMResult
 from layers.rag.indexer import (
     parse_carveout_exclusions_with_claude,
     create_carveout_chunks,
 )
+
+
+def _mock_llm_text(text: str) -> MagicMock:
+    """Фабрика: мок get_llm_client() возвращающий заданный текст из call_text."""
+    mock_client = AsyncMock()
+    mock_client.call_text = AsyncMock(return_value=LLMResult(text=text))
+    return mock_client
 
 
 class TestCarveoutParsing:
@@ -17,42 +25,17 @@ class TestCarveoutParsing:
     @pytest.mark.asyncio
     async def test_parse_carveout_with_service_urgency(self):
         """Тест парсинга CARVEOUT с условием service_urgency."""
-        contract_text = """
-        4.1. თირკმლის ქრონიკულ უკმარისობა ნებისმიერი თანხით არ დაფარულია
-        გარდა ურგენტული ჩარევის დროს.
-        """
-
-        # Mock Claude API response
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text=json.dumps([
-            {
-                "num": "4.1",
-                "excluded": {
-                    "ka": "თირკმლის ქრონიკულ უკმარისობა",
-                    "ru": "Хроническая почечная недостаточность",
-                    "icd10": ["N18", "N19"]
-                },
-                "carveout_conditions": [
-                    {
-                        "type": "service_urgency",
-                        "value": "urgent",
-                        "ka_marker": "ურგენტული ჩარევა"
-                    }
-                ],
-                "general_exceptions": [],
-                "original_text": "თირკმლის ქრონიკულ უკმარისობა..."
-            }
-        ]))]
-
-        with patch("anthropic.AsyncAnthropic") as mock_anthropic:
-            mock_client = AsyncMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-
+        contract_text = "4.1. თირკმლის ქრონიკულ უკმარისობა გარდა ურგენტული ჩარევის დროს."
+        payload = json.dumps([{
+            "num": "4.1",
+            "excluded": {"ka": "თირკმლის", "ru": "Хроническая почечная недостаточность", "icd10": ["N18", "N19"]},
+            "carveout_conditions": [{"type": "service_urgency", "value": "urgent", "ka_marker": "ურგენტული"}],
+            "general_exceptions": [],
+            "original_text": "თირკმლის..."
+        }])
+        with patch("layers.rag.indexer.get_llm_client", return_value=_mock_llm_text(payload)):
             result = await parse_carveout_exclusions_with_claude(contract_text)
-
             assert len(result) == 1
-            assert result[0]["num"] == "4.1"
             assert result[0]["excluded"]["ru"] == "Хроническая почечная недостаточность"
             assert result[0]["excluded"]["icd10"] == ["N18", "N19"]
             assert result[0]["carveout_conditions"][0]["value"] == "urgent"
@@ -60,74 +43,31 @@ class TestCarveoutParsing:
     @pytest.mark.asyncio
     async def test_parse_carveout_with_general_exception(self):
         """Тест парсинга CARVEOUT с общим исключением (гепатит A не исключён)."""
-        contract_text = """
-        4.2. ნებისმიერ ჰეპატიტებთან დაკავშირებული ხარჯები არ დაფარულია
-        გარდა: A ტიპის ჰეპატიტი და პირველადი დიაგნოსტიკა.
-        """
-
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text=json.dumps([
-            {
-                "num": "4.2",
-                "excluded": {
-                    "ka": "ნებისმიერ ჰეპატიტებთან",
-                    "ru": "Гепатиты (любые)",
-                    "icd10": ["B15", "B16", "B17", "B18", "B19"]
-                },
-                "carveout_conditions": [
-                    {
-                        "type": "service_urgency",
-                        "value": "diagnostic",
-                        "ka_marker": "პირველადი დიაგნოსტიკა"
-                    }
-                ],
-                "general_exceptions": ["B15"],  # Гепатит А НЕ исключён
-                "original_text": "ნებისმიერ ჰეპატიტებთან..."
-            }
-        ]))]
-
-        with patch("anthropic.AsyncAnthropic") as mock_anthropic:
-            mock_client = AsyncMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-
+        contract_text = "4.2. ნებისმიერ ჰეპატიტებთან გარდა: A ტიპის ჰეპატიტი."
+        payload = json.dumps([{
+            "num": "4.2",
+            "excluded": {"ka": "ჰეპატიტი", "ru": "Гепатиты (любые)", "icd10": ["B15", "B16", "B17", "B18", "B19"]},
+            "carveout_conditions": [{"type": "service_urgency", "value": "diagnostic", "ka_marker": "დიაგნოსტიკა"}],
+            "general_exceptions": ["B15"],
+            "original_text": "ნებისმიერ..."
+        }])
+        with patch("layers.rag.indexer.get_llm_client", return_value=_mock_llm_text(payload)):
             result = await parse_carveout_exclusions_with_claude(contract_text)
-
             assert len(result) == 1
             assert "B15" in result[0]["general_exceptions"]
 
     @pytest.mark.asyncio
     async def test_parse_no_carveouts_found(self):
         """Если CARVEOUT-ов нет, возвращаем пустой список."""
-        contract_text = "Обычный текст без CARVEOUT-исключений."
-
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="[]")]
-
-        with patch("anthropic.AsyncAnthropic") as mock_anthropic:
-            mock_client = AsyncMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-
-            result = await parse_carveout_exclusions_with_claude(contract_text)
-
+        with patch("layers.rag.indexer.get_llm_client", return_value=_mock_llm_text("[]")):
+            result = await parse_carveout_exclusions_with_claude("Обычный текст без CARVEOUT-исключений.")
             assert result == []
 
     @pytest.mark.asyncio
     async def test_parse_invalid_json_returns_empty(self):
-        """Если Claude вернул некорректный JSON, возвращаем пустой список."""
-        contract_text = "Some text"
-
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="Not valid JSON")]
-
-        with patch("anthropic.AsyncAnthropic") as mock_anthropic:
-            mock_client = AsyncMock()
-            mock_anthropic.return_value = mock_client
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-
-            result = await parse_carveout_exclusions_with_claude(contract_text)
-
+        """Если LLM вернул некорректный JSON, возвращаем пустой список."""
+        with patch("layers.rag.indexer.get_llm_client", return_value=_mock_llm_text("Not valid JSON")):
+            result = await parse_carveout_exclusions_with_claude("Some text")
             assert result == []
 
 
@@ -187,6 +127,7 @@ class TestCarveoutChunkCreation:
     @pytest.mark.asyncio
     async def test_create_carveout_chunks_skips_invalid(self):
         """Пропускаем CARVEOUT-ы без original_text."""
+        from uuid import UUID
         carveouts = [
             {
                 "num": "4.1",

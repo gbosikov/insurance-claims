@@ -9,11 +9,12 @@ Unit тесты: качество решений (Шаги 21, 22, 23, 26).
 """
 
 from datetime import date
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
 import pytest
 
+from core.llm_client import LLMResult
 from core.schemas.claim import DiagnoisItem, EventData, ExtractionResult, InsuredData, LineItem
 from core.schemas.contract import ContractChunkSchema
 from core.schemas.core_api import ICD10Item, RiskInfo, RisksAndLimits
@@ -56,7 +57,7 @@ def make_risks(
     return RisksAndLimits(
         policy_number=POLICY_NUMBER,
         risks=[RiskInfo(
-            risk_id=1, name="Амбулаторное", coverage_pct=80.0,
+            risk_id=1, name="Амбулаторное without referral", coverage_pct=80.0,
             total_limit=2000.0, remaining_limit=remaining, currency="GEL",
             sublimit=sublimit,
         )],
@@ -65,15 +66,14 @@ def make_risks(
     )
 
 
-def make_tool_response(
+def make_tool_input(
     overall_confidence: float = 0.95,
     diagnosis_confidence: float = 0.95,
     coherence_flags: list[str] | None = None,
     requires_manual_review: bool = False,
-) -> MagicMock:
-    tool_block = MagicMock()
-    tool_block.type = "tool_use"
-    tool_block.input = {
+) -> dict:
+    """Возвращает tool_input dict для LLMResult."""
+    d = {
         "diagnoses": [{
             "icd10_code": "J06.9", "is_covered": True,
             "approved_amount": 96.0, "confidence": diagnosis_confidence,
@@ -88,28 +88,44 @@ def make_tool_response(
         "summary": "Одобрено",
     }
     if coherence_flags is not None:
-        tool_block.input["coherence_flags"] = coherence_flags
-    response = MagicMock()
-    response.content = [tool_block]
-    return response
+        d["coherence_flags"] = coherence_flags
+    return d
 
 
-def decision_patches(mock_client, audit_mock=None):
+def make_llm_mock(
+    overall_confidence: float = 0.95,
+    diagnosis_confidence: float = 0.95,
+    coherence_flags: list[str] | None = None,
+    requires_manual_review: bool = False,
+    reasoning: str | None = None,
+) -> AsyncMock:
+    """Мок BaseLLMClient возвращающий заданный tool_input."""
+    mock = AsyncMock()
+    mock.supports_thinking = True
+    mock.call_tool = AsyncMock(return_value=LLMResult(
+        tool_input=make_tool_input(overall_confidence, diagnosis_confidence, coherence_flags, requires_manual_review),
+        reasoning=reasoning,
+    ))
+    mock.call_text = AsyncMock(return_value=LLMResult(text=""))
+    return mock
+
+
+def decision_patches(mock_llm, audit_mock=None):
     """Стандартный набор патчей для make_decision без БД и внешних API."""
     return [
         patch("layers.decision.service.check_fraud", AsyncMock(return_value=[])),
         patch("layers.decision.service.check_positive_list", AsyncMock(return_value={})),
         patch("layers.decision.service.check_exclusions", AsyncMock(return_value=None)),
         patch("layers.decision.service.get_tenant_config_float", AsyncMock(return_value=1.0)),
-        patch("layers.decision.service.anthropic.AsyncAnthropic", return_value=mock_client),
+        patch("layers.decision.service.get_llm_client", return_value=mock_llm),
         patch("layers.decision.service.write_audit_entry", audit_mock or AsyncMock()),
         patch("layers.decision.service.enrich_all", AsyncMock(return_value={})),
         patch("layers.decision.service.random.random", return_value=0.99),
     ]
 
 
-async def run_make_decision(mock_client, extraction=None, risks=None, audit_mock=None):
-    patches = decision_patches(mock_client, audit_mock)
+async def run_make_decision(mock_llm, extraction=None, risks=None, audit_mock=None):
+    patches = decision_patches(mock_llm, audit_mock)
     for p in patches:
         p.start()
     try:
@@ -121,6 +137,7 @@ async def run_make_decision(mock_client, extraction=None, risks=None, audit_mock
             icd10_list=[ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ")],
             providers=[], contract_chunks=[],
             submission_date=date(2026, 1, 20), db=AsyncMock(),
+            ocr_texts=["Диагноз: J06.9 ОРВИ Консультация 120 GEL"],
         )
     finally:
         for p in patches:
@@ -133,12 +150,9 @@ async def run_make_decision(mock_client, extraction=None, risks=None, audit_mock
 @pytest.mark.asyncio
 async def test_coherence_flags_route_to_manual_review_not_fraud():
     """Несоответствие услуг диагнозу → manual_review со штрафом, БЕЗ fraud-роутинга."""
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(return_value=make_tool_response(
+    decision = await run_make_decision(make_llm_mock(
         coherence_flags=["МРТ позвоночника не соответствует J06.9 (ОРВИ)"],
     ))
-
-    decision = await run_make_decision(mock_client)
 
     assert decision.requires_manual_review is True
     assert decision.status == "manual_review"
@@ -151,10 +165,7 @@ async def test_coherence_flags_route_to_manual_review_not_fraud():
 @pytest.mark.asyncio
 async def test_no_coherence_flags_no_penalty():
     """Пустые coherence_flags не влияют на решение."""
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(return_value=make_tool_response(coherence_flags=[]))
-
-    decision = await run_make_decision(mock_client)
+    decision = await run_make_decision(make_llm_mock(coherence_flags=[]))
 
     assert decision.requires_manual_review is False
     assert decision.overall_confidence == pytest.approx(0.95)
@@ -224,19 +235,17 @@ def test_waiting_period_exactly_n_days_passes():
 
 @pytest.mark.asyncio
 async def test_waiting_period_violation_returns_manual_review_without_claude():
-    """Нарушение периода ожидания → manual_review до вызова Claude."""
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(return_value=make_tool_response())
-
+    """Нарушение периода ожидания → manual_review до вызова LLM."""
+    mock_llm = make_llm_mock()
     decision = await run_make_decision(
-        mock_client,
+        mock_llm,
         extraction=make_extraction(service_urgency="planned"),
         risks=make_risks(policy_start_date=date(2026, 1, 5)),  # событие 2026-01-15, 10-й день
     )
 
     assert decision.requires_manual_review is True
     assert decision.manual_review_reason == "waiting_period_violation"
-    mock_client.messages.create.assert_not_called()
+    mock_llm.call_tool.assert_not_called()
 
 
 # ── Шаг 23: суб-лимиты ────────────────────────────────────────────
@@ -263,11 +272,8 @@ def test_check_sublimits_skipped_when_core_gives_no_data():
 @pytest.mark.asyncio
 async def test_sublimit_violation_routes_to_manual_review():
     """Превышение суб-лимита → manual_review с reason=sublimit_exceeded."""
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(return_value=make_tool_response())
-
     decision = await run_make_decision(
-        mock_client,
+        make_llm_mock(),
         extraction=make_extraction(total_claimed=250.0),
         risks=make_risks(sublimit=200.0),
     )
@@ -282,52 +288,34 @@ async def test_sublimit_violation_routes_to_manual_review():
 
 @pytest.mark.asyncio
 async def test_complex_case_uses_thinking_kwargs():
-    """Сложный случай (сумма > порога) → adaptive thinking, tool_choice=auto, без temperature."""
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(return_value=make_tool_response())
+    """Сложный случай (сумма > порога) → call_tool вызван с use_thinking=True."""
+    mock_llm = make_llm_mock()
+    await run_make_decision(mock_llm, extraction=make_extraction(total_claimed=500.0))  # > 300 GEL
 
-    await run_make_decision(
-        mock_client,
-        extraction=make_extraction(total_claimed=500.0),  # > 300 GEL
-    )
-
-    kwargs = mock_client.messages.create.await_args.kwargs
-    assert kwargs["thinking"] == {"type": "adaptive"}
-    assert kwargs["tool_choice"] == {"type": "auto"}
-    assert "temperature" not in kwargs
-    assert "make_claim_decision" in kwargs["messages"][0]["content"]
+    call_kwargs = mock_llm.call_tool.await_args.kwargs
+    assert call_kwargs["use_thinking"] is True
+    assert "make_claim_decision" in call_kwargs["messages"][0]["content"]
 
 
 @pytest.mark.asyncio
 async def test_simple_case_uses_forced_tool_choice():
-    """Простой случай → стандартный путь: forced tool_choice + temperature."""
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(return_value=make_tool_response())
+    """Простой случай (сумма <= порога) → call_tool без thinking."""
+    mock_llm = make_llm_mock()
+    await run_make_decision(mock_llm, extraction=make_extraction(total_claimed=120.0))
 
-    await run_make_decision(mock_client, extraction=make_extraction(total_claimed=120.0))
-
-    kwargs = mock_client.messages.create.await_args.kwargs
-    assert kwargs["tool_choice"] == {"type": "tool", "name": "make_claim_decision"}
-    assert "thinking" not in kwargs
-    assert "temperature" in kwargs
+    call_kwargs = mock_llm.call_tool.await_args.kwargs
+    assert call_kwargs.get("use_thinking") is False
 
 
 @pytest.mark.asyncio
 async def test_thinking_blocks_recorded_as_reasoning():
-    """Thinking-блоки ответа сохраняются в audit_log.output_data['reasoning']."""
-    thinking_block = MagicMock()
-    thinking_block.type = "thinking"
-    thinking_block.thinking = "Диагноз J06.9 входит в категорию острых респираторных."
-
-    response = make_tool_response()
-    response.content = [thinking_block] + response.content
-
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(return_value=response)
+    """Reasoning из LLMResult.reasoning сохраняется в audit_log.output_data['reasoning']."""
+    thinking_text = "Диагноз J06.9 входит в категорию острых респираторных."
+    mock_llm = make_llm_mock(reasoning=thinking_text)
     audit_mock = AsyncMock()
 
     await run_make_decision(
-        mock_client,
+        mock_llm,
         extraction=make_extraction(total_claimed=500.0),
         audit_mock=audit_mock,
     )
@@ -343,11 +331,8 @@ async def test_thinking_blocks_recorded_as_reasoning():
 @pytest.mark.asyncio
 async def test_second_pass_refines_uncertain_diagnosis():
     """Диагноз с confidence < 0.65 → повторный узкий вызов, merge решения."""
-    first_response = make_tool_response(diagnosis_confidence=0.50)
-
-    refined_block = MagicMock()
-    refined_block.type = "tool_use"
-    refined_block.input = {
+    first_tool_input = make_tool_input(diagnosis_confidence=0.50, overall_confidence=0.50)
+    second_tool_input = {
         "diagnoses": [{
             "icd10_code": "J06.9", "is_covered": True,
             "approved_amount": 96.0, "confidence": 0.92,
@@ -356,16 +341,19 @@ async def test_second_pass_refines_uncertain_diagnosis():
         "total_approved": 96.0, "deductible_applied": 0.0, "final_payout": 96.0,
         "requires_manual_review": False, "overall_confidence": 0.92, "summary": "",
     }
-    second_response = MagicMock()
-    second_response.content = [refined_block]
 
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(side_effect=[first_response, second_response])
+    mock_llm = AsyncMock()
+    mock_llm.supports_thinking = True
+    mock_llm.call_tool = AsyncMock(side_effect=[
+        LLMResult(tool_input=first_tool_input),
+        LLMResult(tool_input=second_tool_input),
+    ])
+    mock_llm.call_text = AsyncMock(return_value=LLMResult(text=""))
     audit_mock = AsyncMock()
 
-    decision = await run_make_decision(mock_client, audit_mock=audit_mock)
+    decision = await run_make_decision(mock_llm, audit_mock=audit_mock)
 
-    assert mock_client.messages.create.await_count == 2  # основной + второй проход
+    assert mock_llm.call_tool.await_count == 2  # основной + второй проход
     assert decision.diagnoses[0].confidence == pytest.approx(0.92)
     assert decision.diagnoses[0].contract_reference == "Статья 4.1"
 
@@ -375,9 +363,7 @@ async def test_second_pass_refines_uncertain_diagnosis():
 
 @pytest.mark.asyncio
 async def test_no_second_pass_for_confident_diagnosis():
-    """Уверенный диагноз → один вызов Claude."""
-    mock_client = AsyncMock()
-    mock_client.messages.create = AsyncMock(return_value=make_tool_response(diagnosis_confidence=0.95))
-
-    await run_make_decision(mock_client)
-    assert mock_client.messages.create.await_count == 1
+    """Уверенный диагноз → один вызов LLM."""
+    mock_llm = make_llm_mock(diagnosis_confidence=0.95)
+    await run_make_decision(mock_llm)
+    assert mock_llm.call_tool.await_count == 1

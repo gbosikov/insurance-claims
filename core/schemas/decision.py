@@ -11,7 +11,7 @@ class DiagnosisDecisionSchema(BaseModel):
     is_covered:          bool
     approved_amount:     float
     rejection_reason:    str | None = None
-    contract_reference:  str = ""    # "Статья 4.2, пункт 3"
+    contract_reference:  str | None = None
     confidence:          float = Field(ge=0.0, le=1.0)
 
 

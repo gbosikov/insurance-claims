@@ -291,6 +291,7 @@ async def test_decision_requires_manual_review_flag_propagates():
             contract_chunks=make_contract_chunks(),
             submission_date=date(2026, 1, 20),
             db=db,
+            ocr_texts=["J06.9 ОРВИ"],
         )
 
     assert decision.requires_manual_review is True
@@ -490,6 +491,7 @@ async def test_stochastic_qa_routes_approved_to_manual_review():
             contract_chunks=make_contract_chunks(),
             submission_date=date(2026, 1, 20),
             db=db,
+            ocr_texts=["J06.9 ОРВИ"],
         )
 
     assert decision.requires_manual_review is True
@@ -556,6 +558,7 @@ async def test_stochastic_qa_at_rate_zero_never_triggers():
                 contract_chunks=make_contract_chunks(),
                 submission_date=date(2026, 1, 20),
                 db=db,
+                ocr_texts=["J06.9 ОРВИ"],
             )
             assert decision.requires_manual_review is False
             assert decision.manual_review_reason != "stochastic_qa_sample"
