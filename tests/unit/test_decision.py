@@ -390,14 +390,13 @@ async def test_stochastic_qa_sets_manual_review_reason():
     mock_client = AsyncMock()
     mock_client.supports_thinking = True
     mock_client.call_tool = AsyncMock(return_value=LLMResult(tool_input={
-        "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "confidence": 0.95}],
+        "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "coverage_clarity": 0.95}],
         "line_items": [],
         "total_approved": 120.0,
         "deductible_applied": 0.0,
         "final_payout": 120.0,
         "requires_manual_review": False,
         "manual_review_reason": None,
-        "overall_confidence": 0.95,
         "summary": "Одобрено",
     }))
     mock_client.call_text = AsyncMock(return_value=LLMResult(text=""))
@@ -465,14 +464,13 @@ async def test_fraud_task_is_asyncio_task():
         mock_client = AsyncMock()
         mock_client.supports_thinking = True
         mock_client.call_tool = AsyncMock(return_value=LLMResult(tool_input={
-            "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "confidence": 0.95}],
+            "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "coverage_clarity": 0.95}],
             "line_items": [{"description": "Консультация", "claimed_amount": 150.0, "approved_amount": 120.0}],
             "total_approved": 120.0,
             "deductible_applied": 0.0,
             "final_payout": 120.0,
             "requires_manual_review": False,
             "manual_review_reason": None,
-            "overall_confidence": 0.95,
             "summary": "Одобрено: J06.9, покрытие 80%.",
         }))
         mock_client.call_text = AsyncMock(return_value=LLMResult(text=""))
@@ -526,14 +524,13 @@ async def test_make_decision_applies_positive_list_coverage():
     mock_client = AsyncMock()
     mock_client.supports_thinking = True
     mock_client.call_tool = AsyncMock(return_value=LLMResult(tool_input={
-        "diagnoses": [{"icd10_code": "K29.7", "is_covered": True, "approved_amount": 400.0, "confidence": 0.95}],
+        "diagnoses": [{"icd10_code": "K29.7", "is_covered": True, "approved_amount": 400.0, "coverage_clarity": 0.95}],
         "line_items": [{"description": "Полипэктомия", "claimed_amount": 500.0, "approved_amount": 400.0}],
         "total_approved": 400.0,
         "deductible_applied": 0.0,
         "final_payout": 400.0,
         "requires_manual_review": False,
         "manual_review_reason": None,
-        "overall_confidence": 0.95,
         "summary": "Одобрено: K29.7, Полипэктомия из POSITIVE LIST.",
     }))
     mock_client.call_text = AsyncMock(return_value=LLMResult(text=""))
@@ -598,14 +595,13 @@ async def test_make_decision_applies_calibration_factor():
     mock_client = AsyncMock()
     mock_client.supports_thinking = True
     mock_client.call_tool = AsyncMock(return_value=LLMResult(tool_input={
-        "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "confidence": 0.95}],
+        "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "coverage_clarity": 0.95}],
         "line_items": [],
         "total_approved": 120.0,
         "deductible_applied": 0.0,
         "final_payout": 120.0,
         "requires_manual_review": False,
         "manual_review_reason": None,
-        "overall_confidence": 0.95,
         "summary": "Одобрено",
     }))
     mock_client.call_text = AsyncMock(return_value=LLMResult(text=""))
@@ -645,9 +641,10 @@ async def test_make_decision_applies_calibration_factor():
             submission_date=date(2026, 1, 20), db=AsyncMock(),
         )
 
+    # routing_signal = min(data_score=1.0, coverage_signal=0.95*0.8=0.76, amount_gate=1.0) = 0.76
     assert decision.overall_confidence == pytest.approx(0.95 * 0.8)
 
     audit_confidence = mock_audit.await_args.kwargs["confidence"]
     assert audit_confidence["overall"] == pytest.approx(0.76)
-    assert audit_confidence["overall_raw"] == pytest.approx(0.95)
+    assert audit_confidence["raw_coverage_signal"] == pytest.approx(0.95)
     assert audit_confidence["calibration_factor"] == pytest.approx(0.8)

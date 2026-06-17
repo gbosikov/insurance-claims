@@ -72,11 +72,15 @@ def make_tool_input(
     coherence_flags: list[str] | None = None,
     requires_manual_review: bool = False,
 ) -> dict:
-    """Возвращает tool_input dict для LLMResult."""
+    """Возвращает tool_input dict для LLMResult.
+
+    overall_confidence оставлен для совместимости вызовов, но больше не используется
+    decision engine — routing_signal вычисляется из coverage_clarity per-diagnosis.
+    """
     d = {
         "diagnoses": [{
             "icd10_code": "J06.9", "is_covered": True,
-            "approved_amount": 96.0, "confidence": diagnosis_confidence,
+            "approved_amount": 96.0, "coverage_clarity": diagnosis_confidence,
         }],
         "line_items": [],
         "total_approved": 96.0,
@@ -84,7 +88,6 @@ def make_tool_input(
         "final_payout": 96.0,
         "requires_manual_review": requires_manual_review,
         "manual_review_reason": None,
-        "overall_confidence": overall_confidence,
         "summary": "Одобрено",
     }
     if coherence_flags is not None:
@@ -339,11 +342,11 @@ async def test_second_pass_refines_uncertain_diagnosis():
     second_tool_input = {
         "diagnoses": [{
             "icd10_code": "J06.9", "is_covered": True,
-            "approved_amount": 96.0, "confidence": 0.92,
+            "approved_amount": 96.0, "coverage_clarity": 0.92,
             "contract_reference": "Статья 4.1",
         }],
         "total_approved": 96.0, "deductible_applied": 0.0, "final_payout": 96.0,
-        "requires_manual_review": False, "overall_confidence": 0.92, "summary": "",
+        "requires_manual_review": False, "summary": "",
     }
 
     mock_llm = AsyncMock()
@@ -358,7 +361,7 @@ async def test_second_pass_refines_uncertain_diagnosis():
     decision = await run_make_decision(mock_llm, audit_mock=audit_mock)
 
     assert mock_llm.call_tool.await_count == 2  # основной + второй проход
-    assert decision.diagnoses[0].confidence == pytest.approx(0.92)
+    assert decision.diagnoses[0].coverage_clarity == pytest.approx(0.92)
     assert decision.diagnoses[0].contract_reference == "Статья 4.1"
 
     audit_steps = [call.kwargs["step"] for call in audit_mock.await_args_list]

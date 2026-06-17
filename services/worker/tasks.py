@@ -145,16 +145,16 @@ async def _commit_submit_audit(
 def _build_structured_comment(decision, extraction) -> str:
     """
     Строит структурированный Comment для поля ClaimParsing_UNI:
-    Уверенность: 85% | Диагнозы: E55.9 Дефицит... ✓, F45.9 ... ✗ |
-    Сумма: 128 GEL (80% от 160) | Услуги: ... | <AI-вердикт>.
+    სანდოობა: 85% | დიაგნოზები: E55.9 Дефицит... ✓, F45.9 ... ✗ |
+    თანხა: 128 GEL (80% / 160-დან) | მომსახურება: ... | <AI-вердикт>.
     """
     parts: list[str] = []
 
-    # 1. Уверенность
+    # 1. სანდოობა (уверенность)
     pct = round(decision.overall_confidence * 100)
-    parts.append(f"Уверенность: {pct}%")
+    parts.append(f"სანდოობა: {pct}%")
 
-    # 2. Диагнозы с признаком покрытия
+    # 2. დიაგნოზები с признаком покрытия (названия остаются как в документах)
     dec_map = {d.icd10_code: d for d in decision.diagnoses}
     diag_labels = []
     for d in extraction.event.diagnoses:
@@ -163,23 +163,23 @@ def _build_structured_comment(decision, extraction) -> str:
         name = (d.description or d.icd10_code)[:40]
         diag_labels.append(f"{d.icd10_code} {name} {mark}")
     if diag_labels:
-        parts.append("Диагнозы: " + ", ".join(diag_labels))
+        parts.append("დიაგნოზები: " + ", ".join(diag_labels))
 
-    # 3. Сумма выплаты
+    # 3. თანხა (сумма выплаты)
     total = extraction.event.total_claimed or 0.0
     payout = decision.final_payout or 0.0
     if total > 0:
         cov_pct = round(payout / total * 100) if payout else 0
-        parts.append(f"Сумма: {payout:.0f} GEL ({cov_pct}% от {total:.0f})")
+        parts.append(f"თანხა: {payout:.0f} GEL ({cov_pct}% / {total:.0f}-დან)")
 
-    # 4. Услуги — только из чека, иначе все позиции
+    # 4. მომსახურება — только из чека, иначе все позиции
     receipt_svc = [
         li.description for li in extraction.event.line_items
         if li.doc_source and li.doc_source.startswith("receipt") and li.description
     ]
     services = receipt_svc or [li.description for li in extraction.event.line_items if li.description]
     if services:
-        parts.append("Услуги: " + ", ".join(services))
+        parts.append("მომსახურება: " + ", ".join(services))
 
     # 5. Краткое AI-описание (первые 200 символов из summary)
     if decision.summary:

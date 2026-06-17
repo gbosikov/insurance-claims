@@ -42,7 +42,7 @@ settings = get_settings()
 # v1.1.0: добавлен cross_document (Шаг 25)
 # v1.2.0: doc_source в line_items; нумерация чеков в промпте; services в form_100; line_items в receipt
 # v1.3.0: amount_currency (дозировки vs цены); receipt_summaries (total_stated); 7 новых валидаций
-PROMPT_VERSION = "extraction/v1.3.0"
+PROMPT_VERSION = "extraction/v1.3.1"
 
 # ── Tool definition для Claude API ────────────────────────────────
 
@@ -851,6 +851,33 @@ def _merge_multipage_receipts(summaries: list[ReceiptSummary]) -> list[ReceiptSu
 
 _DEDUP_FUZZY_THRESHOLD = 0.75  # минимальное сходство описаний для fuzzy-дедупа
 
+
+def _dedup_same_receipts(summaries: list[ReceiptSummary]) -> list[ReceiptSummary]:
+    """Удалить дублирующиеся чеки по ключу (total_stated, receipt_date).
+
+    Один чек может прийти дважды: файл загружен дважды, или один чек
+    сфотографирован с разными языковыми надписями на бланке (ГР + EN).
+    При дедупликации оставляем первую встреченную запись, остальные дропаем.
+    Флаг duplicate_receipt всё равно ставится в cross_validate() → manual_review.
+    """
+    seen: set[tuple] = set()
+    result: list[ReceiptSummary] = []
+    for rs in summaries:
+        if rs.total_stated is not None and rs.receipt_date is not None:
+            key = (rs.total_stated, rs.receipt_date)
+            if key in seen:
+                log.warning(
+                    "duplicate_receipt_deduplicated",
+                    removed_source=rs.doc_source,
+                    total_stated=rs.total_stated,
+                    receipt_date=rs.receipt_date,
+                    institution=rs.receipt_institution,
+                )
+                continue
+            seen.add(key)
+        result.append(rs)
+    return result
+
 # Валюты платежей. Строки с другими единицами (IU, mg, ml) — дозировки, не цены.
 _GEL_CURRENCIES: frozenset[str] = frozenset({"GEL", "₾", "ლარი", "LARI", "ЛАРИ"})
 
@@ -988,6 +1015,8 @@ async def _extract_with_claude(
 
             # Склейка страниц многостраничного чека
             receipt_summaries = _merge_multipage_receipts(receipt_summaries)
+            # Дедупликация одинаковых чеков (один файл загружен дважды или два языка на бланке)
+            receipt_summaries = _dedup_same_receipts(receipt_summaries)
 
             # Есть ли в пакете хотя бы один чек?
             has_receipts = bool(receipt_summaries) or any(

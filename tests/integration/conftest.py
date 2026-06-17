@@ -321,7 +321,11 @@ def make_claude_decision_response(
     requires_manual_review: bool = False,
     overall_confidence: float = 0.91,
 ) -> MagicMock:
-    """Мок ответа Claude API для decision."""
+    """Мок ответа Claude API для decision.
+
+    overall_confidence оставлен для совместимости сигнатуры, но больше не
+    используется decision engine — routing_signal считается из coverage_clarity.
+    """
     tool_block = MagicMock()
     tool_block.type = "tool_use"
     tool_block.input = {
@@ -332,7 +336,7 @@ def make_claude_decision_response(
                 "approved_amount": approved_amount if is_covered else 0.0,
                 "rejection_reason": None if is_covered else "Не входит в перечень страховых случаев",
                 "contract_reference": "Статья 4.1 — Амбулаторное лечение острых заболеваний",
-                "confidence": confidence,
+                "coverage_clarity": confidence,
             }
         ],
         "line_items": [
@@ -348,7 +352,6 @@ def make_claude_decision_response(
         "final_payout": approved_amount if is_covered else 0.0,
         "requires_manual_review": requires_manual_review,
         "manual_review_reason": None,
-        "overall_confidence": overall_confidence,
         "summary": (
             f"Диагноз {icd10_code} покрывается договором (ст. 4.1). "
             f"Сумма к выплате: {approved_amount if is_covered else 0.0} GEL. "

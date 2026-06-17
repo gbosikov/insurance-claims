@@ -185,6 +185,17 @@ class Settings(BaseSettings):
     decision_reasoning_audit_max_chars: int = 4000
     decision_second_pass_confidence_threshold: float = 0.65
     decision_stochastic_qa_rate: float = 0.05   # 5% AUTO_APPROVED → случайная проверка
+
+    # ── Три сигнала маршрутизации ──────────────────────────────────
+    # Amount gate: доля total_claimed / annual_limit → коэффициент строгости
+    # claim/limit > high  → gate=high_score  (крупная заявка)
+    # claim/limit > medium → gate=medium_score (средняя заявка)
+    # иначе               → gate=1.0          (малая заявка, без поправки)
+    decision_amount_gate_high_pct:     float = 0.30
+    decision_amount_gate_medium_pct:   float = 0.10
+    decision_amount_gate_high_score:   float = 0.60
+    decision_amount_gate_medium_score: float = 0.80
+
     decision_waiting_period_enabled: bool = True   # False — отключить проверку периода ожидания
     decision_default_waiting_period_days: int = 30
     # Дефолт калибровочного фактора; рабочее значение живёт в

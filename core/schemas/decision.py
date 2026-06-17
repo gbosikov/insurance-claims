@@ -12,7 +12,9 @@ class DiagnosisDecisionSchema(BaseModel):
     approved_amount:     float
     rejection_reason:    str | None = None
     contract_reference:  str | None = None
-    confidence:          float = Field(ge=0.0, le=1.0)
+    coverage_clarity:    float = Field(ge=0.0, le=1.0, default=0.5)
+    # coverage_clarity: насколько однозначно договор покрывает/исключает этот диагноз.
+    # 1.0 = прямое упоминание в договоре; 0.4 = интерпретация по категории; 0.1 = договор молчит.
 
 
 class LineItemDecisionSchema(BaseModel):
@@ -37,6 +39,8 @@ class ClaimDecision(BaseModel):
     manual_review_reason:   str | None = None
     fraud_flags:            list[str] = Field(default_factory=list)
     overall_confidence:     float = Field(ge=0.0, le=1.0)
+    # Разбивка по трём сигналам: data_score, coverage_signal, amount_gate + итоговый routing_signal
+    signal_breakdown:       dict = Field(default_factory=dict)
     summary:                str = ""   # полный вердикт → идёт в Comment ClaimParsing_UNI
     rag_chunks_used:        list[str] = Field(default_factory=list)
     prompt_version:         str = ""
