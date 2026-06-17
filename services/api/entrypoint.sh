@@ -20,13 +20,20 @@ else
 fi
 
 # ── Справочник провайдеров ───────────────────────────────────────────
-PROVIDERS_FILE="/app/db/data/providers.csv"
+# Принимаем оба имени: providers.csv (стандарт) и Cliniks.csv (исходник Lite GROUP)
+PROVIDERS_FILE=""
+for _candidate in "/app/db/data/providers.csv" "/app/db/data/Cliniks.csv"; do
+    if [ -f "$_candidate" ]; then
+        PROVIDERS_FILE="$_candidate"
+        break
+    fi
+done
 
-if [ -f "$PROVIDERS_FILE" ]; then
-    echo "[entrypoint] Проверяю справочник провайдеров..."
+if [ -n "$PROVIDERS_FILE" ]; then
+    echo "[entrypoint] Проверяю справочник провайдеров ($PROVIDERS_FILE)..."
     python -m db.loaders.load_providers --file "$PROVIDERS_FILE" --skip-if-loaded
 else
-    echo "[entrypoint] Файл $PROVIDERS_FILE не найден, пропускаю загрузку провайдеров."
+    echo "[entrypoint] Файл providers.csv / Cliniks.csv не найден, пропускаю загрузку провайдеров."
 fi
 
 exec "$@"
