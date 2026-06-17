@@ -48,10 +48,97 @@ from layers.preprocessing.service import preprocess_all_documents
 from layers.rag.searcher import build_rag_query, get_contract_chunks_with_freshness_check
 from layers.routing.service import route_claim
 from core.audit import write_audit_entry
+from core.schemas.core_api import SubmitClaimResult
 from services.worker.celery_app import celery_app
 
 log = structlog.get_logger()
 settings = get_settings()
+
+
+# ── Идемпотентность ClaimParsing_UNI ──────────────────────────────
+# Если Celery-задача упала ПОСЛЕ успешного submit_claim() но ДО финального
+# db.commit(), следующий запуск должен обнаружить предыдущий submit и не создавать
+# дублирующийся убыток в кор-системе.
+#
+# Механизм:
+#   1. _commit_submit_audit  — сразу после submit_claim() коммитит результат
+#      в ОТДЕЛЬНОЙ транзакции (независимо от основной транзакции задачи).
+#   2. _load_prior_submit    — в начале шага 8 проверяет, есть ли уже
+#      закоммиченная запись step='core_submit' с status=0 для этой заявки.
+
+async def _load_prior_submit(claim_uuid: UUID) -> SubmitClaimResult | None:
+    """
+    Читает committed данные о предыдущем успешном ClaimParsing_UNI.
+
+    Открывает ОТДЕЛЬНУЮ сессию (isolation=REPEATABLE READ по умолчанию asyncpg),
+    читает только закоммиченные строки — поэтому обнаруживает submit из
+    прошлого запуска даже если его основная транзакция откатилась.
+    Возвращает None если успешного submit ещё не было.
+    """
+    from sqlalchemy import text as sa_text
+
+    async with AsyncSessionLocal() as check_db:
+        row = await check_db.execute(
+            sa_text("""
+                SELECT output_data
+                FROM audit_log
+                WHERE claim_id = :cid
+                  AND step = 'core_submit'
+                  AND (output_data->>'status')::int = 0
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """),
+            {"cid": str(claim_uuid)},
+        )
+        record = row.fetchone()
+
+    if record is None:
+        return None
+
+    # asyncpg десериализует JSONB в dict автоматически
+    output: dict = record[0] if isinstance(record[0], dict) else {}
+    return SubmitClaimResult(
+        innum=str(output.get("innum", "")),
+        status=int(output.get("status", 0)),
+        status_text=str(output.get("status_text", "")),
+    )
+
+
+async def _commit_submit_audit(
+    claim_uuid: UUID,
+    tenant_uuid: UUID,
+    core_result: SubmitClaimResult,
+    input_data: dict,
+) -> None:
+    """
+    Коммитит результат ClaimParsing_UNI в отдельной, немедленно закоммиченной
+    транзакции — это идемпотентный маркер для _load_prior_submit.
+
+    Если этот commit упадёт (крайне редко: DB только что ответила на запрос) —
+    логируем WARNING и продолжаем. Маркера не будет, но если основная транзакция
+    успеет закоммититься, retry не произойдёт.
+    """
+    try:
+        async with AsyncSessionLocal() as commit_db:
+            await write_audit_entry(
+                commit_db,
+                claim_id=claim_uuid,
+                tenant_id=tenant_uuid,
+                step="core_submit",
+                input_data=input_data,
+                output_data={
+                    "innum":       core_result.innum,
+                    "status":      core_result.status,
+                    "status_text": core_result.status_text,
+                },
+            )
+            await commit_db.commit()
+    except Exception as e:
+        log.warning(
+            "core_submit_idempotency_marker_failed",
+            claim_id=str(claim_uuid),
+            error=str(e),
+        )
 
 
 def _build_structured_comment(decision, extraction) -> str:
@@ -380,124 +467,132 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
             claim.status = ClaimStatus.DECISION_PENDING
             await db.flush()
 
-            try:
-                file_fields = await documents_to_file_fields(documents, storage)
-
-                _comment = _build_structured_comment(decision, extraction)
-                # Fallback для полей ClaimParsing_UNI когда decision вернул early-exit
-                # (waiting_period_violation, policy_inactive и др. — без Claude).
-                _config_kind = decision.config_kind or 2  # 2 = акт возмещения (дефолт)
-                _risks_list = decision.risks_list
-                if not _risks_list and risks_limits and risks_limits.risks:
-                    # Предпочитаем строки из чеков — форма 100 содержит анамнез/медикаменты
-                    # с большими суммами которые не должны попасть в кор-систему.
-                    # Если чеков нет — используем все позиции (match_risks сам fallback-ит на total_claimed).
-                    _fallback_receipt_items = [
-                        li for li in extraction.event.line_items
-                        if li.doc_source and li.doc_source.startswith("receipt")
-                    ]
-                    _fallback_items = _fallback_receipt_items if _fallback_receipt_items else extraction.event.line_items
-                    _risks_list, _ = _build_fallback_risks(
-                        line_items=_fallback_items,
-                        risks=risks_limits.risks,
-                        event_date=extraction.event.date or "",
-                        form_100_text=form_100_ocr_text or "",
-                        config_kind=_config_kind,
-                        total_claimed=extraction.event.total_claimed or 0.0,
-                    )
-                    log.info(
-                        "risks_list_fallback_built",
-                        claim_id=claim_id,
-                        risks_count=len(_risks_list),
-                        reason=decision.manual_review_reason or "early_exit",
-                    )
-                core_result = await core_adapter.submit_claim(
-                    policy_number=policy_number,
-                    diagnosid=decision.diagnosid or settings.core_api_diagnosid_fallback,
-                    event_start_date=extraction.event.date,
-                    event_end_date=extraction.event.date,
-                    pers_id=decision.pers_id or settings.core_api_pers_id_fallback,
-                    config_kind=_config_kind,
-                    risks_list=_risks_list,
-                    file_fields=file_fields,
-                    comment=_comment,
-                )
-
-                log.info(
-                    "claim_submitted_to_core",
+            # Идемпотентность: если задача перезапустилась после успешного submit
+            # (crash между submit_claim() и финальным db.commit()) — не создавать
+            # дублирующийся убыток в кор-системе.
+            prior_submit = await _load_prior_submit(claim_uuid)
+            if prior_submit is not None:
+                log.warning(
+                    "core_submit_idempotency_hit",
                     claim_id=claim_id,
-                    innum=core_result.innum,
-                    status=core_result.status,
-                    status_text=core_result.status_text,
+                    innum=prior_submit.innum,
                 )
+                core_result = prior_submit
+            else:
+                try:
+                    file_fields = await documents_to_file_fields(documents, storage)
 
-                # Аудит: что отправили в ClaimParsing_UNI и что вернулось
-                await write_audit_entry(
-                    db,
-                    claim_id=claim_uuid,
-                    tenant_id=tenant_uuid,
-                    step="core_submit",
-                    input_data={
-                        "PolicyNumber":   policy_number,
-                        "DiagnosID":      decision.diagnosid or settings.core_api_diagnosid_fallback,
-                        "EventStartDate": extraction.event.date,
-                        "EventEndDate":   extraction.event.date,
-                        "PersID":         decision.pers_id or settings.core_api_pers_id_fallback,
-                        "ConfigKind":     _config_kind,
-                        "Comment":        _comment[:500],
-                        "RisksList":      _risks_list,
-                        "files_count":    len(file_fields),
-                    },
-                    output_data={
-                        "innum":       core_result.innum,
-                        "status":      core_result.status,
-                        "status_text": core_result.status_text,
-                    },
-                )
+                    _comment = _build_structured_comment(decision, extraction)
+                    # Fallback для полей ClaimParsing_UNI когда decision вернул early-exit
+                    # (waiting_period_violation, policy_inactive и др. — без Claude).
+                    _config_kind = decision.config_kind or 2  # 2 = акт возмещения (дефолт)
+                    _risks_list = decision.risks_list
+                    if not _risks_list and risks_limits and risks_limits.risks:
+                        # Предпочитаем строки из чеков — форма 100 содержит анамнез/медикаменты
+                        # с большими суммами которые не должны попасть в кор-систему.
+                        # Если чеков нет — используем все позиции (match_risks сам fallback-ит на total_claimed).
+                        _fallback_receipt_items = [
+                            li for li in extraction.event.line_items
+                            if li.doc_source and li.doc_source.startswith("receipt")
+                        ]
+                        _fallback_items = _fallback_receipt_items if _fallback_receipt_items else extraction.event.line_items
+                        _risks_list, _ = _build_fallback_risks(
+                            line_items=_fallback_items,
+                            risks=risks_limits.risks,
+                            event_date=extraction.event.date or "",
+                            form_100_text=form_100_ocr_text or "",
+                            config_kind=_config_kind,
+                            total_claimed=extraction.event.total_claimed or 0.0,
+                        )
+                        log.info(
+                            "risks_list_fallback_built",
+                            claim_id=claim_id,
+                            risks_count=len(_risks_list),
+                            reason=decision.manual_review_reason or "early_exit",
+                        )
+                    core_result = await core_adapter.submit_claim(
+                        policy_number=policy_number,
+                        diagnosid=decision.diagnosid or settings.core_api_diagnosid_fallback,
+                        event_start_date=extraction.event.date,
+                        event_end_date=extraction.event.date,
+                        pers_id=decision.pers_id or settings.core_api_pers_id_fallback,
+                        config_kind=_config_kind,
+                        risks_list=_risks_list,
+                        file_fields=file_fields,
+                        comment=_comment,
+                    )
 
-                # Коды ошибок ClaimParsing_UNI (0 = успех):
-                # 1=нет номера карточки, 2=нет диагноза, 3=нет партнёра,
-                # 4=нет вида направления, 5=полис не существует
-                if core_result.status != 0:
-                    log.warning(
-                        "core_submit_non_zero_status",
+                    log.info(
+                        "claim_submitted_to_core",
                         claim_id=claim_id,
+                        innum=core_result.innum,
                         status=core_result.status,
                         status_text=core_result.status_text,
                     )
-                    # Заявка создана в кор-системе с ошибкой — ручная проверка
-                    claim.status = ClaimStatus.MANUAL_REVIEW
-                    claim.routing_reason = (
-                        f"Кор-система: {core_result.status_text} (код {core_result.status})"
+
+                    # Аудит: коммитим в ОТДЕЛЬНОЙ транзакции сразу после submit.
+                    # Это идемпотентный маркер — не зависит от исхода основной транзакции.
+                    # При повторном запуске задачи _load_prior_submit найдёт эту запись.
+                    await _commit_submit_audit(
+                        claim_uuid,
+                        tenant_uuid,
+                        core_result,
+                        input_data={
+                            "PolicyNumber":   policy_number,
+                            "DiagnosID":      decision.diagnosid or settings.core_api_diagnosid_fallback,
+                            "EventStartDate": extraction.event.date,
+                            "EventEndDate":   extraction.event.date,
+                            "PersID":         decision.pers_id or settings.core_api_pers_id_fallback,
+                            "ConfigKind":     _config_kind,
+                            "Comment":        _comment[:500],
+                            "RisksList":      _risks_list,
+                            "files_count":    len(file_fields),
+                        },
                     )
+
+                    # Коды ошибок ClaimParsing_UNI (0 = успех):
+                    # 1=нет номера карточки, 2=нет диагноза, 3=нет партнёра,
+                    # 4=нет вида направления, 5=полис не существует
+                    if core_result.status != 0:
+                        log.warning(
+                            "core_submit_non_zero_status",
+                            claim_id=claim_id,
+                            status=core_result.status,
+                            status_text=core_result.status_text,
+                        )
+                        # Заявка создана в кор-системе с ошибкой — ручная проверка
+                        claim.status = ClaimStatus.MANUAL_REVIEW
+                        claim.routing_reason = (
+                            f"Кор-система: {core_result.status_text} (код {core_result.status})"
+                        )
+                        claim.overall_confidence = decision.overall_confidence
+                        claim.total_claimed = extraction.event.total_claimed
+                        claim.event_date = event_date
+                        claim.processed_at = datetime.utcnow()
+                        await db.commit()
+                        return {
+                            "status": "manual_review",
+                            "reason": f"core_error_{core_result.status}",
+                            "status_text": core_result.status_text,
+                        }
+
+                except CoreAPIUnavailableError:
+                    await db.commit()
+                    raise self.retry(countdown=300)
+
+                except Exception as e:
+                    log.error("core_submit_failed", claim_id=claim_id, error=str(e))
+                    # Ошибка submit — уходим в manual_review, но не теряем решение
+                    claim.status = ClaimStatus.MANUAL_REVIEW
+                    claim.routing_reason = f"Ошибка отправки в кор-систему: {str(e)[:200]}"
                     claim.overall_confidence = decision.overall_confidence
                     claim.total_claimed = extraction.event.total_claimed
+                    claim.total_approved = decision.total_approved
+                    claim.final_payout = decision.final_payout
                     claim.event_date = event_date
                     claim.processed_at = datetime.utcnow()
                     await db.commit()
-                    return {
-                        "status": "manual_review",
-                        "reason": f"core_error_{core_result.status}",
-                        "status_text": core_result.status_text,
-                    }
-
-            except CoreAPIUnavailableError:
-                await db.commit()
-                raise self.retry(countdown=300)
-
-            except Exception as e:
-                log.error("core_submit_failed", claim_id=claim_id, error=str(e))
-                # Ошибка submit — уходим в manual_review, но не теряем решение
-                claim.status = ClaimStatus.MANUAL_REVIEW
-                claim.routing_reason = f"Ошибка отправки в кор-систему: {str(e)[:200]}"
-                claim.overall_confidence = decision.overall_confidence
-                claim.total_claimed = extraction.event.total_claimed
-                claim.total_approved = decision.total_approved
-                claim.final_payout = decision.final_payout
-                claim.event_date = event_date
-                claim.processed_at = datetime.utcnow()
-                await db.commit()
-                return {"status": "manual_review", "reason": "core_submit_error"}
+                    return {"status": "manual_review", "reason": "core_submit_error"}
 
             # ── Шаг 9: Routing (после submit) ────────────────────
             routing_result = await route_claim(claim=claim, decision=decision, db=db)
