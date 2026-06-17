@@ -19,7 +19,7 @@ from core.auth import ApiKeyAuthMiddleware
 from core.config import get_settings
 from core.database import check_db_connection
 from core.logging import configure_logging
-from services.api.routers import analytics, appeals, claims, contracts, devtools, reviews, webhooks
+from services.api.routers import analytics, appeals, claims, contracts, dead_letter, devtools, reviews, webhooks
 
 configure_logging()  # JSON-логи + маскирование ПД (core/logging.py)
 log = structlog.get_logger()
@@ -51,8 +51,9 @@ app.include_router(claims.router,    prefix="/v1/claims",    tags=["claims"])
 app.include_router(contracts.router, prefix="/v1/contracts", tags=["contracts"])
 app.include_router(appeals.router,   prefix="/v1/appeals",   tags=["appeals"])
 app.include_router(analytics.router, prefix="/v1/analytics", tags=["analytics"])
-app.include_router(reviews.router,   prefix="/v1/reviews",   tags=["reviews"])
-app.include_router(webhooks.router,  prefix="/internal/hooks", tags=["webhooks"])
+app.include_router(reviews.router,      prefix="/v1/reviews",      tags=["reviews"])
+app.include_router(dead_letter.router,  prefix="/v1/dead-letter",  tags=["dead-letter"])
+app.include_router(webhooks.router,     prefix="/internal/hooks",  tags=["webhooks"])
 
 # Dev tools — только development-окружение; в production эндпоинты возвращают 404
 if settings.environment == "development":

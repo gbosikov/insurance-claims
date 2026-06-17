@@ -22,6 +22,7 @@ from uuid import UUID
 
 import structlog
 from celery import Task
+from celery.exceptions import Retry
 from sqlalchemy import select
 
 from core.config import get_settings
@@ -204,6 +205,56 @@ def _build_structured_comment(decision, extraction) -> str:
         comment = comment[: max_len - 1] + "…"
 
     return comment
+
+
+async def _write_dead_letter(
+    claim_id: str,
+    tenant_id: str,
+    task_name: str,
+    task_id: str,
+    exc: BaseException,
+    retries: int,
+) -> None:
+    """
+    Записывает постоянно упавшую задачу в platform.dead_letter_queue.
+
+    Коммитится в ОТДЕЛЬНОЙ транзакции — независимо от состояния основной сессии.
+    Ошибки записи поглощаются (WARNING): потеря маркера не должна скрыть исходное
+    исключение и помешать алертингу на уровне Celery.
+    """
+    import traceback as tb_module
+    from core.models.platform import DeadLetterItem
+
+    try:
+        async with AsyncSessionLocal() as dlq_db:
+            item = DeadLetterItem(
+                task_name=task_name,
+                task_id=task_id or f"unknown-{claim_id}",
+                claim_id=UUID(claim_id) if claim_id else None,
+                tenant_id=UUID(tenant_id) if tenant_id else None,
+                task_args=[claim_id, tenant_id],
+                task_kwargs={},
+                exception_type=type(exc).__name__,
+                exception_msg=str(exc)[:2000],
+                traceback="".join(
+                    tb_module.format_exception(type(exc), exc, exc.__traceback__)
+                )[:5000],
+                retries=retries,
+            )
+            dlq_db.add(item)
+            await dlq_db.commit()
+            log.info(
+                "dead_letter_written",
+                claim_id=claim_id,
+                task_id=task_id,
+                exception_type=type(exc).__name__,
+            )
+    except Exception as write_err:
+        log.warning(
+            "dead_letter_write_failed",
+            claim_id=claim_id,
+            error=str(write_err),
+        )
 
 
 def run_async(coro):
@@ -627,6 +678,10 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
 
     try:
         return run_async(_run())
+    except Retry:
+        # Промежуточный retry: Celery поставит задачу обратно в очередь.
+        # _emergency_manual не нужен — задача будет повторена, не провалена.
+        raise
     except Exception as e:
         log.error("process_claim_unexpected_error", claim_id=claim_id, error=str(e))
 
@@ -640,6 +695,14 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                     await db.commit()
 
         run_async(_emergency_manual())
+        run_async(_write_dead_letter(
+            claim_id,
+            tenant_id,
+            self.name,
+            self.request.id or "",
+            e,
+            self.request.retries,
+        ))
         raise
 
 
