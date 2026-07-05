@@ -1,6 +1,10 @@
 # Запуск ядра системы:  docker compose up -d
 # Запуск с порталом:    docker compose --profile portal up -d
 # Логи:                 docker compose logs -f api worker
+#
+# Путь к Google credentials:
+#   Windows: GCLOUD_CONFIG_DIR=%APPDATA%\gcloud   (добавить в .env)
+#   Linux/Mac: GCLOUD_CONFIG_DIR=~/.config/gcloud  (или не задавать — дефолт ниже)
 
 services:
 
@@ -45,11 +49,15 @@ services:
       - PYTHONPATH=/app
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-claims_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-claims}
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - LLM_PROVIDER=${LLM_PROVIDER:-anthropic}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
       - STORAGE_BUCKET=${STORAGE_BUCKET:-claims-documents-dev}
       - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
       - CORE_API_BASE_URL=${CORE_API_BASE_URL:-http://mock-core}
+      - CORE_API_AUTH_URL=${CORE_API_AUTH_URL:-}
+      - CORE_API_AUTH_SCHEME=${CORE_API_AUTH_SCHEME:-Bearer}
       - CORE_API_CLAIMS_BASE_URL=${CORE_API_CLAIMS_BASE_URL:-}
       - CORE_API_CLAIMS_USERNAME=${CORE_API_CLAIMS_USERNAME:-}
       - CORE_API_CLAIMS_PASSWORD=${CORE_API_CLAIMS_PASSWORD:-}
@@ -57,9 +65,11 @@ services:
       - CORE_API_SKIP_CLAIMS_SUBMIT=${CORE_API_SKIP_CLAIMS_SUBMIT:-false}
       - CORE_API_KEY=${CORE_API_KEY:-dev-key}
       - SECRET_KEY=${SECRET_KEY}
+      - WEBHOOK_SECRET_KEY=${WEBHOOK_SECRET_KEY:-}
+      - EXTRACTION_USE_RULES=${EXTRACTION_USE_RULES:-false}
       - ENVIRONMENT=development
     volumes:
-      - ${APPDATA}/gcloud:/root/.config/gcloud:ro
+      - ${GCLOUD_CONFIG_DIR:-/root/.config/gcloud}:/root/.config/gcloud:ro
       - .:/app
       - local_storage:/app/storage     # локальное хранилище документов (dev)
     ports:
@@ -80,11 +90,15 @@ services:
       - PYTHONPATH=/app
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-claims_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-claims}
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - LLM_PROVIDER=${LLM_PROVIDER:-anthropic}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
       - STORAGE_BUCKET=${STORAGE_BUCKET:-claims-documents-dev}
       - STORAGE_PROVIDER=${STORAGE_PROVIDER:-local}
       - CORE_API_BASE_URL=${CORE_API_BASE_URL:-http://mock-core}
+      - CORE_API_AUTH_URL=${CORE_API_AUTH_URL:-}
+      - CORE_API_AUTH_SCHEME=${CORE_API_AUTH_SCHEME:-Bearer}
       - CORE_API_CLAIMS_BASE_URL=${CORE_API_CLAIMS_BASE_URL:-}
       - CORE_API_CLAIMS_USERNAME=${CORE_API_CLAIMS_USERNAME:-}
       - CORE_API_CLAIMS_PASSWORD=${CORE_API_CLAIMS_PASSWORD:-}
@@ -92,12 +106,13 @@ services:
       - CORE_API_SKIP_CLAIMS_SUBMIT=${CORE_API_SKIP_CLAIMS_SUBMIT:-false}
       - CORE_API_KEY=${CORE_API_KEY:-dev-key}
       - SECRET_KEY=${SECRET_KEY}
+      - EXTRACTION_USE_RULES=${EXTRACTION_USE_RULES:-false}
       - ENVIRONMENT=development
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-intfloat/multilingual-e5-large}
       - TRANSFORMERS_CACHE=/app/.cache/huggingface
       - CELERY_WORKER=1
     volumes:
-      - ${APPDATA}/gcloud:/root/.config/gcloud:ro
+      - ${GCLOUD_CONFIG_DIR:-/root/.config/gcloud}:/root/.config/gcloud:ro
       - .:/app
       - model_cache:/app/.cache/huggingface
       - local_storage:/app/storage
