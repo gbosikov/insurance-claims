@@ -424,6 +424,10 @@ class GeminiLLMClient(BaseLLMClient):
             result.append(types.Content(role=role, parts=parts))
         return result
 
+    @property
+    def supports_thinking(self) -> bool:
+        return True
+
     async def _do_call_tool(
         self,
         *,
@@ -433,8 +437,10 @@ class GeminiLLMClient(BaseLLMClient):
         tool_name: str,
         max_tokens: int,
         temperature: float,
-        use_thinking: bool = False,  # игнорируется: Gemini thinking отключается для tool-use
+        use_thinking: bool = False,
     ) -> LLMResult:
+        from core.config import get_settings
+        settings = get_settings()
         types = self._gtypes
 
         # Упрощаем схему для Gemini: убираем поля >3 уровней вложенности
@@ -457,9 +463,16 @@ class GeminiLLMClient(BaseLLMClient):
                 )
             ),
         )
-        # Отключаем thinking чтобы не мешало function calling
+        # Thinking: включаем бюджет из settings если use_thinking=True,
+        # иначе явно отключаем (budget=0) чтобы не тратить лишние токены.
+        thinking_budget = (
+            settings.decision_extended_thinking_budget_tokens
+            if use_thinking else 0
+        )
         try:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=thinking_budget
+            )
         except (AttributeError, TypeError):
             pass
 
@@ -554,11 +567,13 @@ class GeminiLLMClient(BaseLLMClient):
             raise LLMNoToolBlockError(f"Gemini did not return function call for {tool_name!r}")
 
         meta = response.usage_metadata
+        # thoughts_token_count — токены внутреннего рассуждения (billing: как output)
+        thinking_tokens = getattr(meta, "thoughts_token_count", 0) or 0
         return LLMResult(
             tool_input=tool_input,
             text=None,
             input_tokens=getattr(meta, "prompt_token_count", 0),
-            output_tokens=getattr(meta, "candidates_token_count", 0),
+            output_tokens=(getattr(meta, "candidates_token_count", 0) or 0) + thinking_tokens,
         )
 
     async def call_text(
