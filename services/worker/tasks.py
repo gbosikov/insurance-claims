@@ -346,7 +346,7 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
             await db.flush()
 
             try:
-                await preprocess_all_documents(documents, storage, db, tenant_uuid)
+                preprocessed_docs = await preprocess_all_documents(documents, storage, db, tenant_uuid)
             except DocumentQualityError as e:
                 claim.status = ClaimStatus.DOCS_REQUESTED
                 claim.routing_reason = e.detail
@@ -358,7 +358,10 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
             await db.flush()
 
             try:
-                ocr_results = await ocr_all_documents(documents, storage, db, tenant_uuid)
+                ocr_results = await ocr_all_documents(
+                    documents, storage, db, tenant_uuid,
+                    preprocessed_docs=preprocessed_docs,
+                )
             except OCRFailedError as e:
                 claim.status = ClaimStatus.MANUAL_REVIEW
                 claim.routing_reason = f"OCR failed: {e}"

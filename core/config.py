@@ -114,6 +114,9 @@ class Settings(BaseSettings):
     # Лимит запросов/мин если у ключа не задан rate_limit_rpm
     api_rate_limit_default_rpm: int = 60
 
+    # ── Портал (JWT аутентификация для веб-портала) ────────────────
+    portal_jwt_expire_hours: int = 8  # время жизни токена портала
+
     # ── Webhook Security ────────────────────────────────────────────
     # Секретный ключ для подписи webhook от CoreAPI
     # Используется для HMAC-SHA256 верификации

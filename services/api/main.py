@@ -20,6 +20,8 @@ from core.config import get_settings
 from core.database import check_db_connection
 from core.logging import configure_logging
 from services.api.routers import analytics, appeals, claims, contracts, dead_letter, devtools, reviews, webhooks
+from services.api.routers import auth as portal_auth_router
+from services.api.routers import dashboard as portal_dashboard_router
 
 configure_logging()  # JSON-логи + маскирование ПД (core/logging.py)
 log = structlog.get_logger()
@@ -54,6 +56,10 @@ app.include_router(analytics.router, prefix="/v1/analytics", tags=["analytics"])
 app.include_router(reviews.router,      prefix="/v1/reviews",      tags=["reviews"])
 app.include_router(dead_letter.router,  prefix="/v1/dead-letter",  tags=["dead-letter"])
 app.include_router(webhooks.router,     prefix="/internal/hooks",  tags=["webhooks"])
+
+# ── Портал (JWT аутентификация + история заявок) ──────────────────
+app.include_router(portal_auth_router.router,      prefix="/auth",          tags=["portal-auth"])
+app.include_router(portal_dashboard_router.router, prefix="/v1/dashboard",  tags=["portal-dashboard"])
 
 # Dev tools — только development-окружение; в production эндпоинты возвращают 404
 if settings.environment == "development":

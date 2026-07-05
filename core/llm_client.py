@@ -624,3 +624,16 @@ def get_llm_client() -> BaseLLMClient:
         api_key=settings.anthropic_api_key,
         model=settings.claude_model,
     )
+
+
+def get_active_model_name() -> str:
+    """Возвращает имя активной модели без создания клиента.
+
+    Используется для записи model_version в audit_log и ClaimDecision —
+    корректно отражает реального провайдера (gemini или anthropic).
+    """
+    from core.config import get_settings
+    s = get_settings()
+    if s.llm_provider == "gemini":
+        return s.gemini_model
+    return s.claude_model

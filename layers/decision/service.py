@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.audit import AuditTimer, write_audit_entry
 from core.config import get_settings
 from core.exceptions import PolicyLimitExhaustedError
-from core.llm_client import BaseLLMClient, LLMAPIError, LLMNoToolBlockError, get_llm_client
+from core.llm_client import BaseLLMClient, LLMAPIError, LLMNoToolBlockError, get_active_model_name, get_llm_client
 from core.schemas.claim import ExtractionResult
 from core.schemas.contract import ContractChunkSchema
 from core.schemas.core_api import ICD10Item, ProviderInfo, RisksAndLimits
@@ -1205,7 +1205,7 @@ async def _second_pass_diagnosis(
             "output_tokens": sp_output_tokens,
         },
         prompt_version=PROMPT_VERSION,
-        model_version=settings.claude_model,
+        model_version=get_active_model_name(),
     )
     log.info(
         "second_pass_completed",
@@ -1286,7 +1286,7 @@ async def make_decision(
                     "საჭიროა ოპერატორის მიერ ხელით შემოწმება."
                 ),
                 prompt_version=PROMPT_VERSION,
-                model_version=settings.claude_model,
+                model_version=get_active_model_name(),
                 pers_id=pers_id,
             )
 
@@ -1311,7 +1311,7 @@ async def make_decision(
                     "ავტომატური დამტკიცება შეუძლებელია. საჭიროა ოპერატორის შემოწმება."
                 ),
                 prompt_version=PROMPT_VERSION,
-                model_version=settings.claude_model,
+                model_version=get_active_model_name(),
                 pers_id=pers_id,
             )
 
@@ -1333,7 +1333,7 @@ async def make_decision(
                     f"(დასაშვები ვადა: 90 დღე). უარი ხელშეკრულების პირობების საფუძველზე."
                 ),
                 prompt_version=PROMPT_VERSION,
-                model_version=settings.claude_model,
+                model_version=get_active_model_name(),
                 pers_id=pers_id,
             )
 
@@ -1362,7 +1362,7 @@ async def make_decision(
                     "საჭიროა ოპერატორის შემოწმება."
                 ),
                 prompt_version=PROMPT_VERSION,
-                model_version=settings.claude_model,
+                model_version=get_active_model_name(),
                 pers_id=pers_id,
             )
 
@@ -1413,7 +1413,7 @@ async def make_decision(
                             "საჭიროა ოპერატორის შემოწმება."
                         ),
                         prompt_version=PROMPT_VERSION,
-                        model_version=settings.claude_model,
+                        model_version=get_active_model_name(),
                         pers_id=pers_id,
                     )
 
@@ -1601,7 +1601,7 @@ async def make_decision(
                 overall_confidence=0.0,
                 summary=f"AI-ანალიზის შეცდომა: {e}. საჭიროა ოპერატორის მიერ ხელით შემოწმება.",
                 prompt_version=PROMPT_VERSION,
-                model_version=settings.claude_model,
+                model_version=get_active_model_name(),
             )
 
         if main_result.tool_input is None:
@@ -1618,7 +1618,7 @@ async def make_decision(
                 overall_confidence=0.0,
                 summary="AI-მ სტრუქტურირებული პასუხი ვერ დააბრუნა. საჭიროა ხელით შემოწმება.",
                 prompt_version=PROMPT_VERSION,
-                model_version=settings.claude_model,
+                model_version=get_active_model_name(),
             )
 
         raw: dict[str, Any] = main_result.tool_input  # type: ignore[assignment]
@@ -1957,7 +1957,7 @@ async def make_decision(
             summary=raw.get("summary", ""),
             rag_chunks_used=[str(chunk.id) for chunk in contract_chunks],
             prompt_version=PROMPT_VERSION,
-            model_version=settings.claude_model,
+            model_version=get_active_model_name(),
             # Поля для ClaimParsing_UNI
             diagnosid=diagnosid,
             pers_id=pers_id,
@@ -2020,7 +2020,7 @@ async def make_decision(
         },
         rag_chunks=[str(c.id) for c in contract_chunks],
         prompt_version=PROMPT_VERSION,
-        model_version=settings.claude_model,
+        model_version=get_active_model_name(),
         duration_ms=timer.duration_ms,
     )
 

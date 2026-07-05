@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.audit import AuditTimer, write_audit_entry
 from core.config import get_settings
 from core.exceptions import CrossValidationError, ExtractionFailedError
-from core.llm_client import LLMAPIError, LLMNoToolBlockError, get_llm_client
+from core.llm_client import LLMAPIError, LLMNoToolBlockError, get_active_model_name, get_llm_client
 from core.models.claim import ClaimDocument, DocType
 from core.schemas.claim import (
     CrossDocumentData,
@@ -1115,7 +1115,7 @@ async def _extract_with_claude(
         },
         confidence={"extraction": extraction.extraction_confidence},
         prompt_version=PROMPT_VERSION,
-        model_version=settings.claude_model,
+        model_version=get_active_model_name(),
         duration_ms=timer.duration_ms,
     )
 

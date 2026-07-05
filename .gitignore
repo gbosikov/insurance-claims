@@ -26,6 +26,10 @@ db/data/*.xls
 .cache/
 *.cache
 
+# Node / Frontend
+node_modules/
+services/portal/dist/
+
 # IDE
 .vscode/
 .idea/

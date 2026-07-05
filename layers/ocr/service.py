@@ -183,62 +183,71 @@ async def _ocr_single_attempt(image_bytes: bytes, doc_type: DocType) -> list[Tex
         )
 
 
-async def _recognize_document(doc: ClaimDocument, storage: StorageClient) -> "_OCRRawData":
+async def _recognize_page(image_bytes: bytes, doc_type: DocType, doc_id: str) -> list[TextBlock]:
+    """Один Vision API вызов для одной страницы с retry-логикой."""
+    last_error: Exception | None = None
+    for attempt in range(settings.ocr_max_retries):
+        try:
+            return await _ocr_single_attempt(image_bytes, doc_type)
+        except Exception as e:
+            last_error = e
+            log.warning(
+                "ocr_attempt_failed",
+                doc_id=doc_id,
+                attempt=attempt + 1,
+                error=str(e),
+            )
+            if attempt < settings.ocr_max_retries - 1:
+                await asyncio.sleep(RETRY_BACKOFF[attempt])
+    raise OCRFailedError(doc_id=doc_id, reason=str(last_error))
+
+
+async def _recognize_document(
+    doc: ClaimDocument,
+    storage: StorageClient,
+    page_paths: list[str],
+) -> "_OCRRawData":
     """
-    Только вызов Google Vision API (без записи в БД).
+    Вызов Google Vision API для всех страниц документа (без записи в БД).
+    page_paths — список путей к обработанным страницам из preprocessing.
+    Для однострочных файлов (JPG/PNG) len(page_paths) == 1.
+    Для многостраничных PDF len(page_paths) == кол-во страниц.
     Безопасно запускать параллельно через asyncio.gather.
     """
     with AuditTimer() as timer:
-        path = doc.preprocessed_path or doc.storage_path
-        image_bytes = await storage.download(path)
+        all_blocks: list[TextBlock] = []
 
-        blocks: list[TextBlock] = []
-        last_error: Exception | None = None
+        for page_path in page_paths:
+            image_bytes = await storage.download(page_path)
+            page_blocks = await _recognize_page(image_bytes, doc.doc_type, str(doc.id))
+            all_blocks.extend(page_blocks)
 
-        for attempt in range(settings.ocr_max_retries):
-            try:
-                blocks = await _ocr_single_attempt(image_bytes, doc.doc_type)
-                last_error = None
-                break
-            except Exception as e:
-                last_error = e
-                log.warning(
-                    "ocr_attempt_failed",
-                    doc_id=str(doc.id),
-                    attempt=attempt + 1,
-                    error=str(e),
-                )
-                if attempt < settings.ocr_max_retries - 1:
-                    await asyncio.sleep(RETRY_BACKOFF[attempt])
-
-        if last_error is not None:
-            raise OCRFailedError(doc_id=str(doc.id), reason=str(last_error))
-
-    avg_confidence = sum(b.confidence for b in blocks) / len(blocks) if blocks else 0.0
-    min_confidence = min(b.confidence for b in blocks) if blocks else 0.0
-    low_conf_indices = [i for i, b in enumerate(blocks) if b.confidence < settings.ocr_min_confidence]
-    full_text = "\n".join(b.text for b in blocks if b.text.strip())
     strategy = OCR_STRATEGIES.get(doc.doc_type, "vision_text_detection")
+    avg_confidence = sum(b.confidence for b in all_blocks) / len(all_blocks) if all_blocks else 0.0
+    min_confidence = min(b.confidence for b in all_blocks) if all_blocks else 0.0
+    low_conf_indices = [i for i, b in enumerate(all_blocks) if b.confidence < settings.ocr_min_confidence]
+    full_text = "\n".join(b.text for b in all_blocks if b.text.strip())
 
     return _OCRRawData(
         doc=doc,
-        blocks=blocks,
+        blocks=all_blocks,
         full_text=full_text,
         avg_confidence=avg_confidence,
         min_confidence=min_confidence,
         low_conf_indices=low_conf_indices,
         strategy=strategy,
         duration_ms=timer.duration_ms,
+        pages_count=len(page_paths),
     )
 
 
 class _OCRRawData:
     """Промежуточный результат OCR до записи в БД."""
     __slots__ = ("doc", "blocks", "full_text", "avg_confidence", "min_confidence",
-                 "low_conf_indices", "strategy", "duration_ms")
+                 "low_conf_indices", "strategy", "duration_ms", "pages_count")
 
     def __init__(self, doc, blocks, full_text, avg_confidence, min_confidence,
-                 low_conf_indices, strategy, duration_ms):
+                 low_conf_indices, strategy, duration_ms, pages_count=1):
         self.doc = doc
         self.blocks = blocks
         self.full_text = full_text
@@ -247,6 +256,7 @@ class _OCRRawData:
         self.low_conf_indices = low_conf_indices
         self.strategy = strategy
         self.duration_ms = duration_ms
+        self.pages_count = pages_count
 
 
 async def _save_ocr_result(raw: "_OCRRawData", db: AsyncSession, tenant_id: UUID) -> OCRResult:
@@ -272,6 +282,9 @@ async def _save_ocr_result(raw: "_OCRRawData", db: AsyncSession, tenant_id: UUID
     }
     await db.flush()
 
+    # $0.0015 за страницу (Google Vision API, DOCUMENT_TEXT_DETECTION)
+    ocr_cost_usd = round(raw.pages_count * 0.0015, 6)
+
     await write_audit_entry(
         db,
         claim_id=doc.claim_id,
@@ -285,6 +298,8 @@ async def _save_ocr_result(raw: "_OCRRawData", db: AsyncSession, tenant_id: UUID
             "low_confidence_blocks": low_conf_blocks,
             "low_confidence_block_indices": raw.low_conf_indices,
             "text_length": len(raw.full_text),
+            "pages_count": raw.pages_count,
+            "ocr_cost_usd": ocr_cost_usd,
         },
         confidence={"avg": round(raw.avg_confidence, 3), "min": round(raw.min_confidence, 3)},
         duration_ms=raw.duration_ms,
@@ -313,9 +328,14 @@ async def ocr_document(
     storage: StorageClient,
     db: AsyncSession,
     tenant_id: UUID,
+    page_paths: list[str] | None = None,
 ) -> OCRResult:
-    """OCR одного документа (Vision API + запись в БД)."""
-    raw = await _recognize_document(doc, storage)
+    """OCR одного документа (Vision API + запись в БД).
+
+    page_paths — все страницы из preprocessing (None → fallback к doc.preprocessed_path).
+    """
+    effective_paths = page_paths or [doc.preprocessed_path or doc.storage_path]
+    raw = await _recognize_document(doc, storage, effective_paths)
     return await _save_ocr_result(raw, db, tenant_id)
 
 
@@ -324,15 +344,31 @@ async def ocr_all_documents(
     storage: StorageClient,
     db: AsyncSession,
     tenant_id: UUID,
+    preprocessed_docs: "list | None" = None,
 ) -> list[OCRResult]:
     """
     OCR всех документов заявки.
     Google Vision вызывается параллельно (медленные внешние запросы).
     Запись в БД выполняется последовательно (asyncpg не поддерживает
     конкурентные операции на одном соединении).
+
+    preprocessed_docs — результат preprocess_all_documents; содержит page_paths
+    для многостраничных PDF. Если None — fallback к doc.preprocessed_path.
     """
+    # Строим маппинг doc_id → page_paths из preprocessing
+    pages_map: dict[str, list[str]] = {}
+    if preprocessed_docs:
+        for pd in preprocessed_docs:
+            if pd.page_paths:
+                pages_map[str(pd.doc_id)] = pd.page_paths
+
     raw_results = await asyncio.gather(*[
-        _recognize_document(doc, storage) for doc in documents
+        _recognize_document(
+            doc,
+            storage,
+            pages_map.get(str(doc.id)) or [doc.preprocessed_path or doc.storage_path],
+        )
+        for doc in documents
     ])
     results = []
     for raw in raw_results:

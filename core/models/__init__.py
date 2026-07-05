@@ -9,6 +9,7 @@ from core.models.fraud import ClaimFrequency
 from core.models.icd10 import ICD10Diagnosis
 from core.models.platform import ApiKey, Tenant
 from core.models.provider import Provider
+from core.models.user import PortalUser
 
 __all__ = [
     "Claim",
@@ -26,4 +27,5 @@ __all__ = [
     "ApiKey",
     "Tenant",
     "Provider",
+    "PortalUser",
 ]

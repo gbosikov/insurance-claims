@@ -46,8 +46,9 @@ DEFAULT_TENANT_ID = UUID("00000000-0000-0000-0000-000000000001")
 
 # Пути, не требующие API-ключа
 PUBLIC_PATHS = {"/", "/health", "/docs", "/redoc", "/openapi.json"}
-# /internal/hooks/* защищены HMAC-подписью (см. routers/webhooks.py)
-PUBLIC_PATH_PREFIXES = ("/internal/hooks",)
+# /internal/hooks/* защищены HMAC-подписью (см. routers/webhooks.py).
+# /auth/* и /v1/dashboard/* — портал (JWT Bearer), своя аутентификация.
+PUBLIC_PATH_PREFIXES = ("/internal/hooks", "/auth", "/v1/dashboard")
 
 # Полный набор скоупов — выдаётся dev-fallback'у и ключам с scope 'admin'
 ALL_SCOPES = [
