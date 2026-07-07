@@ -550,7 +550,7 @@ def process_claim(self: Task, claim_id: str, tenant_id: str) -> dict:
                             if li.doc_source and li.doc_source.startswith("receipt")
                         ]
                         _fallback_items = _fallback_receipt_items if _fallback_receipt_items else extraction.event.line_items
-                        _risks_list, _ = _build_fallback_risks(
+                        _risks_list, _, _ = _build_fallback_risks(
                             line_items=_fallback_items,
                             risks=risks_limits.risks,
                             event_date=extraction.event.date or "",

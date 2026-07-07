@@ -16,6 +16,7 @@ from core.schemas.core_api import RiskInfo, RisksAndLimits
 from layers.decision.service import (
     check_claim_filed_in_time,
     check_remaining_limit,
+    compute_data_score,
     find_diagnosid,
     find_pers_id,
 )
@@ -60,6 +61,27 @@ def make_extraction(event_date: str = "2026-01-15") -> ExtractionResult:
         extraction_confidence=0.92,
         flags=[],
     )
+
+
+# ── compute_data_score: штрафы за классификацию типа документа ────
+
+
+def test_compute_data_score_no_flags_is_full_score():
+    extraction = make_extraction()
+    assert compute_data_score(extraction) == 1.0
+
+
+def test_compute_data_score_unclassified_document_penalty():
+    """doc_type=other (LLM не смог классифицировать) → штраф 0.20."""
+    extraction = make_extraction()
+    extraction.flags = ["unclassified_document"]
+    assert compute_data_score(extraction) == pytest.approx(0.80)
+
+
+def test_compute_data_score_low_confidence_doc_type_penalty():
+    extraction = make_extraction()
+    extraction.flags = ["low_confidence_doc_type"]
+    assert compute_data_score(extraction) == pytest.approx(0.90)
 
 
 # ── check_remaining_limit ─────────────────────────────────────────
@@ -439,7 +461,71 @@ async def test_stochastic_qa_sets_manual_review_reason():
 
     assert decision.requires_manual_review is True
     assert decision.manual_review_reason == "stochastic_qa_sample"
-    assert decision.final_payout == 120.0  # payout не изменился
+    # QA sampling сам по себе payout не меняет, но final_payout всё равно пересчитан
+    # из claimed_amount по РЕАЛЬНОМУ coverage_pct подобранного риска (80%), а не
+    # взят как есть из ответа Claude (который вернул 120.0 без применения процента).
+    assert decision.final_payout == 96.0
+
+
+@pytest.mark.asyncio
+async def test_make_decision_final_payout_unchanged_when_no_risk_matched():
+    """Если ни один риск не подобран (matched_risk=None) — final_payout не трогаем,
+    берём как есть из ответа Claude (нет реального coverage_pct для пересчёта)."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from core.schemas.claim import DiagnoisItem, EventData, ExtractionResult, InsuredData, LineItem
+    from core.schemas.core_api import ICD10Item, RisksAndLimits
+    from layers.decision.service import make_decision
+
+    mock_check_fraud = AsyncMock(return_value=[])
+    mock_client = AsyncMock()
+    mock_client.supports_thinking = True
+    mock_client.call_tool = AsyncMock(return_value=LLMResult(tool_input={
+        "diagnoses": [{"icd10_code": "J06.9", "is_covered": True, "approved_amount": 120.0, "coverage_clarity": 0.95}],
+        "line_items": [{"description": "Консультация", "claimed_amount": 120.0, "approved_amount": 120.0}],
+        "total_approved": 120.0,
+        "deductible_applied": 0.0,
+        "final_payout": 120.0,
+        "requires_manual_review": False,
+        "manual_review_reason": None,
+        "summary": "Одобрено",
+    }))
+    mock_client.call_text = AsyncMock(return_value=LLMResult(text=""))
+
+    extraction = ExtractionResult(
+        insured=InsuredData(full_name="Иванов И.И.", birth_date="1985-01-01", personal_id="12345678901"),
+        event=EventData(date="2026-01-15", institution=None,
+                        diagnoses=[DiagnoisItem(icd10_code="J06.9", description="ОРВИ")],
+                        line_items=[LineItem(description="Консультация", amount=120.0)],
+                        total_claimed=120.0),
+        extraction_confidence=0.95,
+    )
+    # Пустой список рисков → match_risks вернёт matched_risk=None
+    risks = RisksAndLimits(
+        policy_number=POLICY_NUMBER, risks=[],
+        annual_limit=5000.0, remaining=1500.0, currency="GEL",
+    )
+
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=MagicMock(
+        scalars=MagicMock(return_value=MagicMock(first=MagicMock(return_value=None)))
+    ))
+
+    with patch("layers.decision.service.check_fraud", mock_check_fraud), \
+         patch("layers.decision.service.get_llm_client", return_value=mock_client), \
+         patch("layers.decision.service.write_audit_entry", AsyncMock()), \
+         patch("layers.decision.service.enrich_all", AsyncMock(return_value={})), \
+         patch("layers.decision.service.random.random", return_value=0.99):
+        decision = await make_decision(
+            claim_id=CLAIM_ID, tenant_id=TENANT_ID,
+            policy_number=POLICY_NUMBER,
+            extraction=extraction, risks_limits=risks,
+            icd10_list=[ICD10Item(diagnosid=101, code="J06.9", name="ОРВИ")],
+            providers=[], contract_chunks=[],
+            submission_date=date(2026, 1, 20), db=db,
+            ocr_texts=["ფორმა 100 J06.9 კონსულტაცია 120 GEL"],
+        )
+
+    assert decision.final_payout == 120.0
 
 
 @pytest.mark.asyncio

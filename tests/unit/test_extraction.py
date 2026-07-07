@@ -269,8 +269,195 @@ async def test_persist_extracted_data_sets_per_doc_slices():
     db.flush.assert_awaited()
 
 
+@pytest.mark.asyncio
+async def test_persist_extracted_data_new_doc_types():
+    """discharge_summary/lab_result/prescription получают insured+event (как form_100);
+    other получает {} — неуверенная классификация, нечего атрибутировать."""
+    from unittest.mock import AsyncMock, MagicMock
+    from uuid import uuid4
+
+    from core.models.claim import DocType
+    from layers.extraction.service import _persist_extracted_data
+    from layers.ocr.service import OCRResult
+
+    discharge_id, lab_id, rx_id, other_id = uuid4(), uuid4(), uuid4(), uuid4()
+    docs = {
+        discharge_id: MagicMock(id=discharge_id),
+        lab_id: MagicMock(id=lab_id),
+        rx_id: MagicMock(id=rx_id),
+        other_id: MagicMock(id=other_id),
+    }
+
+    scalars = MagicMock()
+    scalars.all.return_value = list(docs.values())
+    execute_result = MagicMock()
+    execute_result.scalars.return_value = scalars
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=execute_result)
+
+    extraction = make_extraction()
+    ocr_results = [
+        OCRResult(doc_id=discharge_id, doc_type=DocType.DISCHARGE_SUMMARY, full_text=""),
+        OCRResult(doc_id=lab_id, doc_type=DocType.LAB_RESULT, full_text=""),
+        OCRResult(doc_id=rx_id, doc_type=DocType.PRESCRIPTION, full_text=""),
+        OCRResult(doc_id=other_id, doc_type=DocType.OTHER, full_text=""),
+    ]
+
+    await _persist_extracted_data(
+        extraction, ocr_results, db,
+        UUID("00000000-0000-0000-0000-000000000001"),
+    )
+
+    for doc_id in (discharge_id, lab_id, rx_id):
+        assert docs[doc_id].extracted_data["insured"]["full_name"] == "Иванов Иван Иванович"
+        assert docs[doc_id].extracted_data["event"]["total_claimed"] == 150.0
+
+    assert docs[other_id].extracted_data == {}
+
+
+# ── LLM-классификация типов документов (_apply_llm_doc_classification) ──
+
+
+@pytest.mark.asyncio
+async def test_apply_llm_doc_classification_writes_doc_type_and_source():
+    """Каждый документ получает doc_type/doc_type_source='llm' по своему doc_index."""
+    from unittest.mock import AsyncMock, MagicMock
+    from uuid import uuid4
+
+    from core.models.claim import DocType
+    from layers.extraction.service import _apply_llm_doc_classification
+    from layers.ocr.service import OCRResult
+
+    form_id, receipt_id = uuid4(), uuid4()
+    form_doc = MagicMock(id=form_id)
+    receipt_doc = MagicMock(id=receipt_id)
+
+    scalars = MagicMock()
+    scalars.all.return_value = [form_doc, receipt_doc]
+    execute_result = MagicMock()
+    execute_result.scalars.return_value = scalars
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=execute_result)
+
+    ocr_results = [
+        OCRResult(doc_id=form_id, doc_type=DocType.OTHER, full_text="form text"),
+        OCRResult(doc_id=receipt_id, doc_type=DocType.OTHER, full_text="receipt text"),
+    ]
+    raw_documents = [
+        {"doc_index": 1, "doc_type": "form_100", "doc_type_confidence": 0.95},
+        {"doc_index": 2, "doc_type": "receipt", "doc_type_confidence": 0.90},
+    ]
+
+    updated, flags = await _apply_llm_doc_classification(
+        raw_documents, ocr_results, db,
+        UUID("11111111-1111-1111-1111-111111111111"),
+        UUID("00000000-0000-0000-0000-000000000001"),
+    )
+
+    assert form_doc.doc_type == DocType.FORM_100
+    assert form_doc.doc_type_source == "llm"
+    assert receipt_doc.doc_type == DocType.RECEIPT
+    assert receipt_doc.doc_type_source == "llm"
+    assert [r.doc_type for r in updated] == [DocType.FORM_100, DocType.RECEIPT]
+    assert flags == []
+    db.flush.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_llm_doc_classification_missing_index_flags_unclassified():
+    """Отсутствующий doc_index в ответе LLM → флаг unclassified_document, не падение."""
+    from unittest.mock import AsyncMock, MagicMock
+    from uuid import uuid4
+
+    from core.models.claim import DocType
+    from layers.extraction.service import _apply_llm_doc_classification
+    from layers.ocr.service import OCRResult
+
+    doc_id = uuid4()
+    scalars = MagicMock()
+    scalars.all.return_value = [MagicMock(id=doc_id)]
+    execute_result = MagicMock()
+    execute_result.scalars.return_value = scalars
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=execute_result)
+
+    ocr_results = [OCRResult(doc_id=doc_id, doc_type=DocType.FORM_100, full_text="text")]
+
+    updated, flags = await _apply_llm_doc_classification(
+        [], ocr_results, db,
+        UUID("11111111-1111-1111-1111-111111111111"),
+        UUID("00000000-0000-0000-0000-000000000001"),
+    )
+
+    assert flags == ["unclassified_document"]
+    assert updated[0].doc_type == DocType.FORM_100  # без изменений
+
+
+@pytest.mark.asyncio
+async def test_apply_llm_doc_classification_low_confidence_flag():
+    """doc_type_confidence ниже порога → флаг low_confidence_doc_type."""
+    from unittest.mock import AsyncMock, MagicMock
+    from uuid import uuid4
+
+    from core.models.claim import DocType
+    from layers.extraction.service import _apply_llm_doc_classification
+    from layers.ocr.service import OCRResult
+
+    doc_id = uuid4()
+    scalars = MagicMock()
+    scalars.all.return_value = [MagicMock(id=doc_id)]
+    execute_result = MagicMock()
+    execute_result.scalars.return_value = scalars
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=execute_result)
+
+    ocr_results = [OCRResult(doc_id=doc_id, doc_type=DocType.OTHER, full_text="text")]
+    raw_documents = [{"doc_index": 1, "doc_type": "lab_result", "doc_type_confidence": 0.30}]
+
+    updated, flags = await _apply_llm_doc_classification(
+        raw_documents, ocr_results, db,
+        UUID("11111111-1111-1111-1111-111111111111"),
+        UUID("00000000-0000-0000-0000-000000000001"),
+    )
+
+    assert flags == ["low_confidence_doc_type"]
+    assert updated[0].doc_type == DocType.LAB_RESULT
+
+
+@pytest.mark.asyncio
+async def test_apply_llm_doc_classification_other_flags_unclassified():
+    """doc_type='other' → флаг unclassified_document."""
+    from unittest.mock import AsyncMock, MagicMock
+    from uuid import uuid4
+
+    from core.models.claim import DocType
+    from layers.extraction.service import _apply_llm_doc_classification
+    from layers.ocr.service import OCRResult
+
+    doc_id = uuid4()
+    scalars = MagicMock()
+    scalars.all.return_value = [MagicMock(id=doc_id)]
+    execute_result = MagicMock()
+    execute_result.scalars.return_value = scalars
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=execute_result)
+
+    ocr_results = [OCRResult(doc_id=doc_id, doc_type=DocType.FORM_100, full_text="illegible")]
+    raw_documents = [{"doc_index": 1, "doc_type": "other", "doc_type_confidence": 0.40}]
+
+    updated, flags = await _apply_llm_doc_classification(
+        raw_documents, ocr_results, db,
+        UUID("11111111-1111-1111-1111-111111111111"),
+        UUID("00000000-0000-0000-0000-000000000001"),
+    )
+
+    assert flags == ["unclassified_document"]
+    assert updated[0].doc_type == DocType.OTHER
+
+
 def test_build_user_message_includes_all_docs(sample_ocr_result):
-    """Промпт содержит текст всех документов."""
+    """Промпт содержит текст всех документов, нейтрально пронумерованных
+    (тип документа больше не предполагается лейблом — его определяет LLM)."""
     from layers.ocr.service import OCRResult, TextBlock
     from core.models.claim import DocType
     from uuid import uuid4
@@ -284,7 +471,9 @@ def test_build_user_message_includes_all_docs(sample_ocr_result):
     )
 
     message = _build_user_message([sample_ocr_result, id_doc_result])
-    assert "ФОРМА 100" in message
-    assert "ДОКУМЕНТ УДОСТОВЕРЯЮЩИЙ ЛИЧНОСТЬ" in message
+    assert "ДОКУМЕНТ #1" in message
+    assert "ДОКУМЕНТ #2" in message
+    assert "ФОРМА 100" not in message
+    assert "ДОКУМЕНТ УДОСТОВЕРЯЮЩИЙ ЛИЧНОСТЬ" not in message
     assert "J06.9" in message
     assert "12345678901" in message

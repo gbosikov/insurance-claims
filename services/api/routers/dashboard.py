@@ -303,17 +303,18 @@ async def get_stats(
     row = (await db.execute(
         text("""
             SELECT
-                COUNT(DISTINCT claim_id)                                              AS total_claims,
-                COALESCE(SUM(CASE WHEN step = 'ocr'
-                    THEN (output_data->>'pages_count')::numeric END), 0)              AS total_ocr_pages,
-                COALESCE(SUM(CASE WHEN step = 'ocr'
-                    THEN (output_data->>'ocr_cost_usd')::numeric END), 0)             AS total_ocr_cost,
-                COALESCE(SUM(CASE WHEN step IN ('extraction', 'decision')
-                    THEN (output_data->>'input_tokens')::numeric END), 0)             AS total_input_tokens,
-                COALESCE(SUM(CASE WHEN step IN ('extraction', 'decision')
-                    THEN (output_data->>'output_tokens')::numeric END), 0)            AS total_output_tokens
-            FROM audit_log
-            WHERE tenant_id::text = :tenant_id
+                COUNT(DISTINCT al.claim_id)                                           AS total_claims,
+                COALESCE(SUM(CASE WHEN al.step = 'ocr'
+                    THEN (al.output_data->>'pages_count')::numeric END), 0)           AS total_ocr_pages,
+                COALESCE(SUM(CASE WHEN al.step = 'ocr'
+                    THEN (al.output_data->>'ocr_cost_usd')::numeric END), 0)          AS total_ocr_cost,
+                COALESCE(SUM(CASE WHEN al.step IN ('extraction', 'decision')
+                    THEN (al.output_data->>'input_tokens')::numeric END), 0)          AS total_input_tokens,
+                COALESCE(SUM(CASE WHEN al.step IN ('extraction', 'decision')
+                    THEN (al.output_data->>'output_tokens')::numeric END), 0)         AS total_output_tokens
+            FROM audit_log al
+            INNER JOIN claims c ON c.id = al.claim_id AND c.tenant_id = al.tenant_id
+            WHERE al.tenant_id::text = :tenant_id
         """),
         {"tenant_id": str(tenant_id)},
     )).mappings().one()

@@ -16,7 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.audit import AuditTimer, write_audit_entry
 from core.config import get_settings
-from core.models.claim import Claim, ClaimDocument, ClaimStatus, DocType
+from core.doc_type_hint import guess_doc_type_from_filename
+from core.models.claim import Claim, ClaimDocument, ClaimStatus
 from core.schemas.claim import ClaimCreateRequest, ClaimResponse
 
 log = structlog.get_logger()
@@ -90,7 +91,8 @@ async def receive_claim(
             doc = ClaimDocument(
                 claim_id=claim.id,
                 tenant_id=tenant_id,
-                doc_type=DocType.FORM_100,   # временная метка; слой 4 переопределит по OCR
+                doc_type=guess_doc_type_from_filename(doc_ref.filename),
+                doc_type_source="filename_hint",  # слой 4 переопределит по OCR/LLM
                 source_url=doc_ref.url,
                 storage_path=None,           # заполнит worker после скачивания
             )

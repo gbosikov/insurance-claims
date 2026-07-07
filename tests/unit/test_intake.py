@@ -123,6 +123,40 @@ async def test_receive_claim_success():
     assert result is not None
 
 
+@pytest.mark.asyncio
+async def test_receive_claim_sets_doc_type_from_filename_hint():
+    """doc_type выставляется по имени файла (Layer 1), не хардкодом FORM_100."""
+    from core.models.claim import DocType
+    from layers.intake.service import receive_claim
+
+    db = _make_db_mock()
+    mock_claim = MagicMock()
+    mock_claim.id = UUID("11111111-1111-1111-1111-111111111111")
+    mock_claim.status = MagicMock(value="RECEIVED")
+
+    request = _make_request(urls=[
+        ("https://medsystem.example.com/passport_scan.jpg", "passport_scan.jpg"),
+        ("https://medsystem.example.com/receipt_01.pdf", "receipt_01.pdf"),
+        ("https://medsystem.example.com/unnamed_file.pdf", "unnamed_file.pdf"),
+    ])
+
+    with patch("layers.intake.service.Claim", return_value=mock_claim), \
+         patch("layers.intake.service.ClaimDocument") as mock_doc_cls, \
+         patch("layers.intake.service.write_audit_entry", AsyncMock()):
+        mock_doc_cls.return_value = MagicMock()
+
+        await receive_claim(
+            tenant_id=UUID("00000000-0000-0000-0000-000000000001"),
+            request=request,
+            db=db,
+            celery_app=MagicMock(),
+        )
+
+    doc_types = [call.kwargs["doc_type"] for call in mock_doc_cls.call_args_list]
+    assert doc_types == [DocType.ID_DOCUMENT, DocType.RECEIPT, DocType.OTHER]
+    assert all(call.kwargs["doc_type_source"] == "filename_hint" for call in mock_doc_cls.call_args_list)
+
+
 # ── downloader: _check_trusted_host ──────────────────────────────
 
 def test_trusted_host_ok():

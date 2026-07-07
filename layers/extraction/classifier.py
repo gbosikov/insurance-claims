@@ -1,15 +1,19 @@
 """
-Классификатор типа документа по OCR-тексту (Layer 4).
+Классификатор типа документа по OCR-тексту (Layer 4) — rule-based путь.
 
 Метод: регулярные выражения на RU + KA + EN паттернах.
-Вызывается в начале extract_claim_data(), до передачи текста в Claude.
+Вызывается в extract_claim_data() только когда settings.extraction_use_rules=True
+(без LLM в этом режиме тип определять больше некому). В основном (LLM) режиме
+классификацию делает Claude/Gemini как часть extraction tool-call — см.
+EXTRACTION_TOOL["documents"] в layers/extraction/service.py.
 
 Если тип, определённый здесь, отличается от типа из Layer 1 (по имени файла) —
 обновляет ClaimDocument.doc_type и doc_type_source в БД,
-обновляет OCRResult.doc_type чтобы Claude получил правильный лейбл в промпте.
+обновляет OCRResult.doc_type чтобы rule_extractor получил правильный тип.
 
 Порог MIN_MATCHES: минимум совпадений для уверенной переклассификации.
-Ниже порога — оставляем тип из Layer 1 (filename_hint).
+Ниже порога — DocType.OTHER (не текущий тип): недостаточная уверенность должна
+вести к manual_review, а не к тихому сохранению непроверенной догадки.
 """
 
 from __future__ import annotations
@@ -114,6 +118,59 @@ CONTENT_PATTERNS: dict[DocType, list[str]] = {
         # Суммы в GEL
         r"\d+[\.,]\d+\s*(?:gel|₾|lari|ლარი|лари)",
     ],
+    DocType.DISCHARGE_SUMMARY: [
+        # Russian
+        r"выписной\s+эпикриз",
+        r"эпикриз",
+        r"находился\s+на\s+лечении",
+        r"проведено\s+лечение",
+        r"рекомендаци[ия]\s+при\s+выписке",
+        r"дата\s+выписки",
+        # Georgian
+        r"საექიმო\s+დასკვნა",
+        r"ეპიკრიზი",
+        r"გაწერის\s+ეპიკრიზი",
+        r"ჩატარებული\s+მკურნალობა",
+        r"გაწერის\s+თარიღი",
+        # English
+        r"discharge\s+summary",
+        r"discharge\s+epicrisis",
+        r"hospital\s+course",
+        r"discharge\s+date",
+    ],
+    DocType.LAB_RESULT: [
+        # Russian
+        r"результат[ыа]?\s+анализ",
+        r"лабораторн\w*\s+исследовани",
+        r"референсн\w*\s+значени",
+        r"общий\s+анализ\s+крови",
+        r"биохимическ\w*\s+анализ",
+        # Georgian
+        r"ლაბორატორიული",
+        r"ანალიზის\s+შედეგი",
+        r"სისხლის\s+საერთო\s+ანალიზი",
+        r"რეფერენსული\s+მაჩვენებელი",
+        # English
+        r"lab(?:oratory)?\s+result",
+        r"reference\s+range",
+        r"complete\s+blood\s+count",
+        r"test\s+result",
+    ],
+    DocType.PRESCRIPTION: [
+        # Russian
+        r"рецепт\s*[№#]",
+        r"назначени[ея]\s+препарат",
+        r"способ\s+применени",
+        r"принимать\s+по",
+        # Georgian
+        r"რეცეპტი",
+        r"მედიკამენტის\s+დანიშვნა",
+        r"მიღების\s+წესი",
+        # English
+        r"\bprescription\b",
+        r"\brx\s*[№#:]",
+        r"dosage\s+instructions",
+    ],
 }
 
 # Предкомпилированные паттерны — создаются один раз при импорте модуля
@@ -137,7 +194,9 @@ def classify_by_ocr_text(text: str, current_type: DocType) -> ClassificationResu
 
     Подсчитывает совпадения для каждого типа документа.
     Побеждает тип с наибольшим числом совпадений при условии >= MIN_MATCHES.
-    Если уверенности недостаточно — возвращает current_type без изменений.
+    Если уверенности недостаточно — возвращает DocType.OTHER (не текущий тип:
+    молчаливое сохранение непроверенной догадки маскирует неопределённость,
+    которая должна вести к manual_review, а не к тихо неверному лейблу).
     """
     scores: dict[DocType, int] = {dt: 0 for dt in DocType}
 
@@ -150,10 +209,12 @@ def classify_by_ocr_text(text: str, current_type: DocType) -> ClassificationResu
     best_score = scores[best_type]
 
     if best_score < MIN_MATCHES:
+        changed_from = current_type if current_type != DocType.OTHER else None
         return ClassificationResult(
-            doc_type=current_type,
+            doc_type=DocType.OTHER,
             confidence=0.5,
             match_count=best_score,
+            changed_from=changed_from,
         )
 
     # confidence: 2 совпадения → ~0.65, весь набор → 1.0
@@ -185,7 +246,8 @@ async def reclassify_documents(
     - Всегда обновляет doc_type_source = 'ocr_rules' (фиксируем что прошли классификатор)
     - Возвращает обновлённый список OCRResult с актуальными doc_type
 
-    Обновлённые типы попадают в промпт Claude в Layer 4 через _build_user_message().
+    Вызывается только в rule-based режиме (settings.extraction_use_rules=True) —
+    обновлённые типы использует rule_extractor.py вместо LLM.
     """
     updated: list = []
     reclassified_count = 0

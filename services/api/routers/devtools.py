@@ -229,6 +229,10 @@ function addFileRow() {
       <option value="form_100">Форма 100</option>
       <option value="id_document">ID / Паспорт</option>
       <option value="receipt">Чек / Счёт</option>
+      <option value="discharge_summary">Выписка / Эпикриз</option>
+      <option value="lab_result">Лабораторный анализ</option>
+      <option value="prescription">Рецепт</option>
+      <option value="other">Другое</option>
     </select>
     <button class="sec" style="padding:4px 8px; font-size:12px"
             onclick="document.getElementById('fr-${id}').remove()">✕</button>

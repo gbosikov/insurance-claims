@@ -36,6 +36,10 @@ class DocType(str, enum.Enum):
     FORM_100 = "form_100"
     ID_DOCUMENT = "id_document"
     RECEIPT = "receipt"
+    DISCHARGE_SUMMARY = "discharge_summary"
+    LAB_RESULT = "lab_result"
+    PRESCRIPTION = "prescription"
+    OTHER = "other"
 
 
 class Claim(Base):

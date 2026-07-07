@@ -109,6 +109,14 @@ class Settings(BaseSettings):
     environment: str = "development"
     secret_key: str = "change_me"
 
+    # ── Audit Log Immutability ──────────────────────────────────────
+    # audit_log защищён DB-правилами (audit_log_no_delete/no_update) — записи
+    # решений нельзя менять/удалять (compliance, CLAUDE.md правило №5).
+    # True (дефолт) = защита включена. False позволяет временно снять защиту
+    # через `python -m scripts.toggle_audit_log_lock` — ТОЛЬКО для очистки
+    # тестовых данных в dev; скрипт отказывается снимать защиту в production.
+    audit_log_immutable: bool = True
+
     # ── API-аутентификация (platform.api_keys) ─────────────────────
     api_key_header: str = "X-API-Key"
     # Лимит запросов/мин если у ключа не задан rate_limit_rpm
@@ -160,6 +168,9 @@ class Settings(BaseSettings):
     extraction_institution_mismatch_penalty: float = 0.85 # множитель confidence при расхождении
     extraction_date_mismatch_max_days: int = 3            # допустимое расхождение дат между документами
     extraction_amount_mismatch_pct: float = 0.01          # допуск расхождения сумм (±1%)
+
+    # ── Классификация типа документа (documents[] в EXTRACTION_TOOL) ──
+    extraction_doc_type_low_confidence_threshold: float = 0.60
 
     # ── Quality Gate ───────────────────────────────────────────────
     quality_min_resolution_dpi: int = 150

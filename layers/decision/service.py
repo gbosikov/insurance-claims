@@ -321,6 +321,8 @@ _DATA_SCORE_PENALTIES: dict[str, float] = {
     "low_confidence_name":  0.10,  # ФИО извлечено с низкой уверенностью OCR
     "low_ocr_quality":      0.10,  # низкое качество распознавания OCR
     "amount_total_mismatch":0.10,  # сумма формы 100 ≠ сумма чека ± 1%
+    "unclassified_document":  0.20,  # LLM не смог классифицировать документ (doc_type=other)
+    "low_confidence_doc_type":0.10,  # классификация ниже extraction_doc_type_low_confidence_threshold
 }
 
 
@@ -1899,7 +1901,7 @@ async def make_decision(
             if li.doc_source and li.doc_source.startswith("receipt")
         ]
         _items_for_risk = _receipt_items if _receipt_items else extraction.event.line_items
-        risks_list, risk_match_fallback = match_risks(
+        risks_list, risk_match_fallback, matched_risk = match_risks(
             line_items=_items_for_risk,
             risks=risks_limits.risks,
             event_date=extraction.event.date,
@@ -1908,6 +1910,43 @@ async def make_decision(
             total_claimed=extraction.event.total_claimed or 0.0,
         )
         config_kind = 2
+
+        # ── Коррекция процента покрытия по РЕАЛЬНОМУ риску ────────
+        # Claude в DECISION_TOOL сам оценивает final_payout, ориентируясь на
+        # coverage_pct КАКОГО-ТО риска из списка в промпте — необязательно того,
+        # который risk_matcher.py детерминированно выберет для реальной отправки
+        # в ClaimParsing_UNI. Раз RiskID уже определён — пересчитываем final_payout
+        # и построчные approved_amount по ЕГО фактическому coverage_pct из данных
+        # кор-системы, а не по догадке LLM. Позиции POSITIVE LIST (100% покрытие
+        # по бизнес-правилу) не трогаем — они уже выставлены выше.
+        if matched_risk is not None:
+            claude_final_payout = raw.get("final_payout", 0.0)
+            for li in line_items:
+                if li.approved_amount > 0 and not li.positive_list_applied:
+                    li.approved_amount = round(
+                        li.claimed_amount * matched_risk.coverage_pct / 100.0, 2
+                    )
+            if line_items:
+                raw["final_payout"] = round(
+                    sum(li.approved_amount for li in line_items)
+                    - raw.get("deductible_applied", 0.0),
+                    2,
+                )
+            else:
+                raw["final_payout"] = round(
+                    max(0.0, raw.get("total_approved", 0.0) - raw.get("deductible_applied", 0.0))
+                    * matched_risk.coverage_pct / 100.0,
+                    2,
+                )
+            log.info(
+                "final_payout_recalculated_from_matched_risk",
+                claim_id=str(claim_id),
+                risk_id=matched_risk.risk_id,
+                risk_name=matched_risk.name[:60],
+                coverage_pct=matched_risk.coverage_pct,
+                claude_final_payout=claude_final_payout,
+                corrected_final_payout=raw["final_payout"],
+            )
 
         # PersID уже вычислен выше (до всех early-return путей).
 

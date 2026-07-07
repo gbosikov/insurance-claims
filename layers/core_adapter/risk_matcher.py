@@ -203,7 +203,7 @@ def match_risks(
     form_100_text: str,
     config_kind: int = 2,
     total_claimed: float = 0.0,
-) -> tuple[list[dict], bool]:
+) -> tuple[list[dict], bool, RiskInfo | None]:
     """
     Подобрать риск для каждой услуги и построить RisksList для ClaimParsing_UNI.
 
@@ -216,9 +216,13 @@ def match_risks(
         total_claimed: сумма из заявки — используется если нет детализированных line_items
 
     Returns:
-        (risks_list, needs_manual_review)
-        risks_list — список словарей для XML_DATA.RisksList (никогда не пустой если есть риски)
+        (risks_list, needs_manual_review, selected_risk)
+        risks_list     — список словарей для XML_DATA.RisksList (никогда не пустой если есть риски)
         needs_manual_review — True если хотя бы один риск подобран по fallback
+        selected_risk  — RiskInfo реально выбранного риска (или None, если риск не подобран).
+                         coverage_pct отсюда — единственный источник процента покрытия для
+                         расчёта final_payout (Decision Engine не должен использовать
+                         coverage_pct другого риска, который сам себе "придумал" LLM).
     """
     category = detect_service_category(form_100_text)
     prefer_free_choice = (config_kind == 2)
@@ -232,7 +236,7 @@ def match_risks(
     # Если нет детализированных строк — одна запись с total_claimed.
     if not items:
         if selected_risk is None or total_claimed <= 0:
-            return [], needs_manual_review
+            return [], needs_manual_review, selected_risk
         log.info(
             "risk_matcher_fallback_total_claimed",
             risk_id=selected_risk.risk_id,
@@ -245,7 +249,7 @@ def match_risks(
             "ServDate":    event_date,
             "serviceid":   "",
             "ServName":    "Медицинские услуги",
-        }], True  # needs_manual_review=True — нет детализации
+        }], True, selected_risk  # needs_manual_review=True — нет детализации
 
     risks_list: list[dict] = []
 
@@ -278,4 +282,4 @@ def match_risks(
             prefer_free_choice=prefer_free_choice,
         )
 
-    return risks_list, needs_manual_review
+    return risks_list, needs_manual_review, selected_risk

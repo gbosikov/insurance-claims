@@ -6,7 +6,7 @@
 
 Запуск:
     python -m layers.extraction.training_exporter --output dataset.jsonl
-    python -m layers.extraction.training_exporter --output dataset.jsonl --min-source ocr_rules
+    python -m layers.extraction.training_exporter --output dataset.jsonl --min-source llm
     python -m layers.extraction.training_exporter --stats
 
 Пример строки JSONL:
@@ -24,18 +24,20 @@ from pathlib import Path
 import structlog
 from sqlalchemy import select
 
-from core.database import async_session_factory
+from core.database import AsyncSessionLocal
 from core.models.claim import ClaimDocument
 
 log = structlog.get_logger()
 
-# Порядок предпочтения источников (operator > ocr_rules > filename_hint)
-SOURCE_PRIORITY = {"operator": 3, "ocr_rules": 2, "filename_hint": 1}
+# Порядок предпочтения источников (operator > llm > ocr_rules > filename_hint).
+# "llm" ранжирован выше "ocr_rules": классификация Claude/Gemini информативнее
+# чистого regex — основной путь извлечения теперь использует именно её.
+SOURCE_PRIORITY = {"operator": 3, "llm": 2, "ocr_rules": 1, "filename_hint": 0}
 
 
 async def export_dataset(
     output_path: Path,
-    min_source: str = "ocr_rules",
+    min_source: str = "llm",
     tenant_id: str | None = None,
 ) -> dict[str, int]:
     """
@@ -43,13 +45,14 @@ async def export_dataset(
 
     min_source: минимальный уровень источника для включения в выборку
         - 'filename_hint' — все подтверждённые (включая неопределённые по имени)
-        - 'ocr_rules'     — только переклассифицированные или авто-апрув (рекомендуется)
+        - 'ocr_rules'     — regex-классификация (rule-based режим извлечения)
+        - 'llm'           — классификация Claude/Gemini (рекомендуется, основной путь)
         - 'operator'      — только подтверждённые оператором (максимум качество)
     """
     min_priority = SOURCE_PRIORITY.get(min_source, 2)
     stats: Counter = Counter()
 
-    async with async_session_factory() as db:
+    async with AsyncSessionLocal() as db:
         stmt = select(ClaimDocument).where(
             ClaimDocument.doc_type_confirmed == True,
             ClaimDocument.ocr_text.isnot(None),
@@ -90,7 +93,7 @@ async def export_dataset(
 
 async def print_stats(tenant_id: str | None = None) -> None:
     """Показать статистику накопленных обучающих данных."""
-    async with async_session_factory() as db:
+    async with AsyncSessionLocal() as db:
         stmt = select(ClaimDocument).where(
             ClaimDocument.doc_type_confirmed == True,
             ClaimDocument.ocr_text.isnot(None),
@@ -129,9 +132,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("dataset.jsonl"))
     parser.add_argument(
         "--min-source",
-        choices=["filename_hint", "ocr_rules", "operator"],
-        default="ocr_rules",
-        help="Минимальный уровень источника (default: ocr_rules)",
+        choices=["filename_hint", "ocr_rules", "llm", "operator"],
+        default="llm",
+        help="Минимальный уровень источника (default: llm)",
     )
     parser.add_argument("--tenant-id", default=None)
     parser.add_argument("--stats", action="store_true", help="Показать статистику без экспорта")
