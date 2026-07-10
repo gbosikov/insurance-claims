@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     # LLM_PROVIDER=gemini → переключиться на Google Gemini вместо Claude
     llm_provider: str = "anthropic"   # anthropic | gemini
     gemini_api_key: str = ""          # обязателен при LLM_PROVIDER=gemini
-    gemini_model: str = "gemini-2.0-flash"  # extraction + decision + indexer
+    gemini_model: str = "gemini-2.5-flash"  # extraction + decision + indexer
 
     # ── Себестоимость LLM ($/1M токенов) — FALLBACK ────────────────
     # Используются, только если активной модели НЕТ в _LLM_TOKEN_COST_PER_MTOK

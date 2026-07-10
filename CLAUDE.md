@@ -206,7 +206,7 @@ LLMResult:
 ```
 
 **Gemini-специфика:**
-- `gemini-2.0-flash` значительно дешевле Claude Sonnet
+- `gemini-2.5-flash` (дефолт) значительно дешевле Claude Sonnet
 - Не поддерживает extended thinking (CARVEOUT и Chain-of-Thought работают через text-only второй проход)
 - MALFORMED_FUNCTION_CALL — транзиентная ошибка, ретраится автоматически (`_TOOL_CALL_RETRIES=2`)
 
@@ -217,7 +217,7 @@ LLMResult:
 llm_provider: str = "anthropic"        # anthropic | gemini
 anthropic_api_key: str = ""            # обязателен при llm_provider=anthropic
 gemini_api_key: str = ""               # обязателен при llm_provider=gemini
-gemini_model: str = "gemini-2.0-flash"
+gemini_model: str = "gemini-2.5-flash"
 
 claude_model: str = "claude-sonnet-4-6"
 claude_extraction_temperature: float = 0.0
