@@ -68,6 +68,14 @@ function fmtK(n: number) {
   return n.toLocaleString('en')
 }
 
+// Эффективный тариф за 1M токенов из фактической стоимости (уже с наценкой ×4).
+// При смешанной истории (разные модели) единого тарифа нет — считаем реальный
+// по факту: cost / tokens × 1M. Пусто, если токенов нет.
+function fmtRatePerM(cost: number, tokens: number) {
+  if (tokens === 0) return '—'
+  return `$${((cost / tokens) * 1_000_000).toFixed(2)} / 1M`
+}
+
 // ── Table header ────────────────────────────────────────────────────
 
 const COLUMNS = [
@@ -180,14 +188,14 @@ export default function ClaimsList() {
                 label: 'INPUT TOKENS',
                 value: fmtK(stats.ai_input.tokens),
                 cost: fmtUSD(stats.ai_input.cost_usd, 4),
-                rate: '$6.00 / 1M',
+                rate: fmtRatePerM(stats.ai_input.cost_usd, stats.ai_input.tokens),
                 accent: '#8b5cf6',
               },
               {
                 label: 'OUTPUT TOKENS',
                 value: fmtK(stats.ai_output.tokens),
                 cost: fmtUSD(stats.ai_output.cost_usd, 4),
-                rate: '$36.00 / 1M',
+                rate: fmtRatePerM(stats.ai_output.cost_usd, stats.ai_output.tokens),
                 accent: '#db2777',
               },
               {

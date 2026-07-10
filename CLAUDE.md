@@ -497,15 +497,29 @@ POST   /devtools/upload                     Загрузить файлы нап
 
 ### Dashboard: трекинг затрат (core/portal)
 
-Стоимость отображается **с наценкой ×4** от себестоимости:
-| Компонент | Себестоимость | Клиенту |
-|---|---|---|
-| OCR (Vision API) | $0.0015/страница | $0.006/страница |
-| AI Input tokens | $1.50/1M | $6.00/1M |
-| AI Output tokens | $9.00/1M | $36.00/1M |
-| Инфраструктура | — | $0.005/заявку |
+Стоимость отображается **с наценкой ×4** от себестоимости. Тарифы AI-токенов
+берутся по **модели, которая реально обработала заявку** (`audit_log.model_version`)
+через `settings.cost_for_model(model)` → таблица `_LLM_TOKEN_COST_PER_MTOK` в
+`config.py`. Каждая заявка считается по цене своей модели независимо от активной
+модели в `.env` — смешанная история (часть на 2.5, часть на 3.5) считается
+корректно. Модель не в таблице → эвристика по имени (gemini/claude) →
+per-provider fallback; null/старые записи → активная модель.
 
-Коэффициент `_CLIENT_MARKUP = 4.0` задан в `dashboard.py`. Данные берутся из `audit_log.output_data` (`input_tokens`, `output_tokens`, `ocr_cost_usd`, `pages_count`).
+Себестоимость $/1M токенов (`_LLM_TOKEN_COST_PER_MTOK`, ×4 клиенту):
+| Модель | Input | Output |
+|---|---|---|
+| gemini-2.5-flash | $0.30 | $2.50 |
+| gemini-3.5-flash | $1.50 | $9.00 |
+| gemini-2.0-flash | $0.10 | $0.40 |
+| claude-sonnet-4-6 | $3.00 | $15.00 |
+| OCR (Vision, per page) | $0.0015 | — |
+
+`_CLIENT_MARKUP = 4.0` в `dashboard.py`. Данные — из `audit_log.output_data`
+(`input_tokens`, `output_tokens`, `ocr_cost_usd`, `pages_count`).
+
+**Ограничения:** для Gemini `input_tokens` включают кешированные токены по полной
+цене (`cached_content_token_count` пока не учитывается — кеш-скидка $0.03/1M для 2.5
+не отражается). Цены в таблице — ВЕРИФИЦИРОВАТЬ на ai.google.dev/gemini-api/docs/pricing.
 
 ---
 

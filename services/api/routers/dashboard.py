@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.config import get_settings
 from core.database import get_db
 from core.models.claim import Claim
 from core.portal_auth import UserInToken, get_current_portal_user
@@ -31,21 +32,26 @@ _INFRA_COST_USD = 0.005
 # Наценка для клиента: себестоимость × 4 (OCR + AI токены)
 _CLIENT_MARKUP = 4.0
 
-# Себестоимость (raw rates)
+# Себестоимость OCR (Google Vision — не зависит от LLM-провайдера)
 _OCR_COST_PER_PAGE = 0.0015          # $0.0015/страница → клиенту $0.006
-_AI_INPUT_RATE     = 1.50            # $1.50/1M токенов  → клиенту $6.00/1M
-_AI_OUTPUT_RATE    = 9.00            # $9.00/1M токенов  → клиенту $36.00/1M
+
+# Тарифы AI-токенов берутся по МОДЕЛИ, которая обработала заявку
+# (audit_log.model_version) через settings.cost_for_model() — каждая заявка
+# считается по цене своей модели, независимо от активной модели в .env.
 
 
 # ── Helpers ────────────────────────────────────────────────────────
 
-def _ai_cost(input_tokens: float, output_tokens: float) -> float:
-    """Стоимость AI для клиента (наценка ×4 от себестоимости)."""
-    return round(
-        (input_tokens  * _AI_INPUT_RATE  / 1_000_000 +
-         output_tokens * _AI_OUTPUT_RATE / 1_000_000) * _CLIENT_MARKUP,
-        6,
-    )
+def _ai_cost_by_groups(groups: list[tuple[str | None, float, float]]) -> float:
+    """Стоимость AI для клиента (×4). Каждая группа (model, in_tok, out_tok)
+    считается по тарифу СВОЕЙ модели — так смешанная история (разные модели)
+    считается корректно."""
+    settings = get_settings()
+    raw = 0.0
+    for model, in_tok, out_tok in groups:
+        in_rate, out_rate = settings.cost_for_model(model)
+        raw += in_tok * in_rate / 1_000_000 + out_tok * out_rate / 1_000_000
+    return round(raw * _CLIENT_MARKUP, 6)
 
 
 def _ocr_cost(raw_usd: float) -> float:
@@ -59,8 +65,10 @@ async def _fetch_cost_batch(
     tenant_id: UUID,
 ) -> dict[str, dict]:
     """
-    Батч-запрос затрат для списка заявок (один SQL vs N+1).
-    Возвращает: {claim_id_str: {ocr_cost_usd, ai_input_tokens, ai_output_tokens}}
+    Батч-запрос затрат для списка заявок.
+    OCR агрегируется по заявке (модель-независимо), AI-токены — по (заявка, модель),
+    чтобы каждую заявку посчитать по цене её собственной модели.
+    Возвращает: {claim_id: {ocr_cost_usd, ocr_pages, ai_groups: [(model, in, out)]}}
     """
     if not claim_ids:
         return {}
@@ -75,31 +83,50 @@ async def _fetch_cost_batch(
 
     in_clause = ", ".join(placeholders)
 
-    rows = (await db.execute(
+    # OCR — по заявке (Vision billится по страницам, от модели не зависит)
+    ocr_rows = (await db.execute(
         text(f"""
-            SELECT
-                claim_id::text AS claim_id,
-                COALESCE(SUM(CASE WHEN step = 'ocr'
-                    THEN (output_data->>'ocr_cost_usd')::numeric
-                    END), 0) AS ocr_cost_usd,
-                COALESCE(SUM(CASE WHEN step = 'ocr'
-                    THEN (output_data->>'pages_count')::numeric
-                    END), 0) AS ocr_pages,
-                COALESCE(SUM(CASE WHEN step IN ('extraction', 'decision')
-                    THEN (output_data->>'input_tokens')::numeric
-                    END), 0) AS ai_input_tokens,
-                COALESCE(SUM(CASE WHEN step IN ('extraction', 'decision')
-                    THEN (output_data->>'output_tokens')::numeric
-                    END), 0) AS ai_output_tokens
+            SELECT claim_id::text AS claim_id,
+                   COALESCE(SUM((output_data->>'ocr_cost_usd')::numeric), 0) AS ocr_cost_usd,
+                   COALESCE(SUM((output_data->>'pages_count')::numeric), 0)  AS ocr_pages
             FROM audit_log
-            WHERE tenant_id::text = :tenant_id
+            WHERE tenant_id::text = :tenant_id AND step = 'ocr'
               AND claim_id::text IN ({in_clause})
             GROUP BY claim_id
         """),
         params,
     )).mappings().all()
 
-    return {row["claim_id"]: dict(row) for row in rows}
+    # AI-токены — по (заявка, модель), чтобы считать каждую по её тарифу
+    ai_rows = (await db.execute(
+        text(f"""
+            SELECT claim_id::text AS claim_id,
+                   model_version,
+                   COALESCE(SUM((output_data->>'input_tokens')::numeric), 0)  AS in_tok,
+                   COALESCE(SUM((output_data->>'output_tokens')::numeric), 0) AS out_tok
+            FROM audit_log
+            WHERE tenant_id::text = :tenant_id AND step IN ('extraction', 'decision')
+              AND claim_id::text IN ({in_clause})
+            GROUP BY claim_id, model_version
+        """),
+        params,
+    )).mappings().all()
+
+    result: dict[str, dict] = {}
+    for r in ocr_rows:
+        result[r["claim_id"]] = {
+            "ocr_cost_usd": float(r["ocr_cost_usd"]),
+            "ocr_pages": int(r["ocr_pages"]),
+            "ai_groups": [],
+        }
+    for r in ai_rows:
+        entry = result.setdefault(
+            r["claim_id"], {"ocr_cost_usd": 0.0, "ocr_pages": 0, "ai_groups": []}
+        )
+        entry["ai_groups"].append(
+            (r["model_version"], float(r["in_tok"]), float(r["out_tok"]))
+        )
+    return result
 
 
 # ── Endpoints ──────────────────────────────────────────────────────
@@ -144,11 +171,12 @@ async def list_claims(
     items = []
     for claim in claims:
         cost = cost_map.get(str(claim.id), {})
-        ocr_raw = float(cost.get("ocr_cost_usd") or 0)
-        inp     = float(cost.get("ai_input_tokens") or 0)
-        out     = float(cost.get("ai_output_tokens") or 0)
-        ocr     = _ocr_cost(ocr_raw)
-        ai      = _ai_cost(inp, out)
+        ocr_raw   = float(cost.get("ocr_cost_usd") or 0)
+        ai_groups = cost.get("ai_groups") or []
+        inp = sum(g[1] for g in ai_groups)   # суммарные токены (для отображения)
+        out = sum(g[2] for g in ai_groups)
+        ocr = _ocr_cost(ocr_raw)
+        ai  = _ai_cost_by_groups(ai_groups)  # стоимость — по модели каждой группы
 
         ocr_pages = int(cost.get("ocr_pages") or 0)
         items.append({
@@ -235,6 +263,7 @@ async def get_claim_cost(
     total_ocr_cost = 0.0
     total_input_tokens = 0
     total_output_tokens = 0
+    ai_groups_all: list[tuple[str | None, float, float]] = []
 
     for row in audit_rows:
         inp      = int(row["input_tokens"] or 0)
@@ -248,7 +277,10 @@ async def get_claim_cost(
         total_ocr_cost      += ocr
         total_ocr_pages     += pages
 
-        step_ai  = _ai_cost(inp, out)
+        # Стоимость шага по МОДЕЛИ этого шага (row.model_version)
+        step_ai = _ai_cost_by_groups([(row["model_version"], inp, out)]) if (inp or out) else 0.0
+        if inp or out:
+            ai_groups_all.append((row["model_version"], inp, out))
         step_cost = step_ai + ocr
 
         steps.append({
@@ -265,7 +297,7 @@ async def get_claim_cost(
             "confidence": float(row["confidence_overall"]) if row["confidence_overall"] else None,
         })
 
-    ai_cost    = _ai_cost(total_input_tokens, total_output_tokens)
+    ai_cost    = _ai_cost_by_groups(ai_groups_all)
     total_cost = round(total_ocr_cost + ai_cost + _INFRA_COST_USD, 6)
 
     return {
@@ -300,18 +332,15 @@ async def get_stats(
     """
     tenant_id = current_user.tenant_id
 
-    row = (await db.execute(
+    # База: количество заявок + OCR (модель-независимо)
+    base = (await db.execute(
         text("""
             SELECT
                 COUNT(DISTINCT al.claim_id)                                           AS total_claims,
                 COALESCE(SUM(CASE WHEN al.step = 'ocr'
                     THEN (al.output_data->>'pages_count')::numeric END), 0)           AS total_ocr_pages,
                 COALESCE(SUM(CASE WHEN al.step = 'ocr'
-                    THEN (al.output_data->>'ocr_cost_usd')::numeric END), 0)          AS total_ocr_cost,
-                COALESCE(SUM(CASE WHEN al.step IN ('extraction', 'decision')
-                    THEN (al.output_data->>'input_tokens')::numeric END), 0)          AS total_input_tokens,
-                COALESCE(SUM(CASE WHEN al.step IN ('extraction', 'decision')
-                    THEN (al.output_data->>'output_tokens')::numeric END), 0)         AS total_output_tokens
+                    THEN (al.output_data->>'ocr_cost_usd')::numeric END), 0)          AS total_ocr_cost
             FROM audit_log al
             INNER JOIN claims c ON c.id = al.claim_id AND c.tenant_id = al.tenant_id
             WHERE al.tenant_id::text = :tenant_id
@@ -319,15 +348,37 @@ async def get_stats(
         {"tenant_id": str(tenant_id)},
     )).mappings().one()
 
-    total_claims  = int(row["total_claims"])
-    ocr_pages     = int(row["total_ocr_pages"])
-    ocr_raw       = float(row["total_ocr_cost"])
-    input_tokens  = int(row["total_input_tokens"])
-    output_tokens = int(row["total_output_tokens"])
+    # AI-токены — по модели, чтобы каждую группу посчитать по своему тарифу
+    ai_by_model = (await db.execute(
+        text("""
+            SELECT al.model_version,
+                   COALESCE(SUM((al.output_data->>'input_tokens')::numeric), 0)  AS in_tok,
+                   COALESCE(SUM((al.output_data->>'output_tokens')::numeric), 0) AS out_tok
+            FROM audit_log al
+            INNER JOIN claims c ON c.id = al.claim_id AND c.tenant_id = al.tenant_id
+            WHERE al.tenant_id::text = :tenant_id
+              AND al.step IN ('extraction', 'decision')
+            GROUP BY al.model_version
+        """),
+        {"tenant_id": str(tenant_id)},
+    )).mappings().all()
+
+    total_claims  = int(base["total_claims"])
+    ocr_pages     = int(base["total_ocr_pages"])
+    ocr_raw       = float(base["total_ocr_cost"])
+
+    settings = get_settings()
+    input_tokens = sum(int(r["in_tok"]) for r in ai_by_model)
+    output_tokens = sum(int(r["out_tok"]) for r in ai_by_model)
+    input_cost = output_cost = 0.0
+    for r in ai_by_model:
+        in_rate, out_rate = settings.cost_for_model(r["model_version"])
+        input_cost  += int(r["in_tok"])  * in_rate  / 1_000_000 * _CLIENT_MARKUP
+        output_cost += int(r["out_tok"]) * out_rate / 1_000_000 * _CLIENT_MARKUP
 
     ocr_cost    = round(_ocr_cost(ocr_raw), 4)
-    input_cost  = round(input_tokens  * _AI_INPUT_RATE  / 1_000_000 * _CLIENT_MARKUP, 4)
-    output_cost = round(output_tokens * _AI_OUTPUT_RATE / 1_000_000 * _CLIENT_MARKUP, 4)
+    input_cost  = round(input_cost, 4)
+    output_cost = round(output_cost, 4)
     infra_cost  = round(total_claims  * _INFRA_COST_USD, 4)
     total_cost  = round(ocr_cost + input_cost + output_cost + infra_cost, 4)
 

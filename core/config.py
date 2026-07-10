@@ -9,6 +9,19 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# Себестоимость по МОДЕЛИ ($/1M токенов): (input, output).
+# Дашборд выбирает тариф по АКТИВНОЙ модели (GEMINI_MODEL / CLAUDE_MODEL из .env),
+# поэтому смена модели автоматически подхватывает правильную цену.
+# Модель не в таблице → fallback на *_input/output_cost_per_mtok (per-provider) ниже.
+# Источники: ai.google.dev/gemini-api/docs/pricing | anthropic.com/pricing
+_LLM_TOKEN_COST_PER_MTOK: dict[str, tuple[float, float]] = {
+    "gemini-2.5-flash":  (0.30, 2.50),
+    "gemini-3.5-flash":  (1.50, 9.00),
+    "gemini-2.0-flash":  (0.10, 0.40),
+    "claude-sonnet-4-6": (3.00, 15.00),
+}
+
+
 class Settings(BaseSettings):
     # ── База данных ────────────────────────────────────────────────
     database_url: str
@@ -21,6 +34,14 @@ class Settings(BaseSettings):
     llm_provider: str = "anthropic"   # anthropic | gemini
     gemini_api_key: str = ""          # обязателен при LLM_PROVIDER=gemini
     gemini_model: str = "gemini-2.0-flash"  # extraction + decision + indexer
+
+    # ── Себестоимость LLM ($/1M токенов) — FALLBACK ────────────────
+    # Используются, только если активной модели НЕТ в _LLM_TOKEN_COST_PER_MTOK
+    # (см. вверху файла). Известные модели берут точную цену из таблицы.
+    anthropic_input_cost_per_mtok: float = 3.00
+    anthropic_output_cost_per_mtok: float = 15.00
+    gemini_input_cost_per_mtok: float = 0.30
+    gemini_output_cost_per_mtok: float = 2.50
 
     # Google: аутентификация через ADC.
     # В docker-compose передаётся через GOOGLE_APPLICATION_CREDENTIALS.
@@ -231,6 +252,44 @@ class Settings(BaseSettings):
     # Цель: снизить стоимость и latency extraction без потери качества.
     extraction_use_rules: bool = False
     extraction_rules_min_confidence: float = 0.60  # ниже → manual_review
+
+    def llm_cost_per_mtok(self) -> tuple[float, float]:
+        """(input, output) себестоимость $/1M токенов для АКТИВНОЙ модели.
+
+        Дашборд использует это для расчёта денег. Приоритет:
+        1. Точная цена по имени активной модели из _LLM_TOKEN_COST_PER_MTOK —
+           смена GEMINI_MODEL/CLAUDE_MODEL автоматически меняет тариф.
+        2. Модель не в таблице → per-provider fallback из .env
+           (gemini_*/anthropic_*_cost_per_mtok).
+        """
+        model = self.gemini_model if self.llm_provider == "gemini" else self.claude_model
+        return self.cost_for_model(model)
+
+    def cost_for_model(self, model: str | None) -> tuple[float, float]:
+        """(input, output) себестоимость $/1M токенов по КОНКРЕТНОЙ модели.
+
+        Дашборд считает каждую заявку по цене модели, которая её реально
+        обработала (audit_log.model_version) — независимо от активной модели.
+        Приоритет: точная цена из _LLM_TOKEN_COST_PER_MTOK → эвристика по имени
+        провайдера в строке модели → тариф активной модели (для null/старых
+        записей без model_version).
+        """
+        if model:
+            known = _LLM_TOKEN_COST_PER_MTOK.get(model)
+            if known is not None:
+                return known
+            if "gemini" in model:
+                return self.gemini_input_cost_per_mtok, self.gemini_output_cost_per_mtok
+            if "claude" in model:
+                return self.anthropic_input_cost_per_mtok, self.anthropic_output_cost_per_mtok
+        # null / неизвестный провайдер → активная модель (по .env)
+        active = self.gemini_model if self.llm_provider == "gemini" else self.claude_model
+        return _LLM_TOKEN_COST_PER_MTOK.get(
+            active,
+            (self.gemini_input_cost_per_mtok, self.gemini_output_cost_per_mtok)
+            if self.llm_provider == "gemini"
+            else (self.anthropic_input_cost_per_mtok, self.anthropic_output_cost_per_mtok),
+        )
 
     model_config = SettingsConfigDict(
         env_file=".env",
